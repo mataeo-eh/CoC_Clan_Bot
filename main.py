@@ -164,7 +164,7 @@ async def set_clan(interaction: discord.Interaction, clan_name: str, tag: str):
 
 @bot.tree.command(name="clan_war_info", description="Display the current war details for a configured clan")
 @app_commands.describe(
-    clan_name="Name of the configured clan to inspect",
+    clan_name="Required: Name of the configured clan to inspect",
     home_clan="Select to include home clan details",
     opponent_clan="Select to include opponent clan details",
     clan_tag="Select to include the configured clan tag",
@@ -184,7 +184,7 @@ async def set_clan(interaction: discord.Interaction, clan_name: str, tag: str):
     all_members="Select to include a list of participating members",
 )
 @app_commands.choices(
-    home_clan=[app_commands.Choice(name="Include", value="include")],
+    home_clan=[app_commands.Choice(name="home clan",value="include")],
     opponent_clan=[app_commands.Choice(name="Include", value="include")],
     clan_tag=[app_commands.Choice(name="Include", value="include")],
     war_tag=[app_commands.Choice(name="Include", value="include")],
@@ -203,25 +203,25 @@ async def set_clan(interaction: discord.Interaction, clan_name: str, tag: str):
     all_members=[app_commands.Choice(name="Include", value="include")],
 )
 async def clan_war_info(
-    interaction: discord.Interaction,
-    clan_name: str,
-    home_clan: Optional[str] = None,
-    opponent_clan: Optional[str] = None,
-    clan_tag: Optional[str] = None,
-    war_tag: Optional[str] = None,
-    war_state: Optional[str] = None,
-    war_status: Optional[str] = None,
-    war_type: Optional[str] = None,
-    is_cwl: Optional[str] = None,
-    war_size: Optional[str] = None,
-    attacks_per_member: Optional[str] = None,
-    total_attacks: Optional[str] = None,
-    battle_modifier: Optional[str] = None,
-    preparation_start_time: Optional[str] = None,
-    war_day_start_time: Optional[str] = None,
-    war_ends: Optional[str] = None,
-    league_group: Optional[str] = None,
-    all_members: Optional[str] = None,
+    interaction: "discord.Interaction",
+    clan_name: "str",
+    home_clan: "Optional[app_commands.Choice[str]]" = None,
+    opponent_clan: "Optional[app_commands.Choice[str]]" = None,
+    clan_tag: "Optional[app_commands.Choice[str]]" = None,
+    war_tag: "Optional[app_commands.Choice[str]]" = None,
+    war_state: "Optional[app_commands.Choice[str]]" = None,
+    war_status: "Optional[app_commands.Choice[str]]" = None,
+    war_type: "Optional[app_commands.Choice[str]]" = None,
+    is_cwl: "Optional[app_commands.Choice[str]]" = None,
+    war_size: "Optional[app_commands.Choice[str]]" = None,
+    attacks_per_member: "Optional[app_commands.Choice[str]]" = None,
+    total_attacks: "Optional[app_commands.Choice[str]]" = None,
+    battle_modifier: "Optional[app_commands.Choice[str]]" = None,
+    preparation_start_time: "Optional[app_commands.Choice[str]]" = None,
+    war_day_start_time: "Optional[app_commands.Choice[str]]" = None,
+    war_ends: "Optional[app_commands.Choice[str]]" = None,
+    league_group: "Optional[app_commands.Choice[str]]" = None,
+    all_members: "Optional[app_commands.Choice[str]]" = None,
 ):
     if interaction.guild is None:
         await interaction.response.defer(ephemeral=True)
@@ -280,8 +280,7 @@ async def clan_war_info(
         requested_labels = list(info.keys())
 
     embed = discord.Embed(
-        title=f"{clan_name} War Information",
-        description="Showing current war data from the Clash of Clans API.",
+        title=f"{clan_name} Current War Information",
         color=discord.Color.blue()
     )
 

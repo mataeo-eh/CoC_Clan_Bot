@@ -59,13 +59,13 @@ class CoCAPI:
             "is cwl": clan.is_cwl,
             "war size": clan.team_size,
             "attacks per member": clan.attacks_per_member,
-            "total attacks": clan.attacks,
+            "all attacks done this war": clan.attacks,
             "battle modifier": clan.battle_modifier,
             "preparation start time": clan.preparation_start_time,
             "war day start time": clan.start_time,
-            "war ends": clan.end_time,
+            "war end time": clan.end_time,
             "league group": clan.league_group,
-            "all members": clan.members,
+            "all members in war": clan.members,
         }
     
 
