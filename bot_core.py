@@ -22,6 +22,6 @@ __all__ = [
 ]
 
 intents = discord.Intents.default()
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix=None, intents=intents, help_command=None)
 client = CoCAPI(COC_API_key)
 Dkey = Discord_Bot_API_Key

@@ -4,9 +4,13 @@ A Discord bot that connects to the Clash of Clans API to surface clan and war da
 
 ## Project Overview (tracked files only)
 
-- `main.py` – Primary bot entry point. Logs into Discord and the CoC API, manages guild clan configuration, and exposes the `/clan_war_info` slash command with selectable data sections.
-- `COC_API.py` – Thin wrapper around `coc.Client` that handles authentication, guild-specific clan storage, and higher-level helpers for fetching player/war details.
-- `Discord_command_groups.py` – Stand-alone bot harness showcasing the `/clan war_info` command group with auto-complete clan selection and opt-in result categories.
+- `bot_core.py` – Centralises shared Discord state (`bot`, `client`, intents) so multiple modules can register commands without instantiating duplicate bots.
+- `main.py` – Entry point that logs into Discord/CoC, synchronises commands, and imports the slash command catalogue.
+- `Discord_Commands.py` – Production command set featuring `/set_clan` (with alert toggles), an interactive `/clan_war_info_menu` (select menu + broadcast buttons), `/assign_clan_role` for self-service clan roles, `/toggle_war_alerts` for opt-in mentions, and `/assign_bases` for war target planning alongside the scheduled alert loop with refined timing guards to prevent late notifications on restart.
+- `COC_API.py` – Thin wrapper around `coc.Client` for login, guild configuration, and higher-level war/player helpers (including per-clan alert preferences).
+- `logger.py` – Central logging utility that writes per-run DEBUG logs to `logs/COCbotlogfile_<timestamp>.log`, mirrors errors to the console, and tracks slash-command invocation counts.
+- `ENV/Clan_Configs.py` – JSON-backed storage utilities for clan/player tags and the new `Enable Alert Tracking` map.
+- `Discord_command_groups.py` – Stand-alone experimental harness demonstrating alternative command grouping patterns.
 - `README.md` – Project description, file summaries, and credits.
 
 For ignored assets (e.g., documentation drafts, configuration notes), consult the `ENV/` directory directly in the workspace—they are purposefully excluded from version control. Current companions include a slash-command pattern catalog and a Clash of Clans API command cheat sheet to guide ongoing development.
