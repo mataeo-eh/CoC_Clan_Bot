@@ -6,10 +6,11 @@ A Discord bot that connects to the Clash of Clans API to surface clan and war da
 
 - `bot_core.py` – Centralises shared Discord state (`bot`, `client`, intents) so multiple modules can register commands without instantiating duplicate bots.
 - `main.py` – Entry point that logs into Discord/CoC, synchronises commands, and imports the slash command catalogue.
-- `Discord_Commands.py` – Production command set featuring `/set_clan` (with alert toggles), an interactive `/clan_war_info_menu` (select menu + broadcast buttons), `/assign_clan_role` for self-service clan roles, `/toggle_war_alerts` for opt-in mentions, and `/assign_bases` for war target planning alongside the scheduled alert loop with refined timing guards to prevent late notifications on restart.
-- `COC_API.py` – Thin wrapper around `coc.Client` for login, guild configuration, and higher-level war/player helpers (including per-clan alert preferences).
+- `Discord_Commands.py` – Production command suite featuring `/set_clan` (with duplicate-tag protection and alert prompts), `/clan_war_info_menu` and `/player_info` (interactive select menus with broadcast/private buttons), `/choose_war_alert_channel` for per-clan delivery, `/assign_clan_role`, `/toggle_war_alerts`, and `/assign_bases`, all backed by the hourly war-alert loop with refined timing guards.
+- `COC_API.py` – Thin wrapper around `coc.Client` for login, guild configuration, and higher-level war/player helpers, including structured player snapshots for the new profile command.
 - `logger.py` – Central logging utility that writes per-run DEBUG logs to `logs/COCbotlogfile_<timestamp>.log`, mirrors errors to the console, and tracks slash-command invocation counts.
-- `ENV/Clan_Configs.py` – JSON-backed storage utilities for clan/player tags and the new `Enable Alert Tracking` map.
+- `ENV/Clan_Configs.py` – JSON-backed storage utilities for clan/player tags using the unified `clans -> {tag, alerts{enabled, channel_id}}` schema plus helper routines for forward/backward compatibility.
+- `ENV/notify_codex_complete.applescript` – macOS notification helper executed at the end of a TODO run to announce completion.
 - `Discord_command_groups.py` – Stand-alone experimental harness demonstrating alternative command grouping patterns.
 - `README.md` – Project description, file summaries, and credits.
 

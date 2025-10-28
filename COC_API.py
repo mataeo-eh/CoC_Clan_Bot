@@ -29,24 +29,84 @@ class CoCAPI:
         player = await self.client.get_player(tag)
         log.debug("CoCAPI.get_player fetched data")
         data = {
-            "name": player.name,
+            "profile": {
+                "name": player.name,
+                "tag": player.tag,
+                "exp_level": player.exp_level,
+                "town_hall_level": getattr(player, "town_hall", None),
+                "builder_hall_level": getattr(player, "builder_hall_level", None),
+            },
+            "clan": {
+                "name": player.clan.name if player.clan else None,
+                "tag": player.clan.tag if player.clan else None,
+                "role": player.role,
+            },
+            "league": player.league.name if player.league else None,
             "trophies": player.trophies,
-            "town_hall": player.town_hall
+            "best_trophies": getattr(player, "best_trophies", None),
+            "versus_trophies": getattr(player, "versus_trophies", None),
+            "war_stars": getattr(player, "war_stars", None),
+            "attack_wins": getattr(player, "attack_wins", None),
+            "defense_wins": getattr(player, "defense_wins", None),
+            "donations": getattr(player, "donations", None),
+            "donations_received": getattr(player, "donations_received", None),
+            "heroes": [
+                {
+                    "name": hero.name,
+                    "level": hero.level,
+                    "max_level": hero.max_level,
+                    "village": hero.village,
+                }
+                for hero in getattr(player, "heroes", [])
+            ],
+            "troops": [
+                {
+                    "name": troop.name,
+                    "level": troop.level,
+                    "max_level": troop.max_level,
+                    "village": troop.village,
+                    "category": troop.category,
+                }
+                for troop in getattr(player, "troops", [])
+            ],
+            "spells": [
+                {
+                    "name": spell.name,
+                    "level": spell.level,
+                    "max_level": spell.max_level,
+                }
+                for spell in getattr(player, "spells", [])
+            ],
+            "achievements": [
+                {
+                    "name": achievement.name,
+                    "stars": achievement.stars,
+                    "value": achievement.value,
+                    "target": achievement.target,
+                    "info": achievement.info,
+                }
+                for achievement in getattr(player, "achievements", [])
+            ],
         }
-        log.debug("CoCAPI.get_clan_war_info returning payload")
+        log.debug("CoCAPI.get_player returning payload")
         return data
 
     def set_server_clan(self, guild_id: int, clan_name: str, tag: str, alerts_enabled: bool = True):
         log.debug("CoCAPI.set_server_clan invoked")
-        # Set or update a clan tag for a given server and persist alert preference.
+        normalised_tag = tag.upper()
         guild_config = server_config.setdefault(
             guild_id,
-            {"Clan tags": {}, "Player tags": {}, "Enable Alert Tracking": {}},
+            {"clans": {}, "player_tags": {}},
         )
-        clan_tags = guild_config.setdefault("Clan tags", {})
-        clan_tags[clan_name] = tag
-        alert_map = guild_config.setdefault("Enable Alert Tracking", {})
-        alert_map[clan_name] = alerts_enabled
+        clans = guild_config.setdefault("clans", {})
+        clan_entry = clans.setdefault(
+            clan_name,
+            {"tag": normalised_tag, "alerts": {"enabled": alerts_enabled, "channel_id": None}},
+        )
+        clan_entry["tag"] = normalised_tag
+        alerts = clan_entry.setdefault("alerts", {})
+        alerts["enabled"] = alerts_enabled
+        alerts.setdefault("channel_id", None)
         save_server_config()
         log.debug("CoCAPI.set_server_clan persisted configuration")
 
@@ -63,15 +123,17 @@ class CoCAPI:
             raise GuildNotConfiguredError(f"Guild {guild_id} has no stored configuration.")
 
         guild_config = server_config[guild_id]
-        clan_tags = guild_config.get("Clan tags")
+        clans = guild_config.get("clans", {})
 
-        if not clan_tags:
+        if not clans:
             raise ClanNotConfiguredError(f"No clan tags configured for guild {guild_id}.")
 
-        if clan_name not in clan_tags:
+        if clan_name not in clans:
             raise ClanNotConfiguredError(f"Clan '{clan_name}' not configured for guild {guild_id}.")
 
-        tag = clan_tags[clan_name]
+        tag = clans[clan_name].get("tag")
+        if not tag:
+            raise ClanNotConfiguredError(f"Clan '{clan_name}' has no tag configured.")
         clan = await self.client.get_clan_war(tag)
         log.debug("CoCAPI.get_clan_war_info fetched war data")
         data = {

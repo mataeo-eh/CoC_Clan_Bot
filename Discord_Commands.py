@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import discord
 from discord import app_commands
@@ -14,7 +14,7 @@ from logger import get_logger, log_command_call
 
 log = get_logger()
 from COC_API import ClanNotConfiguredError, GuildNotConfiguredError
-from ENV.Clan_Configs import server_config
+from ENV.Clan_Configs import save_server_config, server_config
 
 
 MAX_MESSAGE_LENGTH = 1900
@@ -183,16 +183,230 @@ async def set_clan(
         )
         return
 
-    # Persist the clan tag alongside the chosen alert preference.
-    client.set_server_clan(interaction.guild.id, clan_name, tag, alerts_enabled=enable_alerts)
-    await send_text_response(
-        interaction,
+    guild = interaction.guild
+    guild_id = guild.id
+    normalized_tag = tag.upper()
+    guild_config = _ensure_guild_config(guild_id)
+    clans = guild_config["clans"]
+
+    # Detect duplicate tags under a different clan alias.
+    conflicting_name = next(
         (
-            f"✅ `{clan_name}` now points to {tag} for this server.\n"
-            f"📣 War alerts enabled: {'Yes' if enable_alerts else 'No'}."
+            name
+            for name, data in clans.items()
+            if name != clan_name
+            and isinstance(data, dict)
+            and str(data.get("tag", "")).upper() == normalized_tag
         ),
-        ephemeral=True,
+        None,
     )
+
+    if conflicting_name:
+        log.debug(
+            "set_clan detected duplicate tag %s between %s and %s in guild %s",
+            normalized_tag,
+            conflicting_name,
+            clan_name,
+            guild_id,
+        )
+        view = ReplaceClanTagView(
+            guild=guild,
+            existing_name=conflicting_name,
+            new_name=clan_name,
+            tag=normalized_tag,
+            enable_alerts=enable_alerts,
+        )
+        await send_text_response(
+            interaction,
+            (
+                f"⚠️ The tag {normalized_tag} is already linked to `{conflicting_name}`.\n"
+                "Would you like to replace that clan name with this new one?"
+            ),
+            ephemeral=True,
+            view=view,
+        )
+        return
+
+    response, followup = _apply_clan_update(guild, clan_name, normalized_tag, enable_alerts)
+    await send_text_response(interaction, response, ephemeral=True)
+    if followup:
+        await interaction.followup.send(followup, ephemeral=True)
+
+
+@bot.tree.command(
+    name="choose_war_alert_channel",
+    description="Select the text channel where war alerts will be posted for a clan.",
+)
+@app_commands.describe(clan_name="Choose a configured clan to update.")
+async def choose_war_alert_channel(interaction: discord.Interaction, clan_name: str):
+    """Allow administrators to pick the destination channel for war alerts."""
+    log_command_call("choose_war_alert_channel")
+    log.debug("choose_war_alert_channel invoked for %s", clan_name)
+
+    if interaction.guild is None:
+        await send_text_response(
+            interaction,
+            "❌ This command can only be used inside a Discord server.",
+            ephemeral=True,
+        )
+        return
+
+    member = interaction.user
+    if not isinstance(member, discord.Member) or not member.guild_permissions.administrator:
+        await send_text_response(
+            interaction,
+            "❌ Only administrators can configure alert destinations.",
+            ephemeral=True,
+        )
+        return
+
+    guild = interaction.guild
+    guild_config = _ensure_guild_config(guild.id)
+    clan_entry = guild_config["clans"].get(clan_name)
+    if not isinstance(clan_entry, dict):
+        await send_text_response(
+            interaction,
+            f"⚠️ `{clan_name}` is not configured for this server.",
+            ephemeral=True,
+        )
+        return
+
+    bot_member = guild.me
+    if bot_member is None:
+        await send_text_response(
+            interaction,
+            "⚠️ I cannot resolve my guild membership to check channel permissions.",
+            ephemeral=True,
+        )
+        return
+
+    # Build category -> channel mapping only including channels both the bot and caller can use.
+    channels_by_category: Dict[Optional[int], List[discord.TextChannel]] = {}
+    def sort_key(ch: discord.TextChannel) -> Tuple[int, int, int]:
+        category_position = ch.category.position if ch.category else -1
+        return (category_position, ch.position, ch.id)
+
+    for channel in sorted(guild.text_channels, key=sort_key):
+        if not channel.permissions_for(bot_member).send_messages:
+            continue
+        if not channel.permissions_for(member).view_channel:
+            continue
+        category_id = channel.category_id
+        channels_by_category.setdefault(category_id, []).append(channel)
+
+    channels_by_category = {
+        key: value for key, value in channels_by_category.items() if value
+    }
+
+    if not channels_by_category:
+        await send_text_response(
+            interaction,
+            "⚠️ I could not find any text channels that both of us can access. "
+            "Please adjust permissions or create a suitable channel first.",
+            ephemeral=True,
+        )
+        return
+
+    alerts = clan_entry.get("alerts", {})
+    existing_channel_id = alerts.get("channel_id")
+    if existing_channel_id:
+        existing_channel = guild.get_channel(existing_channel_id)
+        current_status = (
+            f"Current alert channel: {existing_channel.mention}"
+            if isinstance(existing_channel, discord.TextChannel)
+            else f"Current alert channel ID: {existing_channel_id}"
+        )
+    else:
+        current_status = (
+            "Alerts currently use the default fallback channel until a dedicated one is selected."
+        )
+
+    view = ChooseWarAlertChannelView(
+        guild=guild,
+        clan_name=clan_name,
+        channels_by_category=channels_by_category,
+    )
+    intro = (
+        f"{current_status}\n"
+        "Select a category to see available channels."
+    )
+    await send_text_response(interaction, intro, ephemeral=True, view=view)
+
+
+@bot.tree.command(
+    name="player_info",
+    description="Display detailed information about a Clash of Clans player.",
+)
+@app_commands.describe(
+    player_reference="Enter a player tag (e.g. #ABC123) or select a saved player name."
+)
+async def player_info(interaction: discord.Interaction, player_reference: str):
+    """Provide an interactive view of player data with share controls."""
+    log_command_call("player_info")
+    log.debug("player_info invoked with reference %s", player_reference)
+
+    if interaction.guild is None:
+        await send_text_response(
+            interaction,
+            "❌ This command must be used inside a Discord server so I can load saved player tags.",
+            ephemeral=True,
+        )
+        return
+
+    reference = player_reference.strip()
+    if not reference:
+        await send_text_response(
+            interaction,
+            "⚠️ Please provide a player tag (e.g. #ABC123) or choose a saved player name.",
+            ephemeral=True,
+        )
+        return
+
+    guild = interaction.guild
+    guild_config = _ensure_guild_config(guild.id)
+    player_tags: Dict[str, str] = guild_config.get("player_tags", {})
+
+    if reference.startswith("#"):
+        player_tag = reference.upper()
+    else:
+        lookup = {name.lower(): tag for name, tag in player_tags.items()}
+        player_tag = lookup.get(reference.lower())
+        if not player_tag:
+            await send_text_response(
+                interaction,
+                (
+                    f"⚠️ I could not find a saved player named `{reference}`.\n"
+                    "Provide a full player tag like `#ABC123` or add the player to the config."
+                ),
+                ephemeral=True,
+            )
+            return
+        player_tag = player_tag.upper()
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        player_info = await client.get_player(player_tag)
+    except coc.errors.NotFound:
+        await interaction.followup.send(f"⚠️ I could not find a player with tag `{player_tag}`.", ephemeral=True)
+        return
+    except coc.errors.GatewayError as exc:
+        await interaction.followup.send(
+            f"⚠️ Clash of Clans API error while fetching `{player_tag}`: {exc}", ephemeral=True
+        )
+        return
+    except Exception as exc:
+        log.exception("Unexpected error retrieving player data")
+        await interaction.followup.send(f"⚠️ Unable to fetch player info: {exc}", ephemeral=True)
+        return
+
+    profile = player_info.get("profile", {})
+    player_name = profile.get("name") or "Unknown Player"
+    header = f"{player_name} ({player_tag})"
+
+    view = PlayerInfoView(header, player_info)
+    initial_output = _build_player_output(header, [], player_info)
+    view.last_output = initial_output
+    await interaction.followup.send(initial_output, ephemeral=True, view=view)
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +432,71 @@ WAR_INFO_FIELD_MAP: Dict[str, str] = {
     "league group": "League group summary",
     "all members in war": "Clan members participating",
 }
+
+
+PLAYER_INFO_FIELD_MAP: Dict[str, str] = {
+    "profile": "Profile overview",
+    "clan": "Current clan",
+    "league": "League status",
+    "trophies_overview": "Trophies overview",
+    "war_stats": "War statistics",
+    "donations": "Donation summary",
+    "heroes": "Hero levels",
+    "troops": "Troop levels",
+    "spells": "Spell levels",
+    "achievements": "Achievement highlights",
+}
+
+
+def _fmt_numeric(value: Optional[int]) -> str:
+    return f"{value:,}" if isinstance(value, int) else "N/A"
+
+
+def _format_unit_list(units: List[Dict[str, Any]], *, limit: int = 10, label: str = "Unit") -> str:
+    if not units:
+        return f"No {label.lower()} data available."
+    lines = []
+    for entry in units[:limit]:
+        name = entry.get("name", "Unknown")
+        level = entry.get("level")
+        max_level = entry.get("max_level")
+        village = entry.get("village")
+        category = entry.get("category")
+        suffix_parts = []
+        if max_level:
+            suffix_parts.append(f"max {max_level}")
+        if village:
+            suffix_parts.append(village.replace("_", " ").title())
+        if category:
+            suffix_parts.append(category.title())
+        suffix = f" ({', '.join(suffix_parts)})" if suffix_parts else ""
+        lines.append(f"• {name}: Lv{level}{suffix}")
+    if len(units) > limit:
+        lines.append(f"… (+{len(units) - limit} more)")
+    return "\n".join(lines)
+
+
+def _format_achievement_list(achievements: List[Dict[str, Any]], *, limit: int = 5) -> str:
+    if not achievements:
+        return "No achievements recorded."
+    sorted_achievements = sorted(achievements, key=lambda item: item.get("stars", 0), reverse=True)
+    lines = []
+    for achievement in sorted_achievements[:limit]:
+        name = achievement.get("name", "Unknown")
+        stars = achievement.get("stars", 0)
+        value = achievement.get("value", 0)
+        target = achievement.get("target")
+        info = achievement.get("info")
+        progress = (
+            f"{value:,}/{target:,}" if isinstance(value, int) and isinstance(target, int) and target else f"{value:,}"
+        )
+        detail = f"• {name}: ⭐ {stars} — {progress}"
+        if info:
+            detail += f" ({info})"
+        lines.append(detail)
+    if len(sorted_achievements) > limit:
+        lines.append(f"… (+{len(sorted_achievements) - limit} more)")
+    return "\n".join(lines)
 
 
 def _format_timestamp_delta(source: datetime, duration_hours: int = 0) -> str:
@@ -318,11 +597,172 @@ def _build_war_output(clan_name: str, selections: List[str], war_info: Dict[str,
     return "\n\n".join(lines)
 
 
+def _format_player_value(key: str, player_info: Dict[str, Any]) -> str:
+    """Human readable formatter for player information values."""
+    if key == "profile":
+        profile = player_info.get("profile", {})
+        return (
+            f"Name: {profile.get('name', 'Unknown')}\n"
+            f"Tag: {profile.get('tag', 'N/A')}\n"
+            f"Exp Level: {_fmt_numeric(profile.get('exp_level'))}\n"
+            f"Town Hall: TH{profile.get('town_hall_level') or '?'}\n"
+            f"Builder Hall: BH{profile.get('builder_hall_level') or '?'}"
+        )
+
+    if key == "clan":
+        clan = player_info.get("clan", {})
+        if not clan.get("name"):
+            return "Not currently in a clan."
+        return (
+            f"Clan: {clan.get('name')}\n"
+            f"Tag: {clan.get('tag', 'N/A')}\n"
+            f"Role: {str(clan.get('role') or 'Member').replace('_', ' ').title()}"
+        )
+
+    if key == "league":
+        league = player_info.get("league")
+        return league or "Unranked"
+
+    if key == "trophies_overview":
+        return (
+            f"Home: {_fmt_numeric(player_info.get('trophies'))} "
+            f"(Best: {_fmt_numeric(player_info.get('best_trophies'))})\n"
+            f"Versus: {_fmt_numeric(player_info.get('versus_trophies'))}"
+        )
+
+    if key == "war_stats":
+        return (
+            f"War stars: {_fmt_numeric(player_info.get('war_stars'))}\n"
+            f"Attack wins: {_fmt_numeric(player_info.get('attack_wins'))}\n"
+            f"Defense wins: {_fmt_numeric(player_info.get('defense_wins'))}"
+        )
+
+    if key == "donations":
+        return (
+            f"Donations sent: {_fmt_numeric(player_info.get('donations'))}\n"
+            f"Donations received: {_fmt_numeric(player_info.get('donations_received'))}"
+        )
+
+    if key == "heroes":
+        return _format_unit_list(player_info.get("heroes", []), label="Hero")
+
+    if key == "troops":
+        return _format_unit_list(player_info.get("troops", []), label="Troop")
+
+    if key == "spells":
+        return _format_unit_list(player_info.get("spells", []), label="Spell")
+
+    if key == "achievements":
+        return _format_achievement_list(player_info.get("achievements", []))
+
+    value = player_info.get(key)
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
+    if value is None:
+        return "Not available"
+    return str(value)
+
+
+def _build_player_output(player_label: str, selections: List[str], player_info: Dict[str, Any]) -> str:
+    """Render the selected player information fields into plain text."""
+    log.debug("_build_player_output invoked for player %s", player_label)
+    lines: List[str] = [f"**{player_label} — Player Snapshot**"]
+    if not selections:
+        lines.append("Use the dropdown below to choose the details you want to view.")
+        return "\n".join(lines)
+
+    for key in selections:
+        label = PLAYER_INFO_FIELD_MAP.get(key, key.replace("_", " ").title())
+        value = _format_player_value(key, player_info)
+        lines.append(f"**{label}:**\n{value}")
+    return "\n\n".join(lines)
+
+
+def _ensure_guild_config(guild_id: int) -> Dict[str, Any]:
+    """Return the guild config, ensuring required keys exist."""
+    guild_config = server_config.setdefault(guild_id, {"clans": {}, "player_tags": {}})
+    clans = guild_config.setdefault("clans", {})
+    for clan_data in clans.values():
+        if not isinstance(clan_data, dict):
+            continue
+        alerts = clan_data.setdefault("alerts", {})
+        if not isinstance(alerts, dict):
+            clan_data["alerts"] = {"enabled": True, "channel_id": None}
+        else:
+            alerts.setdefault("enabled", True)
+            alerts.setdefault("channel_id", None)
+    guild_config.setdefault("player_tags", {})
+    return guild_config
+
+
 def _clan_names_for_guild(guild_id: int) -> Dict[str, str]:
     """Return a mapping of clan name -> tag for a guild."""
     log.debug("_clan_names_for_guild called")
-    guild_config = server_config.get(guild_id, {})
-    return guild_config.get("Clan tags", {}) or {}
+    guild_config = _ensure_guild_config(guild_id)
+    clans = guild_config.get("clans", {}) or {}
+    return {
+        name: data.get("tag")
+        for name, data in clans.items()
+        if isinstance(data, dict) and data.get("tag")
+    }
+
+
+def _apply_clan_update(
+    guild: discord.Guild,
+    clan_name: str,
+    tag: str,
+    enable_alerts: bool,
+    *,
+    preserve_channel: Optional[int] = None,
+) -> Tuple[str, Optional[str]]:
+    """Persist clan details and return response and follow-up messages."""
+    guild_config = _ensure_guild_config(guild.id)
+    clans = guild_config["clans"]
+
+    previous_entry = clans.get(clan_name, {})
+    previous_alerts = previous_entry.get("alerts", {}) if isinstance(previous_entry, dict) else {}
+    previous_enabled = bool(previous_alerts.get("enabled", False))
+    previous_channel = (
+        preserve_channel
+        if preserve_channel is not None
+        else previous_alerts.get("channel_id")
+    )
+
+    client.set_server_clan(guild.id, clan_name, tag, alerts_enabled=enable_alerts)
+
+    updated_entry = clans.get(clan_name, {})
+    alerts = updated_entry.setdefault("alerts", {"enabled": enable_alerts, "channel_id": None})
+
+    if previous_channel is not None:
+        alerts["channel_id"] = previous_channel
+    elif enable_alerts and (not previous_enabled or alerts.get("channel_id") is None):
+        fallback_channel = _find_alert_channel(guild)
+        if fallback_channel:
+            alerts["channel_id"] = fallback_channel.id
+
+    save_server_config()
+
+    response = (
+        f"✅ `{clan_name}` now points to {tag.upper()} for this server.\n"
+        f"📣 War alerts enabled: {'Yes' if enable_alerts else 'No'}."
+    )
+
+    followup: Optional[str] = None
+    if enable_alerts:
+        channel_id = alerts.get("channel_id")
+        if channel_id:
+            channel_obj = guild.get_channel(channel_id)
+            channel_reference = channel_obj.mention if isinstance(channel_obj, discord.TextChannel) else f"<#{channel_id}>"
+            followup = (
+                f"ℹ️ Alerts for `{clan_name}` will post in {channel_reference} unless you choose another channel "
+                "with `/choose_war_alert_channel`."
+            )
+        else:
+            followup = (
+                "⚠️ I could not find a default channel to use for alerts. "
+                "Please run `/choose_war_alert_channel` to pick one manually."
+            )
+    return response, followup
 
 
 def _format_alert_message(role: Optional[discord.Role], message: str) -> str:
@@ -461,20 +901,54 @@ async def war_alert_loop() -> None:
         if guild is None:
             continue  # Skip guilds the bot is not currently connected to
 
-        channel = _find_alert_channel(guild)
-        if channel is None:
-            continue  # No writable channel to post alerts
-
-        clan_tags = config.get("Clan tags", {})
-        alert_map = config.get("Enable Alert Tracking", {})
-        if not clan_tags:
+        clans: Dict[str, Dict[str, Any]] = config.get("clans", {})  # type: ignore[assignment]
+        if not clans:
             continue  # Nothing configured for this guild
 
         alert_role = discord.utils.get(guild.roles, name=ALERT_ROLE_NAME)
+        default_channel = _find_alert_channel(guild)
 
-        for clan_name, tag in clan_tags.items():
-            if not alert_map.get(clan_name, True):
+        for clan_name, clan_data in clans.items():
+            if not isinstance(clan_data, dict):
+                continue
+            tag = clan_data.get("tag")
+            if not tag:
+                continue
+
+            alerts_cfg = clan_data.get("alerts", {}) if isinstance(clan_data.get("alerts", {}), dict) else {}
+            if not alerts_cfg.get("enabled", True):
                 continue  # Admins disabled tracking for this clan
+
+            target_channel: Optional[discord.TextChannel]
+            channel_id = alerts_cfg.get("channel_id")
+            if channel_id:
+                candidate = guild.get_channel(channel_id)
+                if not isinstance(candidate, discord.TextChannel):
+                    log.debug(
+                        "Skipping alerts for %s in guild %s: stored channel missing",
+                        clan_name,
+                        guild.id,
+                    )
+                    continue
+                if guild.me is None or not candidate.permissions_for(guild.me).send_messages:
+                    log.debug(
+                        "Skipping alerts for %s in guild %s: insufficient permissions for channel %s",
+                        clan_name,
+                        guild.id,
+                        candidate.id,
+                    )
+                    continue
+                target_channel = candidate
+            else:
+                target_channel = default_channel
+                if target_channel is None:
+                    log.debug(
+                        "Skipping alerts for %s in guild %s: no default channel available",
+                        clan_name,
+                        guild.id,
+                    )
+                    continue
+
             try:
                 war = await client.get_clan_war_raw(tag)
             except (coc.errors.PrivateWarLog, coc.errors.NotFound, coc.errors.GatewayError):
@@ -483,7 +957,7 @@ async def war_alert_loop() -> None:
                 continue  # Fail-safe for unexpected library errors
 
             for alert in _collect_war_alerts(guild, clan_name, tag, war, alert_role, now):
-                await send_channel_message(channel, alert)
+                await send_channel_message(target_channel, alert)
 
 
 @war_alert_loop.before_loop
@@ -599,6 +1073,397 @@ async def clan_war_info_menu(interaction: discord.Interaction, clan_name: str):
     initial_output = _build_war_output(clan_name, [], war_info)
     view.last_output = initial_output
     await send_text_response(interaction, initial_output, ephemeral=True, view=view)
+
+
+class PlayerInfoView(discord.ui.View):
+    """Interactive view for displaying player information with sharing controls."""
+
+    def __init__(self, player_label: str, player_info: Dict[str, Any], *, timeout: float = 180):
+        log.debug("PlayerInfoView initialised for player %s", player_label)
+        super().__init__(timeout=timeout)
+        self.player_label = player_label
+        self.player_info = player_info
+        self.last_output: Optional[str] = None
+
+    @discord.ui.select(
+        placeholder="Select the player details to display",
+        min_values=1,
+        max_values=min(5, len(PLAYER_INFO_FIELD_MAP)),
+        options=[
+            discord.SelectOption(label=label, value=key)
+            for key, label in PLAYER_INFO_FIELD_MAP.items()
+        ],
+    )
+    async def select_fields(  # type: ignore[override]
+        self,
+        interaction: discord.Interaction,
+        selector: discord.ui.Select,
+    ):
+        log.debug("PlayerInfoView.select_fields triggered")
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        selections = list(selector.values)
+        self.last_output = _build_player_output(self.player_label, selections, self.player_info)
+        await send_text_response(interaction, self.last_output, ephemeral=True)
+
+    @discord.ui.button(label="Broadcast", style=discord.ButtonStyle.green, emoji="📣")
+    async def broadcast(  # type: ignore[override]
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        log.debug("PlayerInfoView.broadcast triggered")
+        if self.last_output is None:
+            await send_text_response(
+                interaction,
+                "📌 Pick at least one detail from the dropdown first.",
+                ephemeral=True,
+            )
+            return
+        await send_text_response(interaction, self.last_output, ephemeral=False)
+
+    @discord.ui.button(label="Private Copy", style=discord.ButtonStyle.blurple, emoji="📝")
+    async def private(  # type: ignore[override]
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        log.debug("PlayerInfoView.private triggered")
+        if self.last_output is None:
+            await send_text_response(
+                interaction,
+                "📌 Pick at least one detail from the dropdown first.",
+                ephemeral=True,
+            )
+            return
+        await send_text_response(interaction, self.last_output, ephemeral=True)
+
+class ReplaceClanTagView(discord.ui.View):
+    """Confirmation prompt for replacing an existing clan mapped to the same tag."""
+
+    def __init__(
+        self,
+        *,
+        guild: discord.Guild,
+        existing_name: str,
+        new_name: str,
+        tag: str,
+        enable_alerts: bool,
+        timeout: float = 120,
+    ):
+        super().__init__(timeout=timeout)
+        self.guild = guild
+        self.existing_name = existing_name
+        self.new_name = new_name
+        self.tag = tag
+        self.enable_alerts = enable_alerts
+
+    def _disable(self) -> None:
+        for item in self.children:
+            item.disabled = True
+
+    @discord.ui.button(label="Yes, replace it", style=discord.ButtonStyle.danger, emoji="♻️")
+    async def confirm(  # type: ignore[override]
+        self, interaction: discord.Interaction, _: discord.ui.Button
+    ) -> None:
+        log.debug(
+            "ReplaceClanTagView confirm: replacing %s with %s for guild %s",
+            self.existing_name,
+            self.new_name,
+            self.guild.id,
+        )
+        guild_config = _ensure_guild_config(self.guild.id)
+        clans = guild_config["clans"]
+        preserved_channel: Optional[int] = None
+        existing_entry = clans.pop(self.existing_name, None)
+        if isinstance(existing_entry, dict):
+            preserved_channel = (
+                existing_entry.get("alerts", {}).get("channel_id")
+                if isinstance(existing_entry.get("alerts", {}), dict)
+                else None
+            )
+        response, followup = _apply_clan_update(
+            self.guild,
+            self.new_name,
+            self.tag,
+            self.enable_alerts,
+            preserve_channel=preserved_channel,
+        )
+        notice = f"{response}\n\n`{self.existing_name}` has been removed."
+        self._disable()
+        await interaction.response.edit_message(content=notice, view=self)
+        if followup:
+            await interaction.followup.send(followup, ephemeral=True)
+        self.stop()
+
+    @discord.ui.button(label="No, keep existing", style=discord.ButtonStyle.secondary, emoji="✋")
+    async def cancel(  # type: ignore[override]
+        self, interaction: discord.Interaction, _: discord.ui.Button
+    ) -> None:
+        log.debug(
+            "ReplaceClanTagView cancel: keeping %s for guild %s",
+            self.existing_name,
+            self.guild.id,
+        )
+        self._disable()
+        await interaction.response.edit_message(
+            content="ℹ️ No changes were made; existing clan mappings remain intact.", view=self
+        )
+        self.stop()
+
+
+class ChannelChoiceSelect(discord.ui.Select):
+    """Select component for choosing the destination text channel."""
+
+    def __init__(
+        self,
+        parent_view: "ChooseWarAlertChannelView",
+        channels: List[discord.TextChannel],
+        *,
+        limited: bool = False,
+    ):
+        self.parent_view = parent_view
+        self.limited = limited
+        options = self._build_options(channels)
+        placeholder = (
+            "Select a text channel (filtered list)"
+            if limited
+            else "Select a text channel for alerts"
+        )
+        super().__init__(placeholder=placeholder, min_values=1, max_values=1, options=options)
+
+    @staticmethod
+    def _build_options(channels: List[discord.TextChannel]) -> List[discord.SelectOption]:
+        return [
+            discord.SelectOption(
+                label=channel.name[:100],
+                description=f"#{channel.name} in {channel.category.name if channel.category else 'No category'}",
+                value=str(channel.id),
+            )
+            for channel in channels
+        ]
+
+    def update_options(self, channels: List[discord.TextChannel], *, limited: bool) -> None:
+        """Refresh the select options based on a filtered channel list."""
+        self.options = self._build_options(channels)
+        self.placeholder = (
+            "Select a text channel (filtered list)"
+            if limited
+            else "Select a text channel for alerts"
+        )
+        self.limited = limited
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        channel_id = int(self.values[0])
+        channel = self.parent_view.guild.get_channel(channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message(
+                "⚠️ That channel is no longer available. Please choose another.", ephemeral=True
+            )
+            return
+        await self.parent_view.complete_selection(interaction, channel)
+
+
+class ChannelFilterModal(discord.ui.Modal):
+    """Modal dialog to filter the channel list when more than 25 options are present."""
+
+    def __init__(self, parent_view: "ChooseWarAlertChannelView"):
+        super().__init__(title="Filter Channels")
+        self.parent_view = parent_view
+        self.query = discord.ui.TextInput(
+            label="Filter by name",
+            placeholder="Enter part of the channel name (case-insensitive)",
+            required=False,
+            max_length=50,
+        )
+        self.add_item(self.query)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        query = self.query.value.strip().lower()
+        channels = self.parent_view.current_channel_candidates
+        if query:
+            channels = [channel for channel in channels if query in channel.name.lower()]
+        if not channels:
+            await interaction.response.send_message(
+                "⚠️ No channels matched that filter. Try a different phrase.", ephemeral=True
+            )
+            return
+        limited = len(channels) > 25
+        self.parent_view.update_channel_select_options(channels[:25], limited=limited)
+        await interaction.response.edit_message(
+            content=self.parent_view.render_status_message(), view=self.parent_view
+        )
+
+
+class ChannelFilterButton(discord.ui.Button):
+    """Button that opens a modal to filter the channel list."""
+
+    def __init__(self, parent_view: "ChooseWarAlertChannelView"):
+        super().__init__(label="Filter channels", style=discord.ButtonStyle.primary, emoji="🔍")
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        await interaction.response.send_modal(ChannelFilterModal(self.parent_view))
+
+
+class CategorySelect(discord.ui.Select):
+    """Select component for choosing a channel category."""
+
+    def __init__(
+        self,
+        parent_view: "ChooseWarAlertChannelView",
+        category_options: List[discord.SelectOption],
+    ):
+        super().__init__(
+            placeholder="Select a channel category",
+            min_values=1,
+            max_values=1,
+            options=category_options,
+        )
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        category_value = self.values[0]
+        category_id = None if category_value == "none" else int(category_value)
+        await self.parent_view.handle_category_selection(interaction, category_id)
+
+
+class ChooseWarAlertChannelView(discord.ui.View):
+    """Interactive flow for selecting the alert destination channel."""
+
+    def __init__(
+        self,
+        *,
+        guild: discord.Guild,
+        clan_name: str,
+        channels_by_category: Dict[Optional[int], List[discord.TextChannel]],
+        timeout: float = 180,
+    ):
+        super().__init__(timeout=timeout)
+        self.guild = guild
+        self.clan_name = clan_name
+        self.channels_by_category = channels_by_category
+        self.selected_category_id: Optional[int] = None
+        self.current_channel_candidates: List[discord.TextChannel] = []
+        self.channel_select: Optional[ChannelChoiceSelect] = None
+        self.filter_button: Optional[ChannelFilterButton] = None
+        self.category_selected = False
+
+        category_options = self._build_category_options()
+        self.add_item(CategorySelect(self, category_options))
+
+    def _build_category_options(self) -> List[discord.SelectOption]:
+        options: List[discord.SelectOption] = []
+        for category_id, channels in self.channels_by_category.items():
+            if not channels:
+                continue
+            if category_id is None:
+                label = "No Category"
+            else:
+                category = self.guild.get_channel(category_id)
+                if isinstance(category, discord.CategoryChannel):
+                    label = category.name[:100]
+                else:
+                    label = "Unknown Category"
+            options.append(
+                discord.SelectOption(
+                    label=label,
+                    description=f"{len(channels)} channel(s)",
+                    value="none" if category_id is None else str(category_id),
+                )
+            )
+        if not options:
+            options.append(discord.SelectOption(label="No eligible categories", value="none"))
+        return options
+
+    def render_status_message(self) -> str:
+        if not self.category_selected:
+            return "Select a category to continue."
+        category_label = (
+            "No Category"
+            if self.selected_category_id is None
+            else (
+                self.guild.get_channel(self.selected_category_id).name
+                if isinstance(self.guild.get_channel(self.selected_category_id), discord.CategoryChannel)
+                else "Unknown Category"
+            )
+        )
+        return (
+            f"Category selected: **{category_label}**.\n"
+            "Pick a channel below, or filter the list if you do not see the one you need."
+        )
+
+    async def handle_category_selection(
+        self,
+        interaction: discord.Interaction,
+        category_id: Optional[int],
+    ) -> None:
+        self.selected_category_id = category_id
+        self.category_selected = True
+        self.current_channel_candidates = self.channels_by_category.get(category_id, [])
+
+        # Remove previous widgets if they exist.
+        if self.channel_select:
+            self.remove_item(self.channel_select)
+            self.channel_select = None
+        if self.filter_button:
+            self.remove_item(self.filter_button)
+            self.filter_button = None
+
+        if not self.current_channel_candidates:
+            await interaction.response.edit_message(
+                content="⚠️ No channels are available in that category. Please choose another.",
+                view=self,
+            )
+            return
+
+        limited = len(self.current_channel_candidates) > 25
+        initial_channels = self.current_channel_candidates[:25]
+        self.channel_select = ChannelChoiceSelect(self, initial_channels, limited=limited)
+        self.add_item(self.channel_select)
+
+        if limited:
+            self.filter_button = ChannelFilterButton(self)
+            self.add_item(self.filter_button)
+
+        await interaction.response.edit_message(
+            content=self.render_status_message(),
+            view=self,
+        )
+
+    def update_channel_select_options(self, channels: List[discord.TextChannel], *, limited: bool) -> None:
+        if self.channel_select is None:
+            return
+        self.channel_select.update_options(channels, limited=limited)
+
+    async def complete_selection(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel,
+    ) -> None:
+        log.debug(
+            "choose_war_alert_channel selected %s for clan %s in guild %s",
+            channel.id,
+            self.clan_name,
+            self.guild.id,
+        )
+        guild_config = _ensure_guild_config(self.guild.id)
+        clan_entry = guild_config["clans"].get(self.clan_name)
+        if not isinstance(clan_entry, dict):
+            await interaction.response.send_message(
+                "⚠️ That clan configuration no longer exists. Please re-run the command.",
+                ephemeral=True,
+            )
+            return
+
+        alerts = clan_entry.setdefault("alerts", {"enabled": True, "channel_id": None})
+        alerts["channel_id"] = channel.id
+        save_server_config()
+
+        for child in self.children:
+            child.disabled = True
+
+        message = (
+            f"✅ Alerts for `{self.clan_name}` will now post in {channel.mention}.\n"
+            "⚠️ If I lose send permissions there, alerts will pause until you choose another channel."
+        )
+        await interaction.response.edit_message(content=message, view=self)
+        self.stop()
 
 
 class RoleAssignmentView(discord.ui.View):
@@ -974,6 +1839,7 @@ async def assign_clan_role(interaction: discord.Interaction):
 
 @clan_war_info_menu.autocomplete("clan_name")
 @assign_bases.autocomplete("clan_name")
+@choose_war_alert_channel.autocomplete("clan_name")
 async def clan_name_autocomplete(interaction: discord.Interaction, current: str):
     """Provide clan name suggestions from the server configuration."""
     if interaction.guild is None:
@@ -983,6 +1849,22 @@ async def clan_name_autocomplete(interaction: discord.Interaction, current: str)
     suggestions = [
         app_commands.Choice(name=name, value=name)
         for name in clan_map
+        if current_lower in name.lower()
+    ]
+    return suggestions[:25]
+
+
+@player_info.autocomplete("player_reference")
+async def player_reference_autocomplete(interaction: discord.Interaction, current: str):
+    """Provide player name suggestions sourced from the server configuration."""
+    if interaction.guild is None:
+        return []
+    guild_config = _ensure_guild_config(interaction.guild.id)
+    player_tags: Dict[str, str] = guild_config.get("player_tags", {})
+    current_lower = current.lower()
+    suggestions = [
+        app_commands.Choice(name=name, value=name)
+        for name in player_tags
         if current_lower in name.lower()
     ]
     return suggestions[:25]
