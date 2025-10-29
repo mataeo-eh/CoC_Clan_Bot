@@ -1,6 +1,8 @@
+ENV/
 **/.venv
 **/ENV/*
 *pycache*
 TODO.md
 logs/
 COC_Clan_Bot.code-workspace
+git_commands.md

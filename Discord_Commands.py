@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Literal, Optional, Set, Tuple
 
 import discord
 from discord import app_commands
@@ -21,6 +21,7 @@ MAX_MESSAGE_LENGTH = 1900
 ALERT_ROLE_NAME = "War Alerts"
 # Matches the poll frequency of the background alert loop (5 minutes).
 ALERT_WINDOW_SECONDS = 300
+README_URL = "https://github.com/mataeo/COC_Clan_Bot/blob/main/README.md"
 
 # Cache of alert milestones sent per (guild, clan, war) tuple to avoid duplicates.
 alert_state: Dict[Tuple[int, str, str], Set[str]] = {}
@@ -147,6 +148,18 @@ def _elapsed_within_window(value: Optional[float], *, target: float) -> bool:
     return (value - target) <= ALERT_WINDOW_SECONDS
 
 
+def _normalise_player_tag(raw_tag: str) -> Optional[str]:
+    """Return a standardised player tag with a leading #."""
+    if not isinstance(raw_tag, str):
+        return None
+    cleaned = raw_tag.strip().upper()
+    if not cleaned:
+        return None
+    if not cleaned.startswith("#"):
+        cleaned = f"#{cleaned.lstrip('#')}"
+    return cleaned
+
+
 # ---------------------------------------------------------------------------
 # Slash command: /set_clan
 # ---------------------------------------------------------------------------
@@ -231,6 +244,24 @@ async def set_clan(
     await send_text_response(interaction, response, ephemeral=True)
     if followup:
         await interaction.followup.send(followup, ephemeral=True)
+
+
+@bot.tree.command(name="help", description="Show a quick primer on using the Clan Bot.")
+async def help_command(interaction: discord.Interaction):
+    """Provide a concise overview plus a link to the full documentation."""
+    log_command_call("help")
+    log.debug("help_command invoked")
+    summary = (
+        "Clan_Bot keeps your Clash of Clans server organised—fetch war intel, assign bases, "
+        "and share updates with just a few prompts."
+    )
+    message = (
+        f"{summary}\n\n"
+        f"📘 Full guide: {README_URL}\n"
+        "Tip: After entering any command’s required options, press enter to run it. "
+        "Interactive menus or buttons appear right afterward to guide the rest of the workflow."
+    )
+    await send_text_response(interaction, message, ephemeral=True)
 
 
 @bot.tree.command(
@@ -328,9 +359,156 @@ async def choose_war_alert_channel(interaction: discord.Interaction, clan_name: 
     )
     intro = (
         f"{current_status}\n"
-        "Select a category to see available channels."
+        "1️⃣ Pick a channel category below, 2️⃣ choose the exact text channel, then 3️⃣ confirm the selection. "
+        "Alerts use the channel you select as soon as you finish the flow."
     )
     await send_text_response(interaction, intro, ephemeral=True, view=view)
+
+
+@bot.tree.command(
+    name="link_player",
+    description="Link or unlink Clash of Clans player tags to Discord members.",
+)
+@app_commands.describe(
+    action="Choose 'link' to add a tag or 'unlink' to remove one.",
+    player_tag="Player tag (e.g. #ABC123). The tag will be validated before saving.",
+    alias="Optional nickname that appears in autocomplete. Defaults to the in-game name.",
+    target_member="Only admins may manage tags for someone else.",
+)
+async def link_player(
+    interaction: discord.Interaction,
+    action: Literal["link", "unlink"],
+    player_tag: str,
+    alias: Optional[str] = None,
+    target_member: Optional[discord.Member] = None,
+):
+    """Allow members to map their Discord identity to one or more Clash of Clans accounts."""
+    log_command_call("link_player")
+    log.debug(
+        "link_player invoked action=%s tag=%s target=%s",
+        action,
+        player_tag,
+        target_member.id if isinstance(target_member, discord.Member) else None,
+    )
+
+    if interaction.guild is None:
+        await send_text_response(
+            interaction,
+            "❌ This command must be used inside a Discord server.",
+            ephemeral=True,
+        )
+        return
+
+    actor = interaction.user if isinstance(interaction.user, discord.Member) else interaction.guild.get_member(interaction.user.id)
+    if actor is None:
+        await send_text_response(
+            interaction,
+            "⚠️ I could not resolve your guild membership. Please try again.",
+            ephemeral=True,
+        )
+        return
+
+    target = target_member or actor
+    action_lower = action.lower()
+    normalized_tag = _normalise_player_tag(player_tag)
+    if normalized_tag is None:
+        await send_text_response(
+            interaction,
+            "⚠️ Please provide a valid player tag (for example `#ABC123`).",
+            ephemeral=True,
+        )
+        return
+
+    if target != actor and not actor.guild_permissions.administrator:
+        await send_text_response(
+            interaction,
+            "❌ Only administrators can manage linked tags for other members.",
+            ephemeral=True,
+        )
+        return
+
+    guild = interaction.guild
+    guild_config = _ensure_guild_config(guild.id)
+    accounts = guild_config.setdefault("player_accounts", {})
+    user_key = str(target.id)
+    existing_entries = accounts.setdefault(user_key, [])
+
+    if action_lower == "link":
+        try:
+            player_payload = await client.get_player(normalized_tag)
+        except coc.errors.NotFound:
+            await send_text_response(
+                interaction,
+                f"⚠️ I couldn't find a Clash of Clans profile with tag `{normalized_tag}`.",
+                ephemeral=True,
+            )
+            return
+        except Exception as exc:
+            log.exception("Unexpected error while linking player")
+            await send_text_response(
+                interaction,
+                f"⚠️ Unable to verify that tag right now: {exc}",
+                ephemeral=True,
+            )
+            return
+
+        inferred_alias = alias.strip() if isinstance(alias, str) and alias.strip() else None
+        if inferred_alias is None:
+            inferred_alias = player_payload.get("profile", {}).get("name")
+        if inferred_alias:
+            inferred_alias = inferred_alias.strip()
+
+        # Update existing entry if the tag is already linked.
+        updated = False
+        for record in existing_entries:
+            if isinstance(record, dict) and record.get("tag") == normalized_tag:
+                record["alias"] = inferred_alias
+                updated = True
+                break
+        if not updated:
+            existing_entries.append({"tag": normalized_tag, "alias": inferred_alias})
+
+        save_server_config()
+        alias_note = f" as `{inferred_alias}`" if inferred_alias else ""
+        target_label = target.display_name if isinstance(target, discord.Member) else target.id
+        await send_text_response(
+            interaction,
+            f"✅ Linked `{normalized_tag}`{alias_note} to {target_label}. "
+            "You can now reference it quickly with `/player_info`.",
+            ephemeral=True,
+        )
+        return
+
+    if action_lower == "unlink":
+        before = len(existing_entries)
+        existing_entries[:] = [
+            entry
+            for entry in existing_entries
+            if not (isinstance(entry, dict) and entry.get("tag") == normalized_tag)
+        ]
+        if not existing_entries:
+            accounts.pop(user_key, None)
+        if before == len(existing_entries):
+            await send_text_response(
+                interaction,
+                f"⚠️ No link for `{normalized_tag}` was found for that member.",
+                ephemeral=True,
+            )
+            return
+        save_server_config()
+        target_label = target.display_name if isinstance(target, discord.Member) else target.id
+        await send_text_response(
+            interaction,
+            f"🗑️ Removed `{normalized_tag}` from {target_label}'s linked accounts.",
+            ephemeral=True,
+        )
+        return
+
+    await send_text_response(
+        interaction,
+        "⚠️ Please choose either 'link' or 'unlink' for the action.",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(
@@ -365,23 +543,87 @@ async def player_info(interaction: discord.Interaction, player_reference: str):
     guild = interaction.guild
     guild_config = _ensure_guild_config(guild.id)
     player_tags: Dict[str, str] = guild_config.get("player_tags", {})
+    player_accounts: Dict[str, List[Dict[str, Optional[str]]]] = guild_config.get("player_accounts", {})
 
-    if reference.startswith("#"):
-        player_tag = reference.upper()
+    alias_lookup: Dict[str, str] = {}
+    mention_lookup: Dict[str, str] = {}
+    for user_id_str, records in player_accounts.items():
+        if not isinstance(records, list):
+            continue
+        member = None
+        if user_id_str.isdigit():
+            member = guild.get_member(int(user_id_str))
+        display_name = member.display_name if member else None
+        first_tag: Optional[str] = None
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            tag = record.get("tag")
+            normalised_tag = _normalise_player_tag(tag) if isinstance(tag, str) else None
+            if normalised_tag is None:
+                continue
+            alias = record.get("alias")
+            if isinstance(alias, str) and alias.strip():
+                alias_lookup[alias.strip().lower()] = normalised_tag
+            if display_name:
+                alias_lookup.setdefault(display_name.lower(), normalised_tag)
+            first_tag = first_tag or normalised_tag
+        if first_tag:
+            mention_lookup[user_id_str] = first_tag
+            if display_name:
+                alias_lookup.setdefault(f"@{display_name.lower()}", first_tag)
+
+    normalised_reference = reference.upper() if reference.startswith("#") else None
+    player_tag: Optional[str] = None
+
+    if normalised_reference:
+        player_tag = _normalise_player_tag(reference)
     else:
-        lookup = {name.lower(): tag for name, tag in player_tags.items()}
-        player_tag = lookup.get(reference.lower())
-        if not player_tag:
-            await send_text_response(
-                interaction,
-                (
-                    f"⚠️ I could not find a saved player named `{reference}`.\n"
-                    "Provide a full player tag like `#ABC123` or add the player to the config."
-                ),
-                ephemeral=True,
-            )
-            return
-        player_tag = player_tag.upper()
+        lowered = reference.lower()
+        # Mentions arrive as <@123> or <@!123>
+        if reference.startswith("<@") and reference.endswith(">"):
+            candidate = reference.strip("<@!>")
+            player_tag = mention_lookup.get(candidate)
+        if player_tag is None:
+            player_tag = alias_lookup.get(lowered)
+        if player_tag is None:
+            player_tag = alias_lookup.get(reference)
+        if player_tag is None:
+            mapped_tag = player_tags.get(reference)
+            if mapped_tag is None:
+                mapped_tag = player_tags.get(reference.title())
+            if mapped_tag is None:
+                mapped_tag = player_tags.get(reference.lower())
+            if mapped_tag:
+                player_tag = _normalise_player_tag(mapped_tag)
+        if player_tag is None:
+            mapped_tag = alias_lookup.get(lowered.strip())
+            if mapped_tag:
+                player_tag = mapped_tag
+        if player_tag is None:
+            mapped_tag = player_tags.get(reference.lower())
+            if mapped_tag:
+                player_tag = _normalise_player_tag(mapped_tag)
+        if player_tag is None:
+            mapped_tag = player_tags.get(reference)
+            if mapped_tag:
+                player_tag = _normalise_player_tag(mapped_tag)
+        if player_tag is None:
+            # If the user typed a raw tag without leading '#'
+            potential_tag = _normalise_player_tag(reference)
+            if potential_tag and potential_tag.lstrip("#").isalnum():
+                player_tag = potential_tag
+
+    if player_tag is None:
+        await send_text_response(
+            interaction,
+            (
+                f"⚠️ I could not find a saved player named `{reference}`.\n"
+                "Provide a full player tag like `#ABC123` or link the account with `/link_player` first."
+            ),
+            ephemeral=True,
+        )
+        return
 
     await interaction.response.defer(ephemeral=True, thinking=True)
     try:
@@ -587,7 +829,10 @@ def _build_war_output(clan_name: str, selections: List[str], war_info: Dict[str,
     log.debug("_build_war_output invoked for clan %s", clan_name)
     lines: List[str] = [f"**{clan_name} — War Snapshot**"]
     if not selections:
-        lines.append("Use the dropdown below to choose the details you want to view.")
+        lines.append(
+            "After submitting the command, use the dropdown below to choose which war details to view. "
+            "The buttons let you broadcast the current selection or keep a private copy."
+        )
         return "\n".join(lines)
 
     for key in selections:
@@ -668,7 +913,10 @@ def _build_player_output(player_label: str, selections: List[str], player_info: 
     log.debug("_build_player_output invoked for player %s", player_label)
     lines: List[str] = [f"**{player_label} — Player Snapshot**"]
     if not selections:
-        lines.append("Use the dropdown below to choose the details you want to view.")
+        lines.append(
+            "After the command sends, pick the player details you need from the dropdown. "
+            "Use the buttons to broadcast the current view or grab a private copy."
+        )
         return "\n".join(lines)
 
     for key in selections:
@@ -676,6 +924,41 @@ def _build_player_output(player_label: str, selections: List[str], player_info: 
         value = _format_player_value(key, player_info)
         lines.append(f"**{label}:**\n{value}")
     return "\n\n".join(lines)
+
+
+def _normalise_player_accounts_map(raw: Any) -> Dict[str, List[Dict[str, Optional[str]]]]:
+    """Ensure player account mappings use the expected structure."""
+    if not isinstance(raw, dict):
+        return {}
+
+    normalised: Dict[str, List[Dict[str, Optional[str]]]] = {}
+    for user_id, records in raw.items():
+        key = str(user_id)
+        entries: List[Dict[str, Optional[str]]] = []
+        if isinstance(records, list):
+            source_iterable = records
+        elif isinstance(records, dict):
+            source_iterable = [{"alias": alias, "tag": tag} for alias, tag in records.items()]
+        else:
+            continue
+
+        for record in source_iterable:
+            if isinstance(record, dict):
+                tag = record.get("tag")
+                if not isinstance(tag, str) or not tag.strip():
+                    continue
+                alias = record.get("alias")
+                entries.append(
+                    {
+                        "tag": tag.strip().upper(),
+                        "alias": alias.strip() if isinstance(alias, str) and alias.strip() else None,
+                    }
+                )
+            elif isinstance(record, str) and record.strip():
+                entries.append({"tag": record.strip().upper(), "alias": None})
+        if entries:
+            normalised[key] = entries
+    return normalised
 
 
 def _ensure_guild_config(guild_id: int) -> Dict[str, Any]:
@@ -692,6 +975,8 @@ def _ensure_guild_config(guild_id: int) -> Dict[str, Any]:
             alerts.setdefault("enabled", True)
             alerts.setdefault("channel_id", None)
     guild_config.setdefault("player_tags", {})
+    accounts = _normalise_player_accounts_map(guild_config.get("player_accounts", {}))
+    guild_config["player_accounts"] = accounts
     return guild_config
 
 
@@ -849,46 +1134,6 @@ def _collect_war_alerts(
 
 
 
-
-def _parse_assignment_string(definition: str) -> Dict[int, List[int]]:
-    """Parse admin assignment input into a mapping of home -> enemy bases."""
-    log.debug("_parse_assignment_string invoked")
-    mapping: Dict[int, List[int]] = {}
-    if not definition.strip():
-        raise ValueError("Assignments cannot be empty.")
-    blocks = definition.replace("\n", ";").split(";")
-    for block in blocks:
-        chunk = block.strip()
-        if not chunk:
-            continue
-        if ":" not in chunk:
-            raise ValueError("Each assignment must use the format base:target")
-        left, right = chunk.split(":", 1)
-        try:
-            home = int(left.strip())
-        except ValueError as exc:
-            raise ValueError(f"Invalid home base number '{left}'.") from exc
-        if home in mapping:
-            raise ValueError(f"Duplicate assignment for base {home}.")
-        targets: List[int] = []
-        for part in right.split(','):
-            data = part.strip()
-            if not data:
-                continue
-            try:
-                targets.append(int(data))
-            except ValueError as exc:
-                raise ValueError(f"Invalid enemy base number '{data}'.") from exc
-        if not targets:
-            raise ValueError(f"Base {home} must list at least one target.")
-        if len(targets) > 2:
-            raise ValueError(f"Base {home} can only receive up to two targets.")
-        mapping[home] = targets
-    if not mapping:
-        raise ValueError("No valid assignments were provided.")
-    #if len(mapping) > 15:
-        #raise ValueError("You can assign at most 15 bases per command.")
-    return mapping
 
 # Poll every five minutes so 5-minute alert thresholds are respected.
 @tasks.loop(minutes=5)
@@ -1373,7 +1618,9 @@ class ChooseWarAlertChannelView(discord.ui.View):
 
     def render_status_message(self) -> str:
         if not self.category_selected:
-            return "Select a category to continue."
+            return (
+                "Step 1: choose a category so I can list the channels you and I can both post in."
+            )
         category_label = (
             "No Category"
             if self.selected_category_id is None
@@ -1385,7 +1632,8 @@ class ChooseWarAlertChannelView(discord.ui.View):
         )
         return (
             f"Category selected: **{category_label}**.\n"
-            "Pick a channel below, or filter the list if you do not see the one you need."
+            "Step 2: pick the alert channel below (use the 🔍 button if you need to filter the list). "
+            "Step 3: confirm to save the choice."
         )
 
     async def handle_category_selection(
@@ -1463,6 +1711,315 @@ class ChooseWarAlertChannelView(discord.ui.View):
             "⚠️ If I lose send permissions there, alerts will pause until you choose another channel."
         )
         await interaction.response.edit_message(content=message, view=self)
+        self.stop()
+
+
+class AssignBasesModeView(discord.ui.View):
+    """Entry point that lets admins choose between per-player assignments or a general rule."""
+
+    def __init__(
+        self,
+        *,
+        interaction: discord.Interaction,
+        clan_name: str,
+        home_roster: Dict[int, str],
+        max_enemy: int,
+        alert_role: Optional[discord.Role],
+    ):
+        super().__init__(timeout=180)
+        self.interaction = interaction
+        self.guild = interaction.guild
+        self.clan_name = clan_name
+        self.home_roster = home_roster
+        self.max_enemy = max_enemy
+        self.alert_role = alert_role
+        self.channel: Optional[discord.TextChannel] = (
+            interaction.channel if isinstance(interaction.channel, discord.TextChannel) else None
+        )
+
+    def _disable(self) -> None:
+        for child in self.children:
+            child.disabled = True
+
+    def intro_message(self) -> str:
+        return (
+            "Choose how you want to distribute assignments:\n"
+            "• **Per Player Assignments** lets you build a list for each base.\n"
+            "• **General Rule** posts a free-form instruction (e.g. “Mirror attacks”)."
+        )
+
+    @discord.ui.button(label="Per Player Assignments", style=discord.ButtonStyle.primary, emoji="🗂️")
+    async def start_per_player(  # type: ignore[override]
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        """Switch to the per-player assignment workflow."""
+        log.debug("AssignBasesModeView -> per player path")
+        self._disable()
+        per_player_view = PerPlayerAssignmentView(
+            parent=self,
+            home_roster=self.home_roster,
+            max_enemy=self.max_enemy,
+            alert_role=self.alert_role,
+        )
+        await interaction.response.edit_message(
+            content=per_player_view.render_message(),
+            view=per_player_view,
+        )
+
+    @discord.ui.button(label="General Assignment Rule", style=discord.ButtonStyle.secondary, emoji="📝")
+    async def start_general_rule(  # type: ignore[override]
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        """Prompt the admin for a general rule to broadcast."""
+        log.debug("AssignBasesModeView -> general rule path")
+        modal = GeneralAssignmentModal(parent=self)
+        await interaction.response.send_modal(modal)
+
+
+class PerPlayerAssignmentView(discord.ui.View):
+    """Interactive builder for per-player base assignments."""
+
+    def __init__(
+        self,
+        *,
+        parent: AssignBasesModeView,
+        home_roster: Dict[int, str],
+        max_enemy: int,
+        alert_role: Optional[discord.Role],
+        timeout: float = 300,
+    ):
+        super().__init__(timeout=timeout)
+        self.parent = parent
+        self.guild = parent.guild
+        self.clan_name = parent.clan_name
+        self.home_roster = home_roster
+        self.max_enemy = max_enemy
+        self.alert_role = alert_role
+        self.assignments: Dict[int, List[int]] = {}
+        self.add_item(HomeBaseSelect(self))
+
+    def render_message(self) -> str:
+        if not self.assignments:
+            details = "No assignments captured yet."
+        else:
+            lines = []
+            for base in sorted(self.assignments.keys()):
+                member_name = self.home_roster.get(base, f"Base {base}")
+                targets = " and ".join(str(num) for num in self.assignments[base])
+                lines.append(f"[{base}] {member_name}: {targets}")
+            details = "\n".join(lines)
+        return (
+            "Per-player mode: pick a home base from the dropdown, enter the target base numbers when prompted, "
+            "and repeat until you're ready to broadcast.\n"
+            "Once the list looks good, press **Post Assignments**."
+            f"\n\nCurrent assignments:\n{details}"
+        )
+
+    def update_assignment(self, base: int, targets: List[int]) -> None:
+        self.assignments[base] = targets
+
+    def clear_assignments(self) -> None:
+        self.assignments.clear()
+
+    def build_broadcast_content(self) -> Optional[str]:
+        if not self.assignments:
+            return None
+        lines: List[str] = []
+        for base in sorted(self.assignments.keys()):
+            member_name = self.home_roster.get(base, f"Base {base}")
+            target_text = " and ".join(str(num) for num in self.assignments[base])
+            lines.append(f"[{base}] {member_name}: {target_text}")
+        mention = f"{self.alert_role.mention} " if self.alert_role else ""
+        return f"{mention}Assignments for `{self.clan_name}`\n" + "\n".join(lines)
+
+    @discord.ui.button(label="Post Assignments", style=discord.ButtonStyle.success, emoji="📣")
+    async def post_assignments(  # type: ignore[override]
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        content = self.build_broadcast_content()
+        if content is None:
+            await interaction.response.send_message(
+                "⚠️ Add at least one assignment before broadcasting.",
+                ephemeral=True,
+            )
+            return
+
+        log.debug(
+            "PerPlayerAssignmentView posting assignments for clan %s: %s",
+            self.clan_name,
+            self.assignments,
+        )
+        channel = self.parent.channel
+        if channel is None or not channel.permissions_for(self.guild.me).send_messages:
+            await interaction.response.send_message(
+                "⚠️ I don't have permission to post in this channel. Try again after adjusting permissions.",
+                ephemeral=True,
+            )
+            return
+
+        for chunk in _chunk_content(content):
+            await channel.send(chunk)
+        await interaction.response.edit_message(
+            content="✅ Assignments posted to the channel.",
+            view=None,
+        )
+        self.stop()
+
+    @discord.ui.button(label="Clear selections", style=discord.ButtonStyle.danger, emoji="🧹")
+    async def clear_all(  # type: ignore[override]
+        self,
+        interaction: discord.Interaction,
+        _: discord.ui.Button,
+    ) -> None:
+        log.debug("PerPlayerAssignmentView clearing assignments for clan %s", self.clan_name)
+        self.clear_assignments()
+        await interaction.response.edit_message(
+            content=self.render_message(),
+            view=self,
+        )
+
+
+class HomeBaseSelect(discord.ui.Select):
+    """Select component that lets admins choose the home base to configure."""
+
+    def __init__(self, parent_view: PerPlayerAssignmentView):
+        options = [
+            discord.SelectOption(
+                label=f"{position}. {name}",
+                value=str(position),
+                description="Select to assign enemy targets.",
+            )
+            for position, name in sorted(parent_view.home_roster.items())
+        ]
+        super().__init__(
+            placeholder="Pick a home base to assign targets.",
+            min_values=1,
+            max_values=1,
+            options=options[:25],
+        )
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        base = int(self.values[0])
+        modal = AssignmentModal(parent_view=self.parent_view, base=base)
+        await interaction.response.send_modal(modal)
+
+
+class AssignmentModal(discord.ui.Modal):
+    """Modal that captures up to two enemy base numbers for a selected home base."""
+
+    def __init__(self, parent_view: PerPlayerAssignmentView, base: int):
+        super().__init__(title=f"Assign targets for base {base}")
+        self.parent_view = parent_view
+        self.base = base
+        self.targets = discord.ui.TextInput(
+            label="Enemy base numbers",
+            placeholder="Enter 1 or 2 numbers separated by a comma (e.g. 3,14)",
+            required=True,
+            max_length=20,
+        )
+        self.add_item(self.targets)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        raw = self.targets.value.replace(" ", "")
+        parts = [part for part in raw.split(",") if part]
+        try:
+            numbers = [int(part) for part in parts]
+        except ValueError:
+            await interaction.response.send_message(
+                "⚠️ Please enter whole numbers separated by commas.",
+                ephemeral=True,
+            )
+            return
+
+        if not numbers or len(numbers) > 2:
+            await interaction.response.send_message(
+                "⚠️ Provide one or two enemy base numbers.",
+                ephemeral=True,
+            )
+            return
+
+        for num in numbers:
+            if num < 1 or num > self.parent_view.max_enemy:
+                await interaction.response.send_message(
+                    f"⚠️ Enemy base {num} is not present in the current war.",
+                    ephemeral=True,
+                )
+                return
+
+        self.parent_view.update_assignment(self.base, numbers)
+        log.debug(
+            "AssignmentModal stored targets %s for base %s in clan %s",
+            numbers,
+            self.base,
+            self.parent_view.clan_name,
+        )
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
+
+
+class GeneralAssignmentModal(discord.ui.Modal):
+    """Modal that captures a free-form general assignment message."""
+
+    def __init__(self, parent: AssignBasesModeView):
+        super().__init__(title="Broadcast a general assignment")
+        self.parent = parent
+        self.instructions = discord.ui.TextInput(
+            label="What should everyone do?",
+            placeholder="Example: Everyone attack your mirror as soon as you are ready.",
+            style=discord.TextStyle.paragraph,
+            max_length=MAX_MESSAGE_LENGTH - 50,
+        )
+        self.add_item(self.instructions)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        text = self.instructions.value.strip()
+        if not text:
+            await interaction.response.send_message(
+                "⚠️ The message cannot be empty.",
+                ephemeral=True,
+            )
+            return
+
+        channel = self.parent.channel
+        if channel is None or not channel.permissions_for(self.parent.guild.me).send_messages:
+            await interaction.response.send_message(
+                "⚠️ I cannot send messages to this channel. Adjust permissions and try again.",
+                ephemeral=True,
+            )
+            return
+
+        mention = f"{self.parent.alert_role.mention} " if self.parent.alert_role else ""
+        content = f"{mention}General assignment for `{self.parent.clan_name}`\n{text}"
+        for chunk in _chunk_content(content):
+            await channel.send(chunk)
+
+        log.debug(
+            "GeneralAssignmentModal broadcast for clan %s: %s",
+            self.parent.clan_name,
+            text,
+        )
+
+        await interaction.response.send_message(
+            "✅ General assignment broadcast to the channel.",
+            ephemeral=True,
+        )
+        self.parent._disable()
+        try:
+            await self.parent.interaction.edit_original_response(
+                content="General assignment posted to the channel.",
+                view=None,
+            )
+        except discord.HTTPException:
+            log.debug("Unable to update original assign_bases message after general rule broadcast.")
         self.stop()
 
 
@@ -1671,15 +2228,15 @@ async def toggle_war_alerts(interaction: discord.Interaction, enable: bool):
 # Slash command: /assign_bases
 # ---------------------------------------------------------------------------
 
-@bot.tree.command(name="assign_bases", description="Assign enemy bases to clan members.")
-@app_commands.describe(
-    clan_name="Configured clan currently in war",
-    assignments="Use the format 1:1,2;2:3 to pair home bases with enemy targets",
+@bot.tree.command(
+    name="assign_bases",
+    description="Assign war targets with an interactive menu or broadcast a general rule.",
 )
-async def assign_bases(interaction: discord.Interaction, clan_name: str, assignments: str):
-    """Allow administrators to map home clan members to their attack targets."""
+@app_commands.describe(clan_name="Pick the clan that is currently in war.")
+async def assign_bases(interaction: discord.Interaction, clan_name: str):
+    """Present admins with interactive tools to share base assignments."""
     log_command_call("assign_bases")
-    log.debug("assign_bases invoked")
+    log.debug("assign_bases invoked for clan %s", clan_name)
     if interaction.guild is None:
         await send_text_response(
             interaction,
@@ -1696,14 +2253,6 @@ async def assign_bases(interaction: discord.Interaction, clan_name: str, assignm
             ephemeral=True,
         )
         return
-
-    try:
-        parsed = _parse_assignment_string(assignments)
-    except ValueError as exc:
-        await send_text_response(interaction, f"⚠️ {exc}", ephemeral=True)
-        return
-
-    log.debug('assign_bases parsed assignments: %s', parsed)
 
     clan_tags = _clan_names_for_guild(interaction.guild.id)
     tag = clan_tags.get(clan_name)
@@ -1739,62 +2288,38 @@ async def assign_bases(interaction: discord.Interaction, clan_name: str, assignm
         )
         return
 
-    sorted_home = [m for m in sorted(war.clan.members, key=lambda m: getattr(m, "map_position", 0)) if getattr(m, "map_position", None) is not None]
-    sorted_enemy = [m for m in sorted(war.opponent.members, key=lambda m: getattr(m, "map_position", 0)) if getattr(m, "map_position", None) is not None]
-    home_members = {m.map_position: m for m in sorted_home}
-    max_home = len(sorted_home)
+    sorted_home = [
+        member
+        for member in sorted(war.clan.members, key=lambda m: getattr(m, "map_position", 0))
+        if getattr(member, "map_position", None) is not None
+    ]
+    sorted_enemy = [
+        member
+        for member in sorted(war.opponent.members, key=lambda m: getattr(m, "map_position", 0))
+        if getattr(member, "map_position", None) is not None
+    ]
+
+    home_roster = {
+        member.map_position: getattr(member, "name", f"Base {member.map_position}")
+        for member in sorted_home
+    }
     max_enemy = len(sorted_enemy)
 
-    log.debug('assign_bases available home bases: %s', sorted(home_members.keys()))
-
-    entries: List[tuple[int, str, List[int]]] = []
-    for home_base, targets in parsed.items():
-        member_obj = home_members.get(home_base)
-        if member_obj is None or home_base < 1 or home_base > max_home:
-            await send_text_response(
-                interaction,
-                f"⚠️ Home base {home_base} is not present in the current war.",
-                ephemeral=True,
-            )
-            return
-        member_name = getattr(member_obj, "name", f"Base {home_base}")
-
-        for enemy_base in targets:
-            if enemy_base < 1 or enemy_base > max_enemy:
-                await send_text_response(
-                    interaction,
-                    f"⚠️ Enemy base {enemy_base} is not present in the current war.",
-                    ephemeral=True,
-                )
-                return
-        log.debug('assign_bases resolved home %%s -> targets %%s', home_base, targets)
-        entries.append((home_base, member_name, targets))
-
-    entries.sort(key=lambda item: item[0])
-    log.debug('assign_bases sorted entries: %s', entries)
-    lines: List[str] = []  # Final formatted lines for the summary output
-    for display_base, member_name, targets in entries:
-        target_text = " and ".join(str(num) for num in targets)
-        lines.append(f"[{display_base}] {member_name}: {target_text}")
-
-    output = "\n".join(lines)
-
     alert_role = discord.utils.get(interaction.guild.roles, name=ALERT_ROLE_NAME)
-    mention = f"{alert_role.mention} " if alert_role else ""
-    content = f"{mention}Assignments for `{clan_name}`\n{output}".strip()
-    print(f'[assign_bases] final content:\n{content}', flush=True)
 
-    if interaction.channel and interaction.channel.permissions_for(interaction.guild.me).send_messages:
-        for chunk in _chunk_content(content):
-            await interaction.channel.send(chunk)
-        await interaction.response.defer(ephemeral=True)
-        await interaction.followup.send("✅ War targets broadcast to the channel.", ephemeral=True)
-    else:
-        await send_text_response(
-            interaction,
-            content,
-            ephemeral=False,
-        )
+    view = AssignBasesModeView(
+        interaction=interaction,
+        clan_name=clan_name,
+        home_roster=home_roster,
+        max_enemy=max_enemy,
+        alert_role=alert_role,
+    )
+    intro = (
+        "After submitting the command with the clan name, choose how you want to share assignments:\n"
+        "• Use **Per Player Assignments** to build the familiar per-base list without memorising the syntax.\n"
+        "• Use **General Assignment Rule** for a quick broadcast such as “everyone attack your mirror.”"
+    )
+    await send_text_response(interaction, intro, ephemeral=True, view=view)
 
 
 # ---------------------------------------------------------------------------
@@ -1825,8 +2350,8 @@ async def assign_clan_role(interaction: discord.Interaction):
     await send_text_response(
         interaction,
         (
-            "Select the clan whose role you want to adopt. "
-            "Buttons control visibility of the confirmation."
+            "Use the dropdown below to pick the clan role you want applied to your Discord account. "
+            "Once you make a choice, use the buttons to decide whether the confirmation is public or private."
         ),
         ephemeral=True,
         view=view,
@@ -1859,12 +2384,53 @@ async def player_reference_autocomplete(interaction: discord.Interaction, curren
     """Provide player name suggestions sourced from the server configuration."""
     if interaction.guild is None:
         return []
-    guild_config = _ensure_guild_config(interaction.guild.id)
+
+    guild = interaction.guild
+    guild_config = _ensure_guild_config(guild.id)
     player_tags: Dict[str, str] = guild_config.get("player_tags", {})
+    player_accounts: Dict[str, List[Dict[str, Optional[str]]]] = guild_config.get("player_accounts", {})
+
     current_lower = current.lower()
-    suggestions = [
-        app_commands.Choice(name=name, value=name)
-        for name in player_tags
-        if current_lower in name.lower()
-    ]
+    suggestions: List[app_commands.Choice[str]] = []
+    seen_values: Set[str] = set()
+
+    def add_choice(name: str, value: str) -> None:
+        key = value.lower()
+        if key in seen_values:
+            return
+        if current_lower and current_lower not in name.lower() and current_lower not in value.lower():
+            return
+        suggestions.append(app_commands.Choice(name=name, value=value))
+        seen_values.add(key)
+
+    # Linked accounts first.
+    for user_id_str, records in player_accounts.items():
+        if not isinstance(records, list):
+            continue
+        member = guild.get_member(int(user_id_str)) if user_id_str.isdigit() else None
+        member_label = member.display_name if member else f"User {user_id_str}"
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            tag = record.get("tag")
+            alias = record.get("alias")
+            normalised_tag = _normalise_player_tag(tag) if isinstance(tag, str) else None
+            if normalised_tag is None:
+                continue
+            label_alias = alias or member_label
+            add_choice(f"{label_alias} — {normalised_tag}", label_alias)
+            add_choice(normalised_tag, normalised_tag)
+            if len(suggestions) >= 25:
+                return suggestions[:25]
+
+    # Global saved tags.
+    for name, tag in player_tags.items():
+        normalised_tag = _normalise_player_tag(tag)
+        if normalised_tag is None:
+            continue
+        add_choice(f"{name} — {normalised_tag}", name)
+        add_choice(normalised_tag, normalised_tag)
+        if len(suggestions) >= 25:
+            break
+
     return suggestions[:25]
