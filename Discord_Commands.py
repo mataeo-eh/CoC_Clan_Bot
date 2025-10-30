@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import csv
 from datetime import datetime, timedelta, timezone
+from io import BytesIO, StringIO
 from typing import Any, Dict, Iterable, List, Literal, Optional, Set, Tuple
+from uuid import uuid4
 
 import discord
 from discord import app_commands
@@ -10,7 +13,7 @@ from discord.ext import tasks
 import coc
 
 from bot_core import bot, client
-from logger import get_logger, log_command_call
+from logger import get_logger, log_command_call, get_usage_summary
 
 log = get_logger()
 from COC_API import ClanNotConfiguredError, GuildNotConfiguredError
@@ -24,9 +27,35 @@ ALERT_WINDOW_SECONDS = 300
 README_URL = "https://github.com/mataeo/COC_Clan_Bot/blob/main/README.md"
 WAR_NUDGE_REASONS = ("unused_attacks", "no_attacks", "low_stars")
 EVENT_TYPES = ("clan_games", "raid_weekend")
+DASHBOARD_MODULES = {
+    "war_overview": "War overview",
+    "donation_snapshot": "Donation snapshot",
+    "upgrade_queue": "Upgrade queue",
+    "event_opt_ins": "Event opt-in summary",
+}
+DASHBOARD_FORMATS = {"embed", "csv", "both"}
+REPORT_TYPES = ("dashboard", "donation_summary", "season_summary")
+SCHEDULE_FREQUENCIES = ("daily", "weekly")
+WEEKDAY_CHOICES = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+WEEKDAY_MAP = {day: index for index, day in enumerate(WEEKDAY_CHOICES)}
+MAX_UPGRADE_LOG_ENTRIES = 250
 
 # Cache of alert milestones sent per (guild, clan, war) tuple to avoid duplicates.
 alert_state: Dict[Tuple[int, str, str], Set[str]] = {}
+
+
+def _record_command_usage(interaction: discord.Interaction, command_name: str) -> None:
+    """Log a command invocation with anonymised user metadata.
+
+    Parameters:
+        interaction (discord.Interaction): The Discord context that exposes the invoking user.
+        command_name (str): Canonical name recorded in the telemetry counters.
+    """
+    user_id = getattr(interaction, "user", None)
+    user_identifier = getattr(user_id, "id", None) if user_id is not None else None
+    if not isinstance(user_identifier, int):
+        user_identifier = None
+    log_command_call(command_name, user_id=user_identifier)
 
 
 def _chunk_content(content: str, limit: int = MAX_MESSAGE_LENGTH) -> List[str]:
@@ -58,6 +87,44 @@ def _chunk_content(content: str, limit: int = MAX_MESSAGE_LENGTH) -> List[str]:
         chunks.append(current)
 
     return chunks or ["(no data)"]
+
+
+def _parse_iso_timestamp(value: Optional[str]) -> Optional[datetime]:
+    """Parse ISO formatted timestamps, tolerating trailing Z for UTC.
+
+    Parameters:
+        value (Optional[str]): Timestamp string saved in ISO 8601 form.
+
+    Returns:
+        Optional[datetime]: A timezone-aware datetime when parsing succeeds.
+    """
+    if not value or not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if not candidate:
+        return None
+    if candidate.endswith("Z"):
+        candidate = candidate[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _format_datetime_utc(value: Optional[datetime]) -> str:
+    """Format a datetime for display in UTC.
+
+    Parameters:
+        value (Optional[datetime]): Naive or timezone-aware datetime to convert for presentation.
+    """
+    if value is None:
+        return "Never"
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
 async def send_text_response(
@@ -179,7 +246,7 @@ async def set_clan(
     enable_alerts: bool,
 ):
     """Allow administrators to bind a clan name to its Clash of Clans tag."""
-    log_command_call("set_clan")
+    _record_command_usage(interaction, "set_clan")
     log.debug("set_clan invoked")
     if interaction.guild is None:
         await send_text_response(
@@ -251,7 +318,7 @@ async def set_clan(
 @bot.tree.command(name="help", description="Show a quick primer on using the Clan Bot.")
 async def help_command(interaction: discord.Interaction):
     """Provide a concise overview plus a link to the full documentation."""
-    log_command_call("help")
+    _record_command_usage(interaction, "help")
     log.debug("help_command invoked")
     summary = (
         "Clan_Bot keeps your Clash of Clans server organised—fetch war intel, assign bases, "
@@ -266,6 +333,73 @@ async def help_command(interaction: discord.Interaction):
     await send_text_response(interaction, message, ephemeral=True)
 
 
+@bot.tree.command(name="help_usage", description="Show aggregate command usage analytics (admin only).")
+async def help_usage(interaction: discord.Interaction):
+    """Display anonymised command analytics for administrators.
+
+    Parameters:
+        interaction (discord.Interaction): Invocation context; must originate from a server administrator.
+    """
+    _record_command_usage(interaction, "help_usage")
+    log.debug("help_usage invoked")
+
+    if interaction.guild is None:
+        await send_text_response(
+            interaction,
+            "❌ This command must be used inside a Discord server.",
+            ephemeral=True,
+        )
+        return
+
+    member = interaction.user
+    if not isinstance(member, discord.Member) or not member.guild_permissions.administrator:
+        await send_text_response(
+            interaction,
+            "❌ Only administrators can view usage analytics.",
+            ephemeral=True,
+        )
+        return
+
+    summary = get_usage_summary()
+    lines = [
+        "📊 **Command Usage Overview**",
+        f"Total invocations logged: {summary.get('total_invocations', 0)}",
+        f"Approximate unique users: {summary.get('unique_users', 0)}",
+        f"Average commands per user: {summary.get('average_per_user', 0.0):.2f}",
+        "",
+        "Top commands:",
+    ]
+
+    top_commands = summary.get("top_commands", [])
+    if top_commands:
+        for index, entry in enumerate(top_commands, start=1):
+            lines.append(
+                f"{index}. {entry.get('name')} — {entry.get('count', 0)} call(s) "
+                f"(last used { _format_datetime_utc(entry.get('last_invoked')) })"
+            )
+    else:
+        lines.append("No commands have been recorded yet.")
+
+    top_counts = summary.get("top_user_counts", [])
+    lines.extend(
+        [
+            "",
+            "Top anonymous user activity:",
+        ]
+    )
+    if top_counts:
+        for index, count in enumerate(top_counts, start=1):
+            lines.append(f"User #{index}: {count} call(s)")
+    else:
+        lines.append("No user activity recorded yet.")
+
+    await send_text_response(
+        interaction,
+        "\n".join(lines),
+        ephemeral=True,
+    )
+
+
 @bot.tree.command(
     name="choose_war_alert_channel",
     description="Select the text channel where war alerts will be posted for a clan.",
@@ -273,7 +407,7 @@ async def help_command(interaction: discord.Interaction):
 @app_commands.describe(clan_name="Choose a configured clan to update.")
 async def choose_war_alert_channel(interaction: discord.Interaction, clan_name: str):
     """Allow administrators to pick the destination channel for war alerts."""
-    log_command_call("choose_war_alert_channel")
+    _record_command_usage(interaction, "choose_war_alert_channel")
     log.debug("choose_war_alert_channel invoked for %s", clan_name)
 
     if interaction.guild is None:
@@ -391,7 +525,7 @@ async def configure_war_nudge(
     description: Optional[str] = None,
 ):
     """Maintain the list of war nudge reasons stored per clan."""
-    log_command_call("configure_war_nudge")
+    _record_command_usage(interaction, "configure_war_nudge")
     log.debug(
         "configure_war_nudge invoked action=%s clan=%s reason=%s type=%s",
         action,
@@ -524,7 +658,7 @@ async def configure_war_nudge(
 )
 async def war_nudge(interaction: discord.Interaction, clan_name: str, reason_name: str):
     """Evaluate the configured reason and post a nudge for matching members."""
-    log_command_call("war_nudge")
+    _record_command_usage(interaction, "war_nudge")
     log.debug("war_nudge invoked for clan=%s reason=%s", clan_name, reason_name)
 
     if interaction.guild is None:
@@ -650,6 +784,161 @@ async def war_nudge(interaction: discord.Interaction, clan_name: str, reason_nam
 
 
 @bot.tree.command(
+    name="configure_dashboard",
+    description="Interactively configure the dashboard modules for a clan.",
+)
+@app_commands.describe(
+    clan_name="Configured clan to update.",
+    channel="Optional default channel for dashboard posts.",
+)
+async def configure_dashboard(
+    interaction: discord.Interaction,
+    clan_name: str,
+    channel: Optional[discord.TextChannel] = None,
+):
+    """Provide an interactive selector for dashboard modules and format."""
+    _record_command_usage(interaction, "configure_dashboard")
+    log.debug("configure_dashboard invoked clan=%s channel=%s", clan_name, getattr(channel, "id", None))
+
+    if interaction.guild is None:
+        await send_text_response(
+            interaction,
+            "❌ This command must be used inside a Discord server.",
+            ephemeral=True,
+        )
+        return
+    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+        await send_text_response(
+            interaction,
+            "❌ Only administrators can configure dashboards.",
+            ephemeral=True,
+        )
+        return
+
+    clan_entry = _get_clan_entry(interaction.guild.id, clan_name)
+    if clan_entry is None:
+        await send_text_response(
+            interaction,
+            f"⚠️ `{clan_name}` is not configured.",
+            ephemeral=True,
+        )
+        return
+
+    modules, fmt, default_channel_id = _dashboard_defaults(clan_entry)
+    default_channel = channel
+    if default_channel is None and isinstance(default_channel_id, int):
+        default_channel = interaction.guild.get_channel(default_channel_id)
+
+    view = DashboardConfigView(
+        guild=interaction.guild,
+        clan_name=clan_name,
+        initial_modules=modules,
+        initial_format=fmt,
+        channel=default_channel,
+    )
+    await send_text_response(
+        interaction,
+        view.render_message(),
+        ephemeral=True,
+        view=view,
+    )
+
+
+@bot.tree.command(name="dashboard", description="Display the configured dashboard for a clan.")
+@app_commands.describe(
+    clan_name="Configured clan to inspect.",
+    modules="Optional comma-separated list of modules to override the default configuration.",
+    format="Optional output format override (embed, csv, or both).",
+    target_channel="Channel to post the dashboard in; defaults to the configured channel or the current channel.",
+)
+async def dashboard(
+    interaction: discord.Interaction,
+    clan_name: str,
+    modules: Optional[str] = None,
+    format: Optional[Literal["embed", "csv", "both"]] = None,
+    target_channel: Optional[discord.TextChannel] = None,
+):
+    """Render and post a dashboard summary."""
+    _record_command_usage(interaction, "dashboard")
+    log.debug(
+        "dashboard invoked clan=%s modules=%s format=%s channel=%s",
+        clan_name,
+        modules,
+        format,
+        getattr(target_channel, "id", None),
+    )
+
+    if interaction.guild is None:
+        await send_text_response(
+            interaction,
+            "❌ This command must be used inside a Discord server.",
+            ephemeral=True,
+        )
+        return
+
+    clan_entry = _get_clan_entry(interaction.guild.id, clan_name)
+    if clan_entry is None:
+        await send_text_response(
+            interaction,
+            f"⚠️ `{clan_name}` is not configured.",
+            ephemeral=True,
+        )
+        return
+
+    default_modules, default_format, default_channel_id = _dashboard_defaults(clan_entry)
+    module_list = _sanitise_modules(
+        [item.strip() for item in modules.split(",") if item.strip()]
+    ) if modules else default_modules
+
+    output_format = format or default_format
+    if output_format not in DASHBOARD_FORMATS:
+        await send_text_response(
+            interaction,
+            "⚠️ Format must be embed, csv, or both.",
+            ephemeral=True,
+        )
+        return
+
+    destination = target_channel
+    if destination is None and isinstance(default_channel_id, int):
+        destination = interaction.guild.get_channel(default_channel_id)
+    if destination is None:
+        destination = interaction.channel if isinstance(interaction.channel, discord.TextChannel) else None
+
+    if destination is None:
+        await send_text_response(
+            interaction,
+            "⚠️ I couldn't determine a channel to post in. Provide `target_channel` or configure a default.",
+            ephemeral=True,
+        )
+        return
+    if not destination.permissions_for(destination.guild.me).send_messages:
+        await send_text_response(
+            interaction,
+            "⚠️ I don't have permission to post in that channel.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        await _send_dashboard(
+            interaction,
+            guild=interaction.guild,
+            clan_name=clan_name,
+            modules=module_list,
+            output_format=output_format,
+            destination=destination,
+        )
+    except ValueError as exc:
+        await send_text_response(
+            interaction,
+            f"⚠️ {exc}",
+            ephemeral=True,
+        )
+
+
+
+@bot.tree.command(
     name="link_player",
     description="Link or unlink Clash of Clans player tags to Discord members.",
 )
@@ -667,7 +956,7 @@ async def link_player(
     target_member: Optional[discord.Member] = None,
 ):
     """Allow members to map their Discord identity to one or more Clash of Clans accounts."""
-    log_command_call("link_player")
+    _record_command_usage(interaction, "link_player")
     log.debug(
         "link_player invoked action=%s tag=%s target=%s",
         action,
@@ -810,7 +1099,7 @@ async def save_war_plan(
     overwrite: bool = False,
 ):
     """Persist a war plan template for later reuse."""
-    log_command_call("save_war_plan")
+    _record_command_usage(interaction, "save_war_plan")
     log.debug("save_war_plan invoked clan=%s plan=%s overwrite=%s", clan_name, plan_name, overwrite)
 
     if interaction.guild is None:
@@ -864,7 +1153,7 @@ async def save_war_plan(
 @app_commands.describe(clan_name="Configured clan to inspect.")
 async def list_war_plans(interaction: discord.Interaction, clan_name: str):
     """Return the stored plan names for quick reference."""
-    log_command_call("list_war_plans")
+    _record_command_usage(interaction, "list_war_plans")
     log.debug("list_war_plans invoked clan=%s", clan_name)
 
     if interaction.guild is None:
@@ -917,7 +1206,7 @@ async def war_plan(
     target_channel: Optional[discord.TextChannel] = None,
 ):
     """Post the specified war plan into the channel."""
-    log_command_call("war_plan")
+    _record_command_usage(interaction, "war_plan")
     log.debug("war_plan invoked clan=%s plan=%s", clan_name, plan_name)
 
     if interaction.guild is None:
@@ -979,7 +1268,7 @@ async def war_plan(
 )
 async def player_info(interaction: discord.Interaction, player_reference: str):
     """Provide an interactive view of player data with share controls."""
-    log_command_call("player_info")
+    _record_command_usage(interaction, "player_info")
     log.debug("player_info invoked with reference %s", player_reference)
 
     if interaction.guild is None:
@@ -1118,15 +1407,25 @@ async def player_info(interaction: discord.Interaction, player_reference: str):
     player_tag="Player tag (e.g. #ABC123) associated with your account.",
     upgrade="Short description of the planned upgrade.",
     notes="Optional timing or resource notes.",
+    clan_name="Optional configured clan this upgrade belongs to.",
 )
 async def plan_upgrade(
     interaction: discord.Interaction,
     player_tag: str,
     upgrade: str,
     notes: Optional[str] = None,
+    clan_name: Optional[str] = None,
 ):
-    """Record a planned upgrade and broadcast it to the configured channel."""
-    log_command_call("plan_upgrade")
+    """Record a planned upgrade and broadcast it to the configured channel.
+
+    Parameters:
+        interaction (discord.Interaction): Invocation context responsible for replying.
+        player_tag (str): Clash of Clans player tag (with or without leading '#').
+        upgrade (str): Human readable description of the upgrade.
+        notes (Optional[str]): Additional free-form context about timing or costs.
+        clan_name (Optional[str]): Configured clan to associate with the upgrade.
+    """
+    _record_command_usage(interaction, "plan_upgrade")
     log.debug("plan_upgrade invoked tag=%s upgrade=%s", player_tag, upgrade)
 
     if interaction.guild is None:
@@ -1171,6 +1470,41 @@ async def plan_upgrade(
         )
         return
 
+    configured_clans = _clan_names_for_guild(interaction.guild.id)
+    resolved_clan_name = None
+    if isinstance(clan_name, str) and clan_name.strip():
+        candidate_name = clan_name.strip()
+        if candidate_name not in configured_clans:
+            await send_text_response(
+                interaction,
+                f"⚠️ `{candidate_name}` is not a configured clan for this server.",
+                ephemeral=True,
+            )
+            return
+        resolved_clan_name = candidate_name
+    resolved_clan_tag: Optional[str] = configured_clans.get(resolved_clan_name) if resolved_clan_name else None
+
+    player_payload: Optional[Dict[str, Any]] = None
+    try:
+        player_payload = await client.get_player(normalised_tag)
+    except Exception as exc:  # pylint: disable=broad-except
+        log.debug("plan_upgrade unable to fetch player payload for %s: %s", normalised_tag, exc)
+
+    player_name = None
+    if isinstance(player_payload, dict):
+        profile = player_payload.get("profile", {})
+        player_name = profile.get("name")
+        clan_info = player_payload.get("clan") or {}
+        player_clan_tag = clan_info.get("tag")
+        if player_clan_tag:
+            if resolved_clan_tag is None:
+                resolved_clan_tag = player_clan_tag
+            if resolved_clan_name is None:
+                for configured_name, configured_tag in configured_clans.items():
+                    if configured_tag == player_clan_tag:
+                        resolved_clan_name = configured_name
+                        break
+
     channel_id = guild_config.get("channels", {}).get("upgrade")
     destination = interaction.guild.get_channel(channel_id) if isinstance(channel_id, int) else None
     if destination is None:
@@ -1187,21 +1521,48 @@ async def plan_upgrade(
             ephemeral=True,
         )
         return
-
-    submission_time = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    details = notes.strip() if isinstance(notes, str) and notes.strip() else "No additional notes."
+    submission_dt = datetime.utcnow().replace(tzinfo=timezone.utc)
+    submission_time = submission_dt.strftime("%Y-%m-%d %H:%M UTC")
+    raw_notes = notes.strip() if isinstance(notes, str) and notes.strip() else None
+    display_notes = raw_notes or "No additional notes."
     account_label = alias or normalised_tag
-    message = (
-        "🛠️ **Planned Upgrade**\n"
-        f"Member: {member.mention}\n"
-        f"Account: `{account_label}`\n"
-        f"Upgrade: {upgrade}\n"
-        f"Notes: {details}\n"
-        f"Submitted: {submission_time}"
+    message_lines = [
+        "🛠️ **Planned Upgrade**",
+        f"Member: {member.mention}",
+        f"Account: `{account_label}`",
+    ]
+    if player_name:
+        message_lines.append(f"In-game name: {player_name}")
+    if resolved_clan_name:
+        message_lines.append(f"Clan: `{resolved_clan_name}`")
+    message_lines.extend(
+        [
+            f"Upgrade: {upgrade}",
+            f"Notes: {display_notes}",
+            f"Submitted: {submission_time}",
+        ]
     )
+    message = "\n".join(message_lines)
 
     for chunk in _chunk_content(message):
         await destination.send(chunk)
+
+    _append_upgrade_log(
+        interaction.guild.id,
+        {
+            "id": str(uuid4()),
+            "timestamp": submission_dt.isoformat(),
+            "user_id": member.id,
+            "user_name": member.display_name,
+            "player_tag": normalised_tag,
+            "player_name": player_name,
+            "alias": alias,
+            "upgrade": upgrade,
+            "notes": raw_notes,
+            "clan_name": resolved_clan_name,
+            "clan_tag": resolved_clan_tag,
+        },
+    )
 
     await send_text_response(
         interaction,
@@ -1217,7 +1578,7 @@ async def plan_upgrade(
 @app_commands.describe(channel="Channel where upgrade notices should be sent.")
 async def set_upgrade_channel(interaction: discord.Interaction, channel: discord.TextChannel):
     """Store the guild-wide upgrade channel in the config."""
-    log_command_call("set_upgrade_channel")
+    _record_command_usage(interaction, "set_upgrade_channel")
     log.debug("set_upgrade_channel invoked channel=%s", channel.id)
 
     if interaction.guild is None:
@@ -1270,7 +1631,7 @@ async def configure_donation_metrics(
     negative_balance: Optional[bool] = None,
 ):
     """Update donation-tracking preferences for a clan."""
-    log_command_call("configure_donation_metrics")
+    _record_command_usage(interaction, "configure_donation_metrics")
     log.debug(
         "configure_donation_metrics invoked clan=%s top=%s low=%s negative=%s",
         clan_name,
@@ -1334,7 +1695,7 @@ async def set_donation_channel(
     channel: discord.TextChannel,
 ):
     """Store the donation summary channel for a clan."""
-    log_command_call("set_donation_channel")
+    _record_command_usage(interaction, "set_donation_channel")
     log.debug("set_donation_channel invoked clan=%s channel=%s", clan_name, channel.id)
 
     if interaction.guild is None:
@@ -1388,7 +1749,7 @@ async def donation_summary(
     target_channel: Optional[discord.TextChannel] = None,
 ):
     """Pull donation stats using the configured metrics and broadcast the summary."""
-    log_command_call("donation_summary")
+    _record_command_usage(interaction, "donation_summary")
     log.debug("donation_summary invoked clan=%s", clan_name)
 
     if interaction.guild is None:
@@ -1408,82 +1769,24 @@ async def donation_summary(
         )
         return
 
-    donation_tracking = clan_entry.get("donation_tracking", {})
-    metrics = donation_tracking.get("metrics", {})
-    if not any(metrics.values()):
-        await send_text_response(
-            interaction,
-            "⚠️ All donation metrics are disabled. Use `/configure_donation_metrics` to enable at least one.",
-            ephemeral=True,
-        )
-        return
-
-    clan_tags = _clan_names_for_guild(interaction.guild.id)
-    tag = clan_tags.get(clan_name)
-    if not tag:
-        await send_text_response(
-            interaction,
-            f"⚠️ `{clan_name}` has no stored tag.",
-            ephemeral=True,
-        )
-        return
-
     await interaction.response.defer(ephemeral=True, thinking=True)
     try:
-        clan = await client.get_clan(tag)
-    except Exception as exc:
-        await interaction.followup.send(
-            f"⚠️ Unable to fetch clan data: {exc}",
-            ephemeral=True,
+        payload, default_channel_id, context = await _compose_donation_summary(
+            interaction.guild,
+            clan_name,
+            clan_entry,
         )
+    except ValueError as exc:
+        await interaction.followup.send(f"⚠️ {exc}", ephemeral=True)
         return
 
-    members = list(getattr(clan, "members", []))
-    if not members:
-        await interaction.followup.send(
-            "⚠️ I couldn't retrieve the member list for that clan.",
-            ephemeral=True,
-        )
-        return
-
-    sections: List[str] = [f"📈 **Donation Summary — {clan.name}**"]
-    if metrics.get("top_donors", True):
-        top_sorted = sorted(members, key=lambda m: getattr(m, "donations", 0), reverse=True)
-        top_entries = [
-            f"• {member.name}: {getattr(member, 'donations', 0):,} donated"
-            for member in top_sorted[:5]
-            if getattr(member, "donations", 0) > 0
-        ]
-        if top_entries:
-            sections.append("🏅 **Top Donors**\n" + "\n".join(top_entries))
-
-    if metrics.get("low_donors"):
-        low_sorted = sorted(members, key=lambda m: getattr(m, "donations", 0))
-        low_entries = [
-            f"• {member.name}: {getattr(member, 'donations', 0):,} donated"
-            for member in low_sorted[:5]
-        ]
-        if low_entries:
-            sections.append("🔻 **Lowest Donation Totals**\n" + "\n".join(low_entries))
-
-    if metrics.get("negative_balance"):
-        negative = [
-            member
-            for member in members
-            if getattr(member, "donations", 0) - getattr(member, "donations_received", 0) < 0
-        ]
-        if negative:
-            lines = [
-                f"• {member.name}: {getattr(member, 'donations', 0):,} given vs {getattr(member, 'donations_received', 0):,} received"
-                for member in negative[:5]
-            ]
-            sections.append("⚠️ **Negative Donation Balance**\n" + "\n".join(lines))
-
-    payload = "\n\n".join(sections)
     destination = target_channel
     if destination is None:
-        channel_id = donation_tracking.get("channel_id")
-        destination = interaction.guild.get_channel(channel_id) if isinstance(channel_id, int) else None
+        destination = (
+            interaction.guild.get_channel(default_channel_id)
+            if isinstance(default_channel_id, int)
+            else None
+        )
     if destination is None:
         destination = interaction.channel if isinstance(interaction.channel, discord.TextChannel) else None
 
@@ -1502,6 +1805,9 @@ async def donation_summary(
 
     for chunk in _chunk_content(payload):
         await destination.send(chunk)
+    csv_payload = _create_csv_file(context.get("csv_sections", []))
+    if csv_payload:
+        await destination.send(file=discord.File(BytesIO(csv_payload), filename="donation_summary.csv"))
 
     await interaction.followup.send(
         f"✅ Donation summary posted to {destination.mention}.",
@@ -1525,7 +1831,7 @@ async def configure_event_role(
     create_role: bool = False,
 ):
     """Allow administrators to configure event opt-in roles."""
-    log_command_call("configure_event_role")
+    _record_command_usage(interaction, "configure_event_role")
     log.debug("configure_event_role invoked event=%s role=%s create=%s", event_type, getattr(role, "id", None), create_role)
 
     if interaction.guild is None:
@@ -1597,7 +1903,7 @@ async def event_alert_opt(
     target_member: Optional[discord.Member] = None,
 ):
     """Toggle event opt-in roles."""
-    log_command_call("event_alert_opt")
+    _record_command_usage(interaction, "event_alert_opt")
     log.debug("event_alert_opt invoked event=%s enable=%s target=%s", event_type, enable, getattr(target_member, "id", None))
 
     if interaction.guild is None:
@@ -1666,7 +1972,7 @@ async def event_alert_opt(
 @bot.tree.command(name="register_me", description="Guided onboarding for new clan members.")
 async def register_me(interaction: discord.Interaction):
     """Provide buttons and guidance to help new members get set up quickly."""
-    log_command_call("register_me")
+    _record_command_usage(interaction, "register_me")
     log.debug("register_me invoked")
 
     if interaction.guild is None:
@@ -1721,7 +2027,7 @@ async def set_season_summary_channel(
     channel: discord.TextChannel,
 ):
     """Store the destination channel for seasonal summaries."""
-    log_command_call("set_season_summary_channel")
+    _record_command_usage(interaction, "set_season_summary_channel")
     log.debug("set_season_summary_channel invoked clan=%s channel=%s", clan_name, channel.id)
 
     if interaction.guild is None:
@@ -1784,7 +2090,7 @@ async def season_summary(
     target_channel: Optional[discord.TextChannel] = None,
 ):
     """Compose a configurable seasonal summary and broadcast it."""
-    log_command_call("season_summary")
+    _record_command_usage(interaction, "season_summary")
     log.debug(
         "season_summary invoked clan=%s donations=%s wars=%s members=%s",
         clan_name,
@@ -1817,61 +2123,27 @@ async def season_summary(
         )
         return
 
-    clan_tags = _clan_names_for_guild(interaction.guild.id)
-    tag = clan_tags.get(clan_name)
-    if not tag:
-        await send_text_response(
-            interaction,
-            f"⚠️ `{clan_name}` has no stored tag.",
-            ephemeral=True,
-        )
-        return
-
     await interaction.response.defer(ephemeral=True, thinking=True)
     try:
-        clan = await client.get_clan(tag)
-    except Exception as exc:
-        await interaction.followup.send(
-            f"⚠️ Unable to fetch clan data: {exc}",
-            ephemeral=True,
+        payload, default_channel_id = await _compose_season_summary(
+            interaction.guild,
+            clan_name,
+            clan_entry,
+            include_donations=include_donations,
+            include_wars=include_wars,
+            include_members=include_members,
         )
+    except ValueError as exc:
+        await interaction.followup.send(f"⚠️ {exc}", ephemeral=True)
         return
-
-    members = list(getattr(clan, "members", []))
-    sections: List[str] = [f"🏁 **Season Summary — {clan.name}**"]
-
-    if include_wars:
-        wars_section = (
-            f"• War wins: {getattr(clan, 'war_wins', 'N/A')}\n"
-            f"• War losses: {getattr(clan, 'war_losses', 'N/A')}\n"
-            f"• War ties: {getattr(clan, 'war_ties', 'N/A')}\n"
-            f"• Current streak: {getattr(clan, 'war_win_streak', 'N/A')}"
-        )
-        sections.append("⚔️ **War Performance**\n" + wars_section)
-
-    if include_donations and members:
-        top_donor = max(members, key=lambda m: getattr(m, "donations", 0))
-        top_receiver = max(members, key=lambda m: getattr(m, "donations_received", 0))
-        donation_lines = [
-            f"• Top donor: {top_donor.name} ({getattr(top_donor, 'donations', 0):,})",
-            f"• Most received: {top_receiver.name} ({getattr(top_receiver, 'donations_received', 0):,})",
-        ]
-        sections.append("🤝 **Donations**\n" + "\n".join(donation_lines))
-
-    if include_members and members:
-        top_trophies = sorted(members, key=lambda m: getattr(m, "trophies", 0), reverse=True)[:5]
-        member_lines = [
-            f"• {member.name}: {getattr(member, 'trophies', 0):,} trophies"
-            for member in top_trophies
-        ]
-        sections.append("🏆 **Top Trophy Holders**\n" + "\n".join(member_lines))
-
-    payload = "\n\n".join(sections)
 
     destination = target_channel
     if destination is None:
-        channel_id = clan_entry.get("season_summary", {}).get("channel_id")
-        destination = interaction.guild.get_channel(channel_id) if isinstance(channel_id, int) else None
+        destination = (
+            interaction.guild.get_channel(default_channel_id)
+            if isinstance(default_channel_id, int)
+            else None
+        )
     if destination is None:
         destination = interaction.channel if isinstance(interaction.channel, discord.TextChannel) else None
 
@@ -2232,16 +2504,92 @@ def _ensure_guild_config(guild_id: int) -> Dict[str, Any]:
         donation_tracking.setdefault("channel_id", None)
         season_summary = clan_data.setdefault("season_summary", {})
         season_summary.setdefault("channel_id", None)
+        dashboard = clan_data.setdefault("dashboard", {})
+        modules = dashboard.get("modules") if isinstance(dashboard.get("modules"), list) else ["war_overview"]
+        if not modules:
+            modules = ["war_overview"]
+        dashboard["modules"] = modules
+        fmt = dashboard.get("format", "embed")
+        if fmt not in DASHBOARD_FORMATS:
+            fmt = "embed"
+        dashboard["format"] = fmt
+        dashboard.setdefault("channel_id", None)
     guild_config.setdefault("player_tags", {})
     accounts = _normalise_player_accounts_map(guild_config.get("player_accounts", {}))
     guild_config["player_accounts"] = accounts
     channels = guild_config.setdefault("channels", {})
     channels.setdefault("upgrade", None)
     channels.setdefault("donation", None)
+    channels.setdefault("dashboard", None)
     event_roles = guild_config.setdefault("event_roles", {})
     event_roles.setdefault("clan_games", None)
     event_roles.setdefault("raid_weekend", None)
+    schedules: List[Dict[str, Any]] = []
+    raw_schedules = guild_config.get("schedules", [])
+    if isinstance(raw_schedules, list):
+        for entry in raw_schedules:
+            if not isinstance(entry, dict):
+                continue
+            schedules.append(
+                {
+                    "id": entry.get("id"),
+                    "type": entry.get("type", "dashboard"),
+                    "clan_name": entry.get("clan_name", ""),
+                    "frequency": entry.get("frequency", "daily"),
+                    "time_utc": entry.get("time_utc", "00:00"),
+                    "weekday": entry.get("weekday"),
+                    "channel_id": entry.get("channel_id"),
+                    "next_run": entry.get("next_run"),
+                    "options": entry.get("options", {}),
+                }
+            )
+    guild_config["schedules"] = schedules
+    raw_upgrade_log = guild_config.get("upgrade_log", [])
+    normalised_log: List[Dict[str, Any]] = []
+    if isinstance(raw_upgrade_log, list):
+        for record in raw_upgrade_log[-MAX_UPGRADE_LOG_ENTRIES:]:
+            if not isinstance(record, dict):
+                continue
+            normalised_log.append(
+                {
+                    "id": record.get("id"),
+                    "timestamp": record.get("timestamp"),
+                    "user_id": record.get("user_id"),
+                    "user_name": record.get("user_name"),
+                    "player_tag": record.get("player_tag"),
+                    "alias": record.get("alias"),
+                    "upgrade": record.get("upgrade"),
+                    "notes": record.get("notes"),
+                    "clan_name": record.get("clan_name"),
+                    "clan_tag": record.get("clan_tag"),
+                    "player_name": record.get("player_name"),
+                }
+            )
+    guild_config["upgrade_log"] = normalised_log
     return guild_config
+
+
+def _append_upgrade_log(guild_id: int, entry: Dict[str, Any]) -> None:
+    """Persist a single upgrade submission, trimming the log to a safe size.
+
+    Parameters:
+        guild_id (int): Discord guild identifier owning the submission.
+        entry (Dict[str, Any]): Payload describing the upgrade (tag, alias, notes, etc.).
+    """
+    guild_config = _ensure_guild_config(guild_id)
+    upgrade_log = guild_config.setdefault("upgrade_log", [])
+    if not isinstance(upgrade_log, list):
+        upgrade_log = guild_config["upgrade_log"] = []
+    upgrade_log.append(entry)
+    if len(upgrade_log) > MAX_UPGRADE_LOG_ENTRIES:
+        del upgrade_log[:-MAX_UPGRADE_LOG_ENTRIES]
+    save_server_config()
+    log.debug(
+        "Stored upgrade submission guild=%s player_tag=%s alias=%s",
+        guild_id,
+        entry.get("player_tag"),
+        entry.get("alias"),
+    )
 
 
 def _clan_names_for_guild(guild_id: int) -> Dict[str, str]:
@@ -2489,6 +2837,819 @@ def _collect_war_alerts(
 
 
 
+async def _fetch_war_overview(clan_name: str, tag: str) -> Tuple[str, str]:
+    try:
+        war = await client.get_clan_war_raw(tag)
+    except coc.errors.PrivateWarLog:
+        return (
+            "War Overview",
+            "⚠️ War log is private; real-time details are unavailable.",
+        )
+    except coc.errors.NotFound:
+        return (
+            "War Overview",
+            "ℹ️ This clan is not currently in a war.",
+        )
+    except Exception as exc:
+        return (
+            "War Overview",
+            f"⚠️ Unable to fetch war data: {exc}",
+        )
+
+    state_value = war.state.value if hasattr(war.state, "value") else war.state
+    start = _timestamp_to_datetime(war.start_time)
+    end = _timestamp_to_datetime(war.end_time)
+    lines = [
+        f"State: {state_value}",
+        f"War Tag: {war.war_tag or 'N/A'}",
+        f"Team Size: {getattr(war, 'team_size', 'N/A')}",
+        f"Score: {getattr(war.clan, 'stars', '?')} — {getattr(war.opponent, 'stars', '?')}",
+    ]
+    if start:
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        if now < start:
+            lines.append(f"Begins: {start.isoformat()} ({_format_timestamp_delta(start, 0)} remaining)")
+        else:
+            lines.append(f"Began: {start.isoformat()}")
+    if end:
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        if now < end:
+            lines.append(f"Ends: {end.isoformat()} ({_format_timestamp_delta(end, 0)} remaining)")
+        else:
+            lines.append(f"Ended: {end.isoformat()}")
+
+    return ("War Overview", "\n".join(lines))
+
+
+async def _compose_donation_summary(
+    guild: discord.Guild,
+    clan_name: str,
+    clan_entry: Dict[str, Any],
+) -> Tuple[str, Optional[int], Dict[str, Any]]:
+    donation_tracking = clan_entry.get("donation_tracking", {})
+    metrics = donation_tracking.get("metrics", {})
+    if not any(metrics.values()):
+        raise ValueError("All donation metrics are disabled.")
+
+    clan_tags = _clan_names_for_guild(guild.id)
+    tag = clan_tags.get(clan_name)
+    if not tag:
+        raise ValueError(f"`{clan_name}` has no stored clan tag.")
+
+    try:
+        clan = await client.get_clan(tag)
+    except Exception as exc:
+        raise ValueError(f"Unable to fetch clan data: {exc}") from exc
+
+    members = list(getattr(clan, "members", []))
+    if not members:
+        raise ValueError("I couldn't retrieve the member list for that clan.")
+
+    sections: List[str] = [f"📈 **Donation Summary — {clan.name}**"]
+    csv_sections: List[Tuple[str, List[str], List[List[str]]]] = []
+
+    if metrics.get("top_donors", True):
+        top_sorted = sorted(members, key=lambda m: getattr(m, "donations", 0), reverse=True)
+        top_entries = [
+            f"• {member.name}: {getattr(member, 'donations', 0):,} donated"
+            for member in top_sorted[:5]
+            if getattr(member, "donations", 0) > 0
+        ]
+        if top_entries:
+            sections.append("🏅 **Top Donors**\n" + "\n".join(top_entries))
+            csv_sections.append(
+                (
+                    "Top Donors",
+                    ["Member", "Donated"],
+                    [
+                        [member.name, str(getattr(member, "donations", 0))]
+                        for member in top_sorted[:10]
+                    ],
+                )
+            )
+
+    if metrics.get("low_donors"):
+        low_sorted = sorted(members, key=lambda m: getattr(m, "donations", 0))
+        low_entries = [
+            f"• {member.name}: {getattr(member, 'donations', 0):,} donated"
+            for member in low_sorted[:5]
+        ]
+        if low_entries:
+            sections.append("🔻 **Lowest Donation Totals**\n" + "\n".join(low_entries))
+            csv_sections.append(
+                (
+                    "Lowest Donation Totals",
+                    ["Member", "Donated"],
+                    [
+                        [member.name, str(getattr(member, "donations", 0))]
+                        for member in low_sorted[:10]
+                    ],
+                )
+            )
+
+    if metrics.get("negative_balance"):
+        negative = [
+            member
+            for member in members
+            if getattr(member, "donations", 0) - getattr(member, "donations_received", 0) < 0
+        ]
+        if negative:
+            lines = [
+                f"• {member.name}: {getattr(member, 'donations', 0):,} given vs {getattr(member, 'donations_received', 0):,} received"
+                for member in negative[:5]
+            ]
+            sections.append("⚠️ **Negative Donation Balance**\n" + "\n".join(lines))
+            csv_sections.append(
+                (
+                    "Negative Donation Balance",
+                    ["Member", "Donated", "Received"],
+                    [
+                        [
+                            member.name,
+                            str(getattr(member, "donations", 0)),
+                            str(getattr(member, "donations_received", 0)),
+                        ]
+                        for member in negative[:10]
+                    ],
+                )
+            )
+
+    payload = "\n\n".join(sections)
+    context = {
+        "csv_sections": csv_sections,
+    }
+    default_channel_id = donation_tracking.get("channel_id")
+    return payload, default_channel_id, context
+
+
+def _compose_event_opt_in_summary(guild: discord.Guild) -> Tuple[str, str]:
+    lines: List[str] = []
+    for event_type in EVENT_TYPES:
+        role = _get_event_role(guild, event_type)
+        if role:
+            lines.append(f"{role.name}: {len(role.members)} opted in")
+    if not lines:
+        lines.append("No event alert roles are configured yet.")
+    return ("Event Opt-Ins", "\n".join(lines))
+
+
+def _create_csv_file(sections: List[Tuple[str, List[str], List[List[str]]]]) -> Optional[bytes]:
+    if not sections:
+        return None
+    buffer = StringIO()
+    writer = csv.writer(buffer)
+    for title, headers, rows in sections:
+        writer.writerow([title])
+        if headers:
+            writer.writerow(headers)
+        writer.writerows(rows)
+        writer.writerow([])
+    return buffer.getvalue().encode("utf-8")
+
+
+def _sanitise_modules(modules: Iterable[str]) -> List[str]:
+    clean = [module for module in modules if module in DASHBOARD_MODULES]
+    return clean or ["war_overview"]
+
+
+def _dashboard_defaults(clan_entry: Dict[str, Any]) -> Tuple[List[str], str, Optional[int]]:
+    dashboard = clan_entry.get("dashboard", {}) if isinstance(clan_entry.get("dashboard"), dict) else {}
+    modules = dashboard.get("modules", ["war_overview"])
+    if not isinstance(modules, list):
+        modules = ["war_overview"]
+    fmt = dashboard.get("format", "embed")
+    if fmt not in DASHBOARD_FORMATS:
+        fmt = "embed"
+    channel_id = dashboard.get("channel_id")
+    return _sanitise_modules(modules), fmt, channel_id
+
+
+async def _generate_dashboard_content(
+    guild: discord.Guild,
+    clan_name: str,
+    modules: Iterable[str],
+) -> Tuple[List[Tuple[str, str]], List[Tuple[str, List[str], List[List[str]]]]]:
+    clan_entry = _get_clan_entry(guild.id, clan_name)
+    if clan_entry is None:
+        raise ValueError(f"`{clan_name}` is not configured.")
+
+    clan_tags = _clan_names_for_guild(guild.id)
+    tag = clan_tags.get(clan_name)
+    if not tag:
+        raise ValueError(f"`{clan_name}` has no stored clan tag.")
+
+    sections: List[Tuple[str, str]] = []
+    csv_sections: List[Tuple[str, List[str], List[List[str]]]] = []
+
+    for module in _sanitise_modules(modules):
+        if module == "war_overview":
+            title, text = await _fetch_war_overview(clan_name, tag)
+            sections.append((title, text))
+        elif module == "donation_snapshot":
+            payload, _, context = await _compose_donation_summary(guild, clan_name, clan_entry)
+            sections.append(("Donation Snapshot", payload))
+            csv_sections.extend(context.get("csv_sections", []))
+        elif module == "upgrade_queue":
+            title, text, csv_data = await _compose_upgrade_snapshot(guild, clan_name, tag)
+            sections.append((title, text))
+            csv_sections.extend(csv_data)
+        elif module == "event_opt_ins":
+            sections.append(_compose_event_opt_in_summary(guild))
+
+    return sections, csv_sections
+
+
+async def _compose_upgrade_snapshot(
+    guild: discord.Guild,
+    clan_name: str,
+    clan_tag: str,
+) -> Tuple[str, str, List[Tuple[str, List[str], List[List[str]]]]]:
+    """Summarise planned upgrades for members of a configured clan.
+
+    Parameters:
+        guild (discord.Guild): Discord guild requesting the snapshot.
+        clan_name (str): Configured clan name used for display.
+        clan_tag (str): Clash of Clans tag associated with the clan.
+
+    Returns:
+        Tuple[str, str, List[Tuple[str, List[str], List[List[str]]]]]: Title, human readable text, and optional CSV sections.
+    """
+    guild_config = _ensure_guild_config(guild.id)
+    upgrade_log: List[Dict[str, Any]] = guild_config.get("upgrade_log", [])
+    if not upgrade_log:
+        return ("Upgrade Queue", "No planned upgrades logged for this server yet.", [])
+
+    try:
+        clan = await client.get_clan(clan_tag)
+    except Exception as exc:
+        raise ValueError(f"Unable to fetch clan roster: {exc}") from exc
+
+    member_tags: Set[str] = {
+        getattr(member, "tag")
+        for member in getattr(clan, "members", [])
+        if getattr(member, "tag", None)
+    }
+
+    def _matches(entry: Dict[str, Any]) -> bool:
+        if entry.get("clan_name") == clan_name:
+            return True
+        if entry.get("clan_tag") == clan_tag:
+            return True
+        return entry.get("player_tag") in member_tags
+
+    relevant_entries = [entry for entry in reversed(upgrade_log) if isinstance(entry, dict) and _matches(entry)]
+    if not relevant_entries:
+        return ("Upgrade Queue", "No recent upgrades logged for this clan.", [])
+
+    lines: List[str] = []
+    csv_rows: List[List[str]] = []
+    for entry in relevant_entries[:10]:
+        alias = entry.get("alias") or entry.get("player_tag") or "Unknown account"
+        upgrade_desc = entry.get("upgrade") or "Upgrade not specified"
+        submitter = entry.get("user_name") or "Unknown member"
+        notes = entry.get("notes") or ""
+        timestamp = _parse_iso_timestamp(entry.get("timestamp"))
+        timestamp_text = timestamp.strftime("%Y-%m-%d %H:%M UTC") if timestamp else "Unknown time"
+
+        line = f"• {alias}: {upgrade_desc} — logged by {submitter} on {timestamp_text}"
+        if notes:
+            line += f"\n  Notes: {notes}"
+        lines.append(line)
+        csv_rows.append(
+            [
+                alias,
+                upgrade_desc,
+                notes,
+                submitter,
+                timestamp_text,
+            ]
+        )
+
+    csv_section = (
+        "Upgrade Queue",
+        ["Alias", "Upgrade", "Notes", "Submitted By", "Submitted (UTC)"],
+        csv_rows,
+    )
+    return ("Upgrade Queue", "\n".join(lines), [csv_section])
+
+
+def _create_dashboard_embed(
+    clan_name: str,
+    sections: List[Tuple[str, str]],
+) -> discord.Embed:
+    embed = discord.Embed(
+        title=f"Dashboard — {clan_name}",
+        colour=discord.Colour.blurple(),
+        timestamp=datetime.utcnow(),
+    )
+    for title, text in sections:
+        text = text or "(no data)"
+        if len(text) > 1024:
+            chunks = _chunk_content(text, 1024)
+            embed.add_field(name=title, value=chunks[0], inline=False)
+            for chunk in chunks[1:]:
+                embed.add_field(name="", value=chunk, inline=False)
+        else:
+            embed.add_field(name=title, value=text, inline=False)
+    return embed
+
+
+async def _send_dashboard(
+    interaction: Optional[discord.Interaction],
+    *,
+    guild: discord.Guild,
+    clan_name: str,
+    modules: Iterable[str],
+    output_format: str,
+    destination: discord.TextChannel,
+) -> None:
+    sections, csv_sections = await _generate_dashboard_content(guild, clan_name, modules)
+    if not sections:
+        raise ValueError("No dashboard sections could be generated.")
+
+    files = []
+    embed: Optional[discord.Embed] = None
+    if output_format in {"embed", "both"}:
+        embed = _create_dashboard_embed(clan_name, sections)
+    csv_payload = None
+    if output_format in {"csv", "both"}:
+        csv_payload = _create_csv_file(csv_sections)
+        if csv_payload:
+            files.append(discord.File(BytesIO(csv_payload), filename=f"dashboard_{clan_name}.csv"))
+
+    if embed and files:
+        await destination.send(embed=embed, file=files[0])
+    elif embed:
+        await destination.send(embed=embed)
+    elif files:
+        await destination.send(file=files[0])
+    else:
+        payload = "\n\n".join(text for _, text in sections)
+        for chunk in _chunk_content(payload):
+            await destination.send(chunk)
+
+    if interaction is not None:
+        await send_text_response(
+            interaction,
+            f"✅ Dashboard posted to {destination.mention}.",
+            ephemeral=True,
+        )
+
+
+async def _compose_season_summary(
+    guild: discord.Guild,
+    clan_name: str,
+    clan_entry: Dict[str, Any],
+    *,
+    include_donations: bool,
+    include_wars: bool,
+    include_members: bool,
+) -> Tuple[str, Optional[int]]:
+    clan_tags = _clan_names_for_guild(guild.id)
+    tag = clan_tags.get(clan_name)
+    if not tag:
+        raise ValueError(f"`{clan_name}` has no stored tag.")
+
+    try:
+        clan = await client.get_clan(tag)
+    except Exception as exc:
+        raise ValueError(f"Unable to fetch clan data: {exc}") from exc
+
+    members = list(getattr(clan, "members", []))
+    sections: List[str] = [f"🏁 **Season Summary — {clan.name}**"]
+
+    if include_wars:
+        wars_section = (
+            f"• War wins: {getattr(clan, 'war_wins', 'N/A')}\n"
+            f"• War losses: {getattr(clan, 'war_losses', 'N/A')}\n"
+            f"• War ties: {getattr(clan, 'war_ties', 'N/A')}\n"
+            f"• Current streak: {getattr(clan, 'war_win_streak', 'N/A')}"
+        )
+        sections.append("⚔️ **War Performance**\n" + wars_section)
+
+    if include_donations and members:
+        top_donor = max(members, key=lambda m: getattr(m, "donations", 0))
+        top_receiver = max(members, key=lambda m: getattr(m, "donations_received", 0))
+        donation_lines = [
+            f"• Top donor: {top_donor.name} ({getattr(top_donor, 'donations', 0):,})",
+            f"• Most received: {top_receiver.name} ({getattr(top_receiver, 'donations_received', 0):,})",
+        ]
+        sections.append("🤝 **Donations**\n" + "\n".join(donation_lines))
+
+    if include_members and members:
+        top_trophies = sorted(members, key=lambda m: getattr(m, "trophies", 0), reverse=True)[:5]
+        member_lines = [
+            f"• {member.name}: {getattr(member, 'trophies', 0):,} trophies"
+            for member in top_trophies
+        ]
+        sections.append("🏆 **Top Trophy Holders**\n" + "\n".join(member_lines))
+
+    payload = "\n\n".join(sections)
+    default_channel_id = clan_entry.get("season_summary", {}).get("channel_id")
+    return payload, default_channel_id
+
+
+def _parse_time_utc(time_str: str) -> Tuple[int, int]:
+    try:
+        hour_str, minute_str = time_str.split(":", 1)
+        hour = int(hour_str)
+        minute = int(minute_str)
+    except Exception as exc:  # pylint: disable=broad-except
+        raise ValueError("Time must be formatted as HH:MM in 24-hour UTC.") from exc
+    if not (0 <= hour < 24 and 0 <= minute < 60):
+        raise ValueError("Time must be formatted as HH:MM in 24-hour UTC.")
+    return hour, minute
+
+
+def _calculate_next_run(
+    frequency: str,
+    time_utc: str,
+    weekday: Optional[str] = None,
+    reference: Optional[datetime] = None,
+) -> str:
+    hour, minute = _parse_time_utc(time_utc)
+    ref = reference or datetime.utcnow()
+    candidate = ref.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+    if frequency == "daily":
+        if candidate <= ref:
+            candidate += timedelta(days=1)
+    elif frequency == "weekly":
+        if weekday is None:
+            raise ValueError("Weekday must be provided for weekly schedules.")
+        weekday_index = WEEKDAY_MAP.get(weekday)
+        if weekday_index is None:
+            raise ValueError("Invalid weekday supplied.")
+        days_ahead = (weekday_index - candidate.weekday()) % 7
+        if days_ahead == 0 and candidate <= ref:
+            days_ahead = 7
+        candidate += timedelta(days=days_ahead)
+    else:
+        raise ValueError("Frequency must be daily or weekly.")
+
+    candidate = candidate.replace(tzinfo=timezone.utc)
+    return candidate.isoformat()
+
+
+def _format_schedule_entry(schedule: Dict[str, Any]) -> str:
+    next_run = schedule.get("next_run", "unknown")
+    friendly = f"ID `{schedule.get('id', 'n/a')}` — {schedule.get('type', 'unknown')} for `{schedule.get('clan_name', '?')}`"
+    friendly += f" every {schedule.get('frequency', 'daily')} at {schedule.get('time_utc', '00:00')} UTC"
+    if schedule.get("frequency") == "weekly" and schedule.get("weekday"):
+        friendly += f" on {schedule['weekday'].title()}"
+    friendly += f" (next run: {next_run})"
+    return friendly
+
+
+async def _execute_schedule(guild: discord.Guild, schedule: Dict[str, Any]) -> None:
+    schedule_type = schedule.get("type")
+    clan_name = schedule.get("clan_name", "")
+    clan_entry = _get_clan_entry(guild.id, clan_name)
+    if clan_entry is None:
+        log.debug("Skipping schedule %s: clan not configured", schedule.get("id"))
+        return
+
+    destination: Optional[discord.TextChannel] = None
+    channel_id = schedule.get("channel_id")
+    if isinstance(channel_id, int):
+        destination = guild.get_channel(channel_id)
+
+    if schedule_type == "dashboard":
+        modules, default_format, default_channel_id = _dashboard_defaults(clan_entry)
+        modules = _sanitise_modules(schedule.get("options", {}).get("modules", modules))
+        format_override = schedule.get("options", {}).get("format", default_format)
+        if destination is None and isinstance(default_channel_id, int):
+            destination = guild.get_channel(default_channel_id)
+        if destination is None:
+            log.debug("Skipping dashboard schedule %s: no destination channel", schedule.get("id"))
+            return
+        if not destination.permissions_for(destination.guild.me).send_messages:
+            log.debug("Skipping dashboard schedule %s: lacking channel permissions", schedule.get("id"))
+            return
+        await _send_dashboard(
+            None,
+            guild=guild,
+            clan_name=clan_name,
+            modules=modules,
+            output_format=format_override,
+            destination=destination,
+        )
+    elif schedule_type == "donation_summary":
+        payload, default_channel_id, context = await _compose_donation_summary(guild, clan_name, clan_entry)
+        if destination is None and isinstance(default_channel_id, int):
+            destination = guild.get_channel(default_channel_id)
+        if destination is None:
+            log.debug("Skipping donation schedule %s: no destination channel", schedule.get("id"))
+            return
+        if not destination.permissions_for(destination.guild.me).send_messages:
+            log.debug("Skipping donation schedule %s: lacking channel permissions", schedule.get("id"))
+            return
+        for chunk in _chunk_content(payload):
+            await destination.send(chunk)
+        csv_payload = _create_csv_file(context.get("csv_sections", []))
+        if csv_payload:
+            await destination.send(file=discord.File(BytesIO(csv_payload), filename=f"donation_summary_{clan_name}.csv"))
+    elif schedule_type == "season_summary":
+        options = schedule.get("options", {})
+        include_d = options.get("include_donations", True)
+        include_w = options.get("include_wars", True)
+        include_m = options.get("include_members", False)
+        payload, default_channel_id = await _compose_season_summary(
+            guild,
+            clan_name,
+            clan_entry,
+            include_donations=include_d,
+            include_wars=include_w,
+            include_members=include_m,
+        )
+        if destination is None and isinstance(default_channel_id, int):
+            destination = guild.get_channel(default_channel_id)
+        if destination is None:
+            log.debug("Skipping season summary schedule %s: no destination channel", schedule.get("id"))
+            return
+        if not destination.permissions_for(destination.guild.me).send_messages:
+            log.debug("Skipping season summary schedule %s: lacking channel permissions", schedule.get("id"))
+            return
+        for chunk in _chunk_content(payload):
+            await destination.send(chunk)
+    else:
+        log.debug("Unknown schedule type %s", schedule_type)
+
+
+@bot.tree.command(
+    name="schedule_report",
+    description="Create or update a scheduled report for a configured clan.",
+)
+@app_commands.describe(
+    clan_name="Configured clan to report on.",
+    report_type="Choose which report to schedule.",
+    frequency="How often to run the report.",
+    time_utc="Time to run (HH:MM in UTC).",
+    weekday="Required for weekly schedules: which weekday to run.",
+    channel="Channel to post in; defaults to configured destination.",
+    dashboard_modules="Dashboard only: comma-separated modules (e.g. war_overview,donation_snapshot).",
+    dashboard_format="Dashboard only: embed, csv, or both.",
+    include_donations="Season summary only: include donation stats.",
+    include_wars="Season summary only: include war stats.",
+    include_members="Season summary only: include member stats.",
+)
+async def schedule_report(
+    interaction: discord.Interaction,
+    clan_name: str,
+    report_type: Literal["dashboard", "donation_summary", "season_summary"],
+    frequency: Literal["daily", "weekly"],
+    time_utc: str,
+    weekday: Optional[Literal["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]] = None,
+    channel: Optional[discord.TextChannel] = None,
+    dashboard_modules: Optional[str] = None,
+    dashboard_format: Optional[Literal["embed", "csv", "both"]] = None,
+    include_donations: Optional[bool] = None,
+    include_wars: Optional[bool] = None,
+    include_members: Optional[bool] = None,
+) -> None:
+    """Persist a scheduled report so it runs automatically.
+
+    Parameters:
+        interaction (discord.Interaction): Invocation context used to validate permissions and respond.
+        clan_name (str): Configured clan that the report should cover.
+        report_type (Literal): Report flavour (`dashboard`, `donation_summary`, or `season_summary`).
+        frequency (Literal): Either `daily` or `weekly` cadence for the scheduler.
+        time_utc (str): Time to run expressed as HH:MM in UTC.
+        weekday (Optional[Literal]): Required when `frequency` is weekly to pick the day.
+        channel (Optional[discord.TextChannel]): Override destination channel; falls back to stored defaults.
+        dashboard_modules (Optional[str]): Dashboard-specific override listing modules separated by commas.
+        dashboard_format (Optional[Literal]): Dashboard output format (`embed`, `csv`, or `both`).
+        include_donations (Optional[bool]): Season summary flag to include donation metrics.
+        include_wars (Optional[bool]): Season summary flag to include war metrics.
+        include_members (Optional[bool]): Season summary flag to include member leaderboard metrics.
+    """
+    _record_command_usage(interaction, "schedule_report")
+    log.debug(
+        "schedule_report invoked clan=%s type=%s frequency=%s time=%s channel=%s",
+        clan_name,
+        report_type,
+        frequency,
+        time_utc,
+        getattr(channel, "id", None),
+    )
+
+    if interaction.guild is None:
+        await send_text_response(
+            interaction,
+            "❌ This command must be used inside a Discord server.",
+            ephemeral=True,
+        )
+        return
+    member = interaction.user
+    if not isinstance(member, discord.Member) or not member.guild_permissions.administrator:
+        await send_text_response(
+            interaction,
+            "❌ Only administrators can manage report schedules.",
+            ephemeral=True,
+        )
+        return
+
+    guild_config = _ensure_guild_config(interaction.guild.id)
+    if clan_name not in _clan_names_for_guild(interaction.guild.id):
+        await send_text_response(
+            interaction,
+            f"⚠️ `{clan_name}` is not configured for this server.",
+            ephemeral=True,
+        )
+        return
+
+    if frequency == "weekly" and weekday is None:
+        await send_text_response(
+            interaction,
+            "⚠️ Weekly schedules must include the `weekday` option.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        _parse_time_utc(time_utc)
+    except ValueError as exc:
+        await send_text_response(
+            interaction,
+            f"⚠️ {exc}",
+            ephemeral=True,
+        )
+        return
+
+    destination_id: Optional[int] = None
+    if channel is not None:
+        if not channel.permissions_for(channel.guild.me).send_messages:
+            await send_text_response(
+                interaction,
+                "⚠️ I do not have permission to send messages in that channel.",
+                ephemeral=True,
+            )
+            return
+        destination_id = channel.id
+
+    options: Dict[str, Any] = {}
+    if report_type == "dashboard":
+        modules_list = None
+        if isinstance(dashboard_modules, str) and dashboard_modules.strip():
+            raw_modules = [item.strip() for item in dashboard_modules.split(",") if item.strip()]
+            modules_list = _sanitise_modules(raw_modules)
+            if not modules_list:
+                await send_text_response(
+                    interaction,
+                    "⚠️ I couldn't recognise any of those dashboard modules.",
+                    ephemeral=True,
+                )
+                return
+            options["modules"] = modules_list
+        if dashboard_format:
+            if dashboard_format not in DASHBOARD_FORMATS:
+                await send_text_response(
+                    interaction,
+                    "⚠️ Dashboard format must be embed, csv, or both.",
+                    ephemeral=True,
+                )
+                return
+            options["format"] = dashboard_format
+    elif report_type == "season_summary":
+        if include_donations is not None:
+            options["include_donations"] = include_donations
+        if include_wars is not None:
+            options["include_wars"] = include_wars
+        if include_members is not None:
+            options["include_members"] = include_members
+
+    schedule_id = str(uuid4())
+    next_run = _calculate_next_run(frequency, time_utc, weekday=weekday)
+    schedule_entry = {
+        "id": schedule_id,
+        "type": report_type,
+        "clan_name": clan_name,
+        "frequency": frequency,
+        "time_utc": time_utc,
+        "weekday": weekday if frequency == "weekly" else None,
+        "channel_id": destination_id,
+        "next_run": next_run,
+        "options": options,
+    }
+    guild_config.setdefault("schedules", []).append(schedule_entry)
+    save_server_config()
+
+    await send_text_response(
+        interaction,
+        f"✅ Scheduled `{report_type}` for `{clan_name}`. Next run at {next_run}. (ID `{schedule_id}`)",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="list_schedules", description="List scheduled reports for this server.")
+@app_commands.describe(clan_name="Optional filter for a specific configured clan.")
+async def list_schedules(interaction: discord.Interaction, clan_name: Optional[str] = None) -> None:
+    """Display the stored schedules, optionally filtered by clan.
+
+    Parameters:
+        interaction (discord.Interaction): Invocation context used for permission checks and responses.
+        clan_name (Optional[str]): When provided, only schedules for the named clan are returned.
+    """
+    _record_command_usage(interaction, "list_schedules")
+    log.debug("list_schedules invoked clan=%s", clan_name)
+
+    if interaction.guild is None:
+        await send_text_response(
+            interaction,
+            "❌ This command must be used inside a Discord server.",
+            ephemeral=True,
+        )
+        return
+    member = interaction.user
+    if not isinstance(member, discord.Member) or not member.guild_permissions.administrator:
+        await send_text_response(
+            interaction,
+            "❌ Only administrators can view report schedules.",
+            ephemeral=True,
+        )
+        return
+
+    guild_config = _ensure_guild_config(interaction.guild.id)
+    schedules = guild_config.get("schedules", [])
+    if not schedules:
+        await send_text_response(
+            interaction,
+            "ℹ️ No schedules have been configured yet.",
+            ephemeral=True,
+        )
+        return
+
+    filtered = schedules
+    if isinstance(clan_name, str) and clan_name.strip():
+        filtered = [entry for entry in schedules if entry.get("clan_name") == clan_name.strip()]
+        if not filtered:
+            await send_text_response(
+                interaction,
+                f"ℹ️ No schedules found for `{clan_name.strip()}`.",
+                ephemeral=True,
+            )
+            return
+
+    lines = ["🗓️ **Scheduled Reports**"] + [_format_schedule_entry(entry) for entry in filtered]
+    await send_text_response(
+        interaction,
+        "\n".join(lines),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="cancel_schedule", description="Remove a scheduled report by its ID.")
+@app_commands.describe(schedule_id="Use `/list_schedules` to find the ID.")
+async def cancel_schedule(interaction: discord.Interaction, schedule_id: str) -> None:
+    """Delete a stored schedule if it exists.
+
+    Parameters:
+        interaction (discord.Interaction): Invocation context used for permission checks and responses.
+        schedule_id (str): Identifier from `/list_schedules` that should be removed.
+    """
+    _record_command_usage(interaction, "cancel_schedule")
+    log.debug("cancel_schedule invoked id=%s", schedule_id)
+
+    if interaction.guild is None:
+        await send_text_response(
+            interaction,
+            "❌ This command must be used inside a Discord server.",
+            ephemeral=True,
+        )
+        return
+    member = interaction.user
+    if not isinstance(member, discord.Member) or not member.guild_permissions.administrator:
+        await send_text_response(
+            interaction,
+            "❌ Only administrators can cancel report schedules.",
+            ephemeral=True,
+        )
+        return
+
+    guild_config = _ensure_guild_config(interaction.guild.id)
+    schedules = guild_config.get("schedules", [])
+    remaining = [entry for entry in schedules if entry.get("id") != schedule_id]
+    if len(remaining) == len(schedules):
+        await send_text_response(
+            interaction,
+            f"⚠️ I couldn't find a schedule with ID `{schedule_id}`.",
+            ephemeral=True,
+        )
+        return
+
+    guild_config["schedules"] = remaining
+    save_server_config()
+    await send_text_response(
+        interaction,
+        f"✅ Removed schedule `{schedule_id}`.",
+        ephemeral=True,
+    )
+
+
 # Poll every five minutes so 5-minute alert thresholds are respected.
 @tasks.loop(minutes=5)
 async def war_alert_loop() -> None:
@@ -2573,6 +3734,51 @@ def ensure_war_alert_loop_running() -> None:
         war_alert_loop.start()
 
 
+@tasks.loop(minutes=1)
+async def report_schedule_loop() -> None:
+    """Poll stored schedules and execute any that are due."""
+    log.debug("report_schedule_loop tick")
+    now = datetime.now(timezone.utc)
+    for guild_id, _ in server_config.items():
+        guild = bot.get_guild(guild_id)
+        if guild is None:
+            continue
+        guild_config = _ensure_guild_config(guild_id)
+        schedules = guild_config.get("schedules", [])
+        modified = False
+        for schedule in schedules:
+            next_run_str = schedule.get("next_run")
+            next_run = _parse_iso_timestamp(next_run_str) if isinstance(next_run_str, str) else None
+            if next_run is None or next_run <= now:
+                try:
+                    await _execute_schedule(guild, schedule)
+                except Exception:
+                    log.exception("Error while executing schedule %s", schedule.get("id"))
+                finally:
+                    schedule["next_run"] = _calculate_next_run(
+                        schedule.get("frequency", "daily"),
+                        schedule.get("time_utc", "00:00"),
+                        weekday=schedule.get("weekday"),
+                    )
+                    modified = True
+        if modified:
+            save_server_config()
+
+
+@report_schedule_loop.before_loop
+async def _schedule_loop_ready() -> None:
+    """Delay schedule processing until the bot is ready."""
+    log.debug("Waiting for bot readiness before starting schedule loop")
+    await bot.wait_until_ready()
+
+
+def ensure_report_schedule_loop_running() -> None:
+    """Ensure the scheduled report loop is active."""
+    log.debug("ensure_report_schedule_loop_running called")
+    if not report_schedule_loop.is_running():
+        report_schedule_loop.start()
+
+
 class WarInfoView(discord.ui.View):
     """Interactive view for displaying war information with sharing controls."""
 
@@ -2636,7 +3842,7 @@ class WarInfoView(discord.ui.View):
 @app_commands.describe(clan_name="Configured clan to inspect.")
 async def clan_war_info_menu(interaction: discord.Interaction, clan_name: str):
     """Provide an interactive view of war details using a select menu and share buttons."""
-    log_command_call("clan_war_info_menu")
+    _record_command_usage(interaction, "clan_war_info_menu")
     log.debug("clan_war_info_menu invoked")
     if interaction.guild is None:
         await send_text_response(
@@ -3377,6 +4583,128 @@ class GeneralAssignmentModal(discord.ui.Modal):
         self.stop()
 
 
+class DashboardModuleSelect(discord.ui.Select):
+    def __init__(self, parent_view: "DashboardConfigView", selected: List[str]):
+        options = [
+            discord.SelectOption(
+                label=label,
+                value=key,
+                default=key in selected,
+            )
+            for key, label in DASHBOARD_MODULES.items()
+        ]
+        super().__init__(
+            placeholder="Select dashboard modules",
+            min_values=1,
+            max_values=len(options),
+            options=options,
+        )
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        self.parent_view.selected_modules = list(self.values)
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
+
+
+class DashboardFormatSelect(discord.ui.Select):
+    def __init__(self, parent_view: "DashboardConfigView", selected: str):
+        options = [
+            discord.SelectOption(label=fmt.upper(), value=fmt, default=(fmt == selected))
+            for fmt in sorted(DASHBOARD_FORMATS)
+        ]
+        super().__init__(
+            placeholder="Select output format",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        self.parent_view.selected_format = self.values[0]
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
+
+
+class DashboardConfigView(discord.ui.View):
+    def __init__(
+        self,
+        *,
+        guild: discord.Guild,
+        clan_name: str,
+        initial_modules: List[str],
+        initial_format: str,
+        channel: Optional[discord.TextChannel],
+    ):
+        super().__init__(timeout=300)
+        self.guild = guild
+        self.clan_name = clan_name
+        self.selected_modules = _sanitise_modules(initial_modules)
+        self.selected_format = initial_format if initial_format in DASHBOARD_FORMATS else "embed"
+        self.channel = channel
+        self.add_item(DashboardModuleSelect(self, self.selected_modules))
+        self.add_item(DashboardFormatSelect(self, self.selected_format))
+
+    def render_message(self) -> str:
+        module_labels = [DASHBOARD_MODULES.get(m, m) for m in self.selected_modules]
+        channel_text = self.channel.mention if self.channel else "Current or invoking channel"
+        return (
+            f"Configuration for `{self.clan_name}`\n"
+            f"• Modules: {', '.join(module_labels)}\n"
+            f"• Format: {self.selected_format.upper()}\n"
+            f"• Default channel: {channel_text}\n\n"
+            "Use the dropdowns to adjust modules and format, then press **Save** to persist your changes."
+        )
+
+    def disable_all_items(self) -> None:
+        for child in self.children:
+            child.disabled = True
+
+    @discord.ui.button(label="Save", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:  # type: ignore[override]
+        if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "⚠️ Only administrators can update the dashboard configuration.",
+                ephemeral=True,
+            )
+            return
+
+        clan_entry = _get_clan_entry(self.guild.id, self.clan_name)
+        if clan_entry is None:
+            await interaction.response.send_message(
+                f"⚠️ `{self.clan_name}` is not configured.",
+                ephemeral=True,
+            )
+            return
+
+        dashboard = clan_entry.setdefault("dashboard", {})
+        dashboard["modules"] = self.selected_modules
+        dashboard["format"] = self.selected_format
+        if self.channel is not None:
+            dashboard["channel_id"] = self.channel.id
+        save_server_config()
+        self.disable_all_items()
+        await interaction.response.edit_message(
+            content=f"✅ Dashboard settings saved for `{self.clan_name}`.",
+            view=self,
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:  # type: ignore[override]
+        self.disable_all_items()
+        await interaction.response.edit_message(
+            content="Configuration cancelled.",
+            view=self,
+        )
+
+    async def on_timeout(self) -> None:
+        self.disable_all_items()
+
 class ToggleRoleButton(discord.ui.Button):
     """Reusable button that toggles a specific role for the onboarding workflow."""
 
@@ -3636,7 +4964,7 @@ class RoleSelect(discord.ui.Select):
 @app_commands.describe(enable="Choose True to receive alerts or False to opt out")
 async def toggle_war_alerts(interaction: discord.Interaction, enable: bool):
     """Toggle the role used for mention-based war alerts."""
-    log_command_call("toggle_war_alerts")
+    _record_command_usage(interaction, "toggle_war_alerts")
     log.debug("toggle_war_alerts invoked (enable=%s)", enable)
     if interaction.guild is None:
         await send_text_response(
@@ -3723,7 +5051,7 @@ async def toggle_war_alerts(interaction: discord.Interaction, enable: bool):
 @app_commands.describe(clan_name="Pick the clan that is currently in war.")
 async def assign_bases(interaction: discord.Interaction, clan_name: str):
     """Present admins with interactive tools to share base assignments."""
-    log_command_call("assign_bases")
+    _record_command_usage(interaction, "assign_bases")
     log.debug("assign_bases invoked for clan %s", clan_name)
     if interaction.guild is None:
         await send_text_response(
@@ -3815,7 +5143,7 @@ async def assign_bases(interaction: discord.Interaction, clan_name: str):
 @bot.tree.command(name="assign_clan_role", description="Self-assign your clan role via select menu.")
 async def assign_clan_role(interaction: discord.Interaction):
     """Allow members to pick a clan role matching configured clans."""
-    log_command_call("assign_clan_role")
+    _record_command_usage(interaction, "assign_clan_role")
     log.debug("assign_clan_role invoked")
     if interaction.guild is None:
         await send_text_response(

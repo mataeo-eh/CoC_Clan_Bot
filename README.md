@@ -5,6 +5,7 @@ A Discord bot that keeps Clash of Clans data at your fingertips: look up wars, a
 ## Highlights
 
 - **Single source of truth** – configure clans once with `/set_clan`, link their alerts, and let the war loop broadcast timed reminders automatically.
+- **Custom dashboards & schedules** – mix-and-match dashboard modules, export CSV snapshots, and automate recurring reports without manual follow-ups.
 - **Guided workflows** – every interactive command explains what to do after you press enter and provides buttons or dropdowns to finish the job.
 - **Player intelligence** – link Discord members to their Clash accounts and surface player stats instantly with `/player_info`.
 - **Safety first** – duplicate-tag protection, permission checks, and clear logging make it easy to understand what the bot is doing.
@@ -40,6 +41,11 @@ Each command behaves the same way: fill in any required options, press **Enter**
 - **Purpose:** Decide which text channel should receive time-based war alerts for a specific clan.
 - **After sending:** Step 1 – choose a category; Step 2 – pick the channel (use the 🔍 filter if there are tons of channels); Step 3 – confirm. The stored channel is used until you change it again.
 - **Permissions:** Administrators only.
+
+### `/configure_dashboard` & `/dashboard`
+- **Purpose:** Build configurable dashboards that combine war, donation, upgrade, and opt-in data, and post them on demand or export CSV snapshots.
+- **After sending:** `/configure_dashboard` opens an interactive view where admins choose modules, set the output format, and store a default channel. `/dashboard` lets anyone with access post the saved dashboard (or override the modules/format/channel for one-offs).
+- **Tips:** Modules accept comma-separated overrides (`war_overview,donation_snapshot`) and the dashboard format can be `embed`, `csv`, or `both`.
 
 ### `/link_player`
 - **Purpose:** Link or unlink Clash of Clans player tags to Discord members so `/player_info` autocomplete stays fast.
@@ -82,6 +88,7 @@ Each command behaves the same way: fill in any required options, press **Enter**
 ### `/plan_upgrade` & `/set_upgrade_channel`
 - **Purpose:** Members log upcoming upgrades for their linked accounts while admins decide where those notices are posted.
 - **After sending:** Upgrades appear in the configured channel with the submitter, account alias, upgrade details, and notes.
+- **Bonus:** Each submission is stored (with optional clan association) so dashboards can highlight recent upgrade plans.
 
 ### Donation tracking (`/configure_donation_metrics`, `/set_donation_channel`, `/donation_summary`)
 - **Purpose:** Highlight top donors (and optionally low donors or negative balances) with per-clan configuration and a dedicated summary channel.
@@ -99,6 +106,15 @@ Each command behaves the same way: fill in any required options, press **Enter**
 - **Purpose:** Drop end-of-season wrap-ups—war records, donation highlights, trophy leaders—into a dedicated channel.
 - **After sending:** The summary command pulls the latest clan data and posts it wherever you direct (or the default summary channel if set).
 
+### Scheduled reports (`/schedule_report`, `/list_schedules`, `/cancel_schedule`)
+- **Purpose:** Automate dashboards, donation summaries, and season wrap-ups so they appear on a daily or weekly cadence.
+- **After sending:** `/schedule_report` validates the cadence, stores the schedule, and tells you the next run time. `/list_schedules` shows what’s queued (with upcoming timestamps), and `/cancel_schedule` removes obsolete entries.
+- **Permissions:** Administrators only; the background scheduler respects per-clan channel settings and skips destinations the bot cannot write to.
+
+### `/help_usage`
+- **Purpose:** Give administrators anonymised insight into how the bot is used—top commands, total traffic, and high-level user activity.
+- **After sending:** The command replies ephemerally with aggregate counts (no user identifiers) so you can gauge adoption and spot unused workflows.
+
 ### Command Workflow Reminder
 Whichever command you choose, remember the pattern:
 1. Fill in the slash command’s options.
@@ -113,6 +129,10 @@ The background loop (defined in `Discord_Commands.py`) checks every tracked clan
 - A war is winding down (12 hours, 1 hour, 5 minutes) or just concluded (final score roundup).
 
 Alerts respect the per-clan channel set via `/choose_war_alert_channel`; if the bot loses send permissions for that channel, it skips the alerts until you pick a new destination.
+
+## Scheduled Reports
+
+Another background loop wakes up every minute, looks at the schedules created with `/schedule_report`, and runs anything that is due. Each run recalculates the next trigger using UTC, honours the per-report channel (falling back to configured defaults), and gracefully skips locations where the bot lacks send permissions. Use `/list_schedules` to monitor what’s queued and `/cancel_schedule` whenever you no longer need an automated recap.
 
 ## Logging and Support Files
 

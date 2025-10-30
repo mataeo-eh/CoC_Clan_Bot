@@ -28,13 +28,17 @@ async def on_ready():
 
     # Kick off background war alert processing after commands are registered.
     try:
-        from Discord_Commands import ensure_war_alert_loop_running
+        from Discord_Commands import (
+            ensure_report_schedule_loop_running,
+            ensure_war_alert_loop_running,
+        )
 
-        log.debug("Starting war alert loop")
+        log.debug("Starting background loops")
         ensure_war_alert_loop_running()
+        ensure_report_schedule_loop_running()
     except Exception as exc:
-        log.exception("Failed to start war alert loop")
-        print(f"Failed to start war alert loop: {exc}")
+        log.exception("Failed to start background loops")
+        print(f"Failed to start background loops: {exc}")
 
 
 if __name__ == "__main__":
