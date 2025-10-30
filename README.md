@@ -71,6 +71,34 @@ Each command behaves the same way: fill in any required options, press **Enter**
 - **Purpose:** Opt in or out of the alert role so members control whether they get pinged when alerts fire.
 - **Usage:** Choose **True** to receive alerts or **False** to opt out; the command explains whether the role was added or removed.
 
+### `/configure_war_nudge` & `/war_nudge`
+- **Purpose:** Let admins define reusable “reasons” (unused attacks, no attacks, low stars) and ping the appropriate members or roles on demand.
+- **After sending:** Configure reasons with mentions and an optional description via `/configure_war_nudge`, then run `/war_nudge` with that reason to post the reminder—no automated nudges, only when you call it.
+
+### War plan commands (`/save_war_plan`, `/list_war_plans`, `/war_plan`)
+- **Purpose:** Store reusable war plans per clan, review what’s available, and broadcast the chosen plan with a single command.
+- **After sending:** Saving stores the plan in the config; listing shows what’s available; `/war_plan` posts the template to the selected channel.
+
+### `/plan_upgrade` & `/set_upgrade_channel`
+- **Purpose:** Members log upcoming upgrades for their linked accounts while admins decide where those notices are posted.
+- **After sending:** Upgrades appear in the configured channel with the submitter, account alias, upgrade details, and notes.
+
+### Donation tracking (`/configure_donation_metrics`, `/set_donation_channel`, `/donation_summary`)
+- **Purpose:** Highlight top donors (and optionally low donors or negative balances) with per-clan configuration and a dedicated summary channel.
+- **After sending:** Metrics updates apply immediately; the summary command fetches live numbers from the Clash API and posts them to the chosen channel.
+
+### Event roles (`/configure_event_role`, `/event_alert_opt`)
+- **Purpose:** Maintain opt-in alert roles for events like Clan Games or Raid Weekend.
+- **After sending:** Admins map or create the roles, and members (or admins on their behalf) toggle them on demand.
+
+### `/register_me`
+- **Purpose:** Give newcomers a single command to opt into alert roles, review linked accounts, and find the documentation.
+- **After sending:** Buttons toggle the configured roles, and the response explains how to link tags or explore other utilities.
+
+### Seasonal summaries (`/set_season_summary_channel`, `/season_summary`)
+- **Purpose:** Drop end-of-season wrap-ups—war records, donation highlights, trophy leaders—into a dedicated channel.
+- **After sending:** The summary command pulls the latest clan data and posts it wherever you direct (or the default summary channel if set).
+
 ### Command Workflow Reminder
 Whichever command you choose, remember the pattern:
 1. Fill in the slash command’s options.
