@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import logging
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
 LOG_NAME = "coc_bot"
 LOG_DIRECTORY = Path("logs")
+LOG_RETENTION_DAYS = 7
 _logger = logging.getLogger(LOG_NAME)
 _command_counters: Counter[str] = Counter()
 _command_metadata: Dict[str, Dict[str, Optional[datetime]]] = {}
@@ -23,7 +24,8 @@ def setup_logger() -> logging.Logger:
         return _logger
 
     LOG_DIRECTORY.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    _prune_old_logs()
+    timestamp = datetime.now().strftime("%Y_%m_%d_%H%M%S")
     log_file = LOG_DIRECTORY / f"COCbotlogfile_{timestamp}.log"
 
     _logger.setLevel(logging.DEBUG)
@@ -49,6 +51,18 @@ def setup_logger() -> logging.Logger:
 def get_logger() -> logging.Logger:
     """Return the shared logger instance."""
     return _logger
+
+
+def _prune_old_logs(retention_days: int = LOG_RETENTION_DAYS) -> None:
+    """Remove log files older than the retention window."""
+    cutoff = datetime.now() - timedelta(days=retention_days)
+    for log_file in LOG_DIRECTORY.glob("COCbotlogfile_*.log"):
+        try:
+            created_at = datetime.fromtimestamp(log_file.stat().st_ctime)
+        except FileNotFoundError:
+            continue
+        if created_at < cutoff:
+            log_file.unlink(missing_ok=True)
 
 
 def log_command_call(command_name: str, *, user_id: Optional[int] = None) -> None:
