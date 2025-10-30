@@ -39,6 +39,10 @@ SCHEDULE_FREQUENCIES = ("daily", "weekly")
 WEEKDAY_CHOICES = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 WEEKDAY_MAP = {day: index for index, day in enumerate(WEEKDAY_CHOICES)}
 MAX_UPGRADE_LOG_ENTRIES = 250
+HELP_REMINDER = (
+    "Tip: After entering any command’s required options, press enter to run it. "
+    "Interactive menus or buttons appear in Discord right afterward."
+)
 
 # Cache of alert milestones sent per (guild, clan, war) tuple to avoid duplicates.
 alert_state: Dict[Tuple[int, str, str], Set[str]] = {}
@@ -125,6 +129,12 @@ def _format_datetime_utc(value: Optional[datetime]) -> str:
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _build_help_message(title: str, bullet_lines: Iterable[str]) -> str:
+    """Create a formatted help blurb for specialised help commands."""
+    body = "\n".join(f"• {line}" for line in bullet_lines)
+    return f"**{title}**\n{body}\n\n{HELP_REMINDER}"
 
 
 async def send_text_response(
@@ -331,6 +341,94 @@ async def help_command(interaction: discord.Interaction):
         "Interactive menus or buttons appear right afterward to guide the rest of the workflow."
     )
     await send_text_response(interaction, message, ephemeral=True)
+
+
+@bot.tree.command(name="help_war_info", description="Explain how to use the war info menu.")
+async def help_war_info(interaction: discord.Interaction) -> None:
+    """Describe the workflow for the interactive war information command."""
+    _record_command_usage(interaction, "help_war_info")
+    log.debug("help_war_info invoked")
+    bullets = [
+        "Run `/clan_war_info_menu` and pick a configured clan name.",
+        "Use the dropdown to choose which sections (members, status, timers) you want to see.",
+        "Press **Broadcast** to share the latest selection with the channel or **Private Copy** to keep it for yourself.",
+    ]
+    await send_text_response(
+        interaction,
+        _build_help_message("War Info Helper", bullets),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="help_assign_bases", description="Explain the target assignment workflow.")
+async def help_assign_bases(interaction: discord.Interaction) -> None:
+    """Outline how to share assignments with `/assign_bases`."""
+    _record_command_usage(interaction, "help_assign_bases")
+    log.debug("help_assign_bases invoked")
+    bullets = [
+        "Call `/assign_bases` and pick the clan you want to coordinate.",
+        "Use **Per Player Assignments** to select a home base, enter one or two enemy targets, and repeat as needed.",
+        "Choose **Post Assignments** when finished—the bot formats the summary and pings the alert role automatically.",
+        "Use **General Assignment Rule** for broad reminders (for example, mirrors-only or cleanup hour).",
+    ]
+    await send_text_response(
+        interaction,
+        _build_help_message("Assign Bases Helper", bullets),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="help_plan_upgrade", description="Explain how to log planned upgrades.")
+async def help_plan_upgrade(interaction: discord.Interaction) -> None:
+    """Explain how members can submit upgrade plans."""
+    _record_command_usage(interaction, "help_plan_upgrade")
+    log.debug("help_plan_upgrade invoked")
+    bullets = [
+        "Link each Clash account to your Discord profile with `/link_player`.",
+        "Run `/plan_upgrade` and choose the account tag plus a short description of the upgrade.",
+        "Add optional notes (timing, cost) and an optional clan name; the bot posts to the configured upgrade channel.",
+        "Admins set or change the destination channel with `/set_upgrade_channel`.",
+    ]
+    await send_text_response(
+        interaction,
+        _build_help_message("Upgrade Planner Helper", bullets),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="help_dashboard", description="Explain how to configure and post dashboards.")
+async def help_dashboard(interaction: discord.Interaction) -> None:
+    """Describe the dashboard configuration and posting commands."""
+    _record_command_usage(interaction, "help_dashboard")
+    log.debug("help_dashboard invoked")
+    bullets = [
+        "Admins run `/configure_dashboard` to pick modules (war overview, donations, upgrades, event opt-ins) and a default channel.",
+        "Anyone can call `/dashboard` for a configured clan; override modules or format with the optional fields when needed.",
+        "Select `embed`, `csv`, or `both` to choose between an embed preview and a downloadable CSV snapshot.",
+    ]
+    await send_text_response(
+        interaction,
+        _build_help_message("Dashboard Helper", bullets),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="help_schedule_report", description="Explain how to automate recurring reports.")
+async def help_schedule_report(interaction: discord.Interaction) -> None:
+    """Summarise the scheduled report command family."""
+    _record_command_usage(interaction, "help_schedule_report")
+    log.debug("help_schedule_report invoked")
+    bullets = [
+        "Admins use `/schedule_report` to choose the clan, report type, cadence (daily or weekly), and a UTC time.",
+        "Optional fields let you override dashboard modules/format or choose which season summary sections to include.",
+        "Run `/list_schedules` to review upcoming jobs and `/cancel_schedule` with an ID to remove an entry.",
+        "The scheduler posts automatically as soon as the next run time arrives.",
+    ]
+    await send_text_response(
+        interaction,
+        _build_help_message("Scheduled Reports Helper", bullets),
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="help_usage", description="Show aggregate command usage analytics (admin only).")

@@ -32,6 +32,13 @@ Each command behaves the same way: fill in any required options, press **Enter**
 - **What it does:** Sends a short reminder of what the bot can do and links back to this README.
 - **How to use:** Run the command anywhere; it always answers ephemerally so you can revisit the documentation link without spamming the channel.
 
+### Specialized help commands
+- `/help_war_info` – Recaps the dropdown workflow for the interactive war viewer.
+- `/help_assign_bases` – Walks admins through the per-player assignment view and broadcast button.
+- `/help_plan_upgrade` – Reminds members how to link accounts and submit upgrade plans.
+- `/help_dashboard` – Summarises the dashboard configuration flow and posting options.
+- `/help_schedule_report` – Explains the scheduler trio (`/schedule_report`, `/list_schedules`, `/cancel_schedule`).
+
 ### `/set_clan`
 - **Purpose:** Register or update a clan name and tag for the server and choose whether war alerts should be enabled.
 - **After sending:** If a conflicting tag already exists, the bot prompts you with a replace/keep choice. Success messages recap the tag, whether alerts are enabled, and suggest linking an alert channel.
