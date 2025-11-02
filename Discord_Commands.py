@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import copy
 import csv
+import re
 from datetime import datetime, timedelta, timezone
 from io import BytesIO, StringIO
 from typing import Any, Dict, Iterable, List, Literal, Optional, Set, Tuple
 from uuid import uuid4
+
+from collections import OrderedDict
 
 import discord
 from discord import app_commands
@@ -26,7 +30,12 @@ ALERT_ROLE_NAME = "War Alerts"
 ALERT_WINDOW_SECONDS = 300
 README_URL = "https://github.com/mataeo/COC_Clan_Bot/blob/main/README.md"
 WAR_NUDGE_REASONS = ("unused_attacks", "no_attacks", "low_stars")
-EVENT_TYPES = ("clan_games", "raid_weekend")
+DEFAULT_EVENT_DEFINITIONS: "OrderedDict[str, Dict[str, str]]" = OrderedDict(
+    [
+        ("clan_games", {"label": "Clan Games", "role_name": "Clan Games Alerts"}),
+        ("raid_weekend", {"label": "Raid Weekend", "role_name": "Raid Weekend Alerts"}),
+    ]
+)
 DASHBOARD_MODULES = {
     "war_overview": "War overview",
     "donation_snapshot": "Donation snapshot",
@@ -43,6 +52,13 @@ HELP_REMINDER = (
     "Tip: After entering any command’s required options, press enter to run it. "
     "Interactive menus or buttons appear in Discord right afterward."
 )
+
+DONATION_METRICS = ("top_donors", "low_donors", "negative_balance")
+DONATION_METRIC_INFO: Dict[str, str] = {
+    "top_donors": "Highlight the top donating members.",
+    "low_donors": "Track members with low donation counts.",
+    "negative_balance": "Flag members who received more troops than they donated.",
+}
 
 # Cache of alert milestones sent per (guild, clan, war) tuple to avoid duplicates.
 alert_state: Dict[Tuple[int, str, str], Set[str]] = {}
@@ -239,92 +255,387 @@ def _normalise_player_tag(raw_tag: str) -> Optional[str]:
     return cleaned
 
 
+def _alias_key_variants(text: str) -> Set[str]:
+    """Return a set of normalised lookup keys for player aliases or references."""
+    if not isinstance(text, str):
+        return set()
+    trimmed = text.strip()
+    if not trimmed:
+        return set()
+    lowered = trimmed.casefold()
+    keys: Set[str] = set()
+    keys.add(lowered)
+
+    # Remove common leading symbols.
+    for prefix in ("#", "@", "@!"):
+        if lowered.startswith(prefix):
+            candidate = lowered[len(prefix) :]
+            if candidate:
+                keys.add(candidate)
+
+    # Collapse whitespace for relaxed matching.
+    compact = lowered.replace(" ", "")
+    if compact:
+        keys.add(compact)
+
+    # Provide versions with and without a hash prefix for user convenience.
+    def _with_hash(value: str) -> Optional[str]:
+        return f"#{value}" if value else None
+
+    if not lowered.startswith("#"):
+        hashed = _with_hash(lowered)
+        if hashed:
+            keys.add(hashed)
+        if compact:
+            hashed_compact = _with_hash(compact)
+            if hashed_compact:
+                keys.add(hashed_compact)
+    else:
+        no_hash = lowered.lstrip("#")
+        if no_hash:
+            keys.add(no_hash)
+        compact_no_hash = compact.lstrip("#")
+        if compact_no_hash:
+            keys.add(compact_no_hash)
+
+    # Handle mention syntax <@123> or <@!123>
+    if lowered.startswith("<@") and lowered.endswith(">"):
+        mention_inner = lowered[2:-1]
+        if mention_inner.startswith("!"):
+            mention_inner = mention_inner[1:]
+        if mention_inner:
+            keys.add(mention_inner)
+
+    # Remove empty strings that may have been introduced.
+    return {key for key in keys if key}
+
+
+def _register_alias(lookup: Dict[str, str], alias: str, tag: str) -> None:
+    """Register an alias and its variants to point at the provided tag."""
+    for key in _alias_key_variants(alias):
+        lookup.setdefault(key, tag)
+
+
+def _build_player_lookup(guild: discord.Guild) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """Create lookup tables for resolving player references to tags."""
+    guild_config = _ensure_guild_config(guild.id)
+    alias_map: Dict[str, str] = {}
+    tag_map: Dict[str, str] = {}
+
+    # Linked accounts stored per Discord member.
+    player_accounts = guild_config.get("player_accounts", {})
+    for user_id_str, records in player_accounts.items():
+        if not isinstance(records, list):
+            continue
+        member: Optional[discord.Member] = None
+        if user_id_str.isdigit():
+            member = guild.get_member(int(user_id_str))
+        name_candidates = {
+            getattr(member, "display_name", None),
+            getattr(member, "name", None),
+            getattr(member, "global_name", None),
+            getattr(member, "nick", None),
+        } if member else set()
+        name_candidates.discard(None)
+
+        first_tag: Optional[str] = None
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            tag = record.get("tag")
+            normalised_tag = _normalise_player_tag(tag) if isinstance(tag, str) else None
+            if normalised_tag is None:
+                continue
+            tag_map.setdefault(normalised_tag, normalised_tag)
+            _register_alias(alias_map, normalised_tag, normalised_tag)
+            first_tag = first_tag or normalised_tag
+
+            alias_value = record.get("alias")
+            if isinstance(alias_value, str) and alias_value.strip():
+                _register_alias(alias_map, alias_value, normalised_tag)
+
+            for name in name_candidates:
+                if isinstance(name, str) and name.strip():
+                    _register_alias(alias_map, name, normalised_tag)
+                    _register_alias(alias_map, f"@{name}", normalised_tag)
+
+        if first_tag:
+            _register_alias(alias_map, user_id_str, first_tag)
+            if member is not None:
+                mention_variants = (
+                    f"<@{member.id}>",
+                    f"<@!{member.id}>",
+                    str(member.id),
+                )
+                for variant in mention_variants:
+                    _register_alias(alias_map, variant, first_tag)
+
+    # Legacy global mappings.
+    for alias, tag in guild_config.get("player_tags", {}).items():
+        normalised_tag = _normalise_player_tag(tag)
+        if normalised_tag is None:
+            continue
+        tag_map.setdefault(normalised_tag, normalised_tag)
+        _register_alias(alias_map, alias, normalised_tag)
+        _register_alias(alias_map, normalised_tag, normalised_tag)
+
+    return alias_map, tag_map
+
+
+def _resolve_player_reference(guild: discord.Guild, reference: str) -> Optional[str]:
+    """Resolve a user-provided reference (alias, mention, or tag) into a normalised tag."""
+    if not isinstance(reference, str):
+        return None
+    candidate = reference.strip()
+    if not candidate:
+        return None
+
+    # Direct tag handling first.
+    if candidate.startswith("#"):
+        direct_tag = _normalise_player_tag(candidate)
+        if direct_tag:
+            return direct_tag
+
+    alias_map, tag_map = _build_player_lookup(guild)
+
+    # Mentions such as <@123> or <@!123>.
+    if candidate.startswith("<@") and candidate.endswith(">"):
+        inner = candidate[2:-1].lstrip("!")
+        resolved = alias_map.get(inner.casefold())
+        if resolved:
+            return resolved
+
+    # User typed a bare numeric ID.
+    if candidate.isdigit():
+        resolved = alias_map.get(candidate.casefold())
+        if resolved:
+            return resolved
+
+    # Alias or display name variations.
+    for key in _alias_key_variants(candidate):
+        resolved = alias_map.get(key)
+        if resolved:
+            return resolved
+
+    # Final fallback: treat as tag without a leading hash.
+    fallback_tag = _normalise_player_tag(candidate)
+    if fallback_tag and fallback_tag in tag_map:
+        return fallback_tag
+
+    return None
+
+
+def _summarise_linked_accounts(guild: discord.Guild, member_id: int) -> str:
+    """Return a human-readable summary of linked accounts for a guild member."""
+    guild_config = _ensure_guild_config(guild.id)
+    accounts = guild_config.get("player_accounts", {}).get(str(member_id), [])
+    summaries: List[str] = []
+    for record in accounts:
+        if not isinstance(record, dict):
+            continue
+        tag = _normalise_player_tag(record.get("tag"))
+        if tag is None:
+            continue
+        alias = record.get("alias")
+        if isinstance(alias, str) and alias.strip():
+            summaries.append(f"{alias.strip()} ({tag})")
+        else:
+            summaries.append(tag)
+    return ", ".join(summaries) if summaries else "None linked yet"
+
+
+DURATION_COMPONENT_RE = re.compile(
+    r"(?P<value>\d+)\s*(?P<unit>d(?:ays?)?|h(?:ours?)?|hr?s?|m(?:in(?:utes?)?)?)",
+    re.IGNORECASE,
+)
+DURATION_COLON_RE = re.compile(r"^\s*(\d+):(\d{2})(?::(\d{2}))?\s*$")
+
+
+def _parse_upgrade_duration(value: str) -> Optional[timedelta]:
+    """Convert a human friendly duration string into a timedelta."""
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+
+    total_seconds = 0
+    matched = False
+    for match in DURATION_COMPONENT_RE.finditer(cleaned):
+        matched = True
+        amount = int(match.group("value"))
+        unit = match.group("unit").lower()
+        if unit in {"d", "day", "days"}:
+            total_seconds += amount * 86400
+        elif unit in {"h", "hour", "hours", "hr", "hrs"}:
+            total_seconds += amount * 3600
+        elif unit in {"m", "min", "mins", "minute", "minutes"}:
+            total_seconds += amount * 60
+        else:
+            matched = False
+            break
+
+    if matched and total_seconds > 0:
+        return timedelta(seconds=total_seconds)
+
+    colon_match = DURATION_COLON_RE.match(cleaned)
+    if colon_match:
+        hours = int(colon_match.group(1))
+        minutes = int(colon_match.group(2))
+        seconds = int(colon_match.group(3) or 0)
+        total = hours * 3600 + minutes * 60 + seconds
+        if total > 0:
+            return timedelta(seconds=total)
+
+    return None
+
+
+def _format_eta(timestamp: datetime) -> str:
+    """Format a completion timestamp for Discord display."""
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    else:
+        timestamp = timestamp.astimezone(timezone.utc)
+    unix_ts = int(timestamp.timestamp())
+    return f"<t:{unix_ts}:R> ({timestamp.strftime('%Y-%m-%d %H:%M UTC')})"
+
+
+class PlayerLinkError(Exception):
+    """Raised when a link or unlink action fails validation."""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+
+
+async def _link_player_account(
+    *,
+    guild: discord.Guild,
+    actor: discord.Member,
+    target: discord.Member,
+    action: Literal["link", "unlink"],
+    player_tag: str,
+    alias: Optional[str],
+) -> str:
+    """Perform the underlying link/unlink operation and return a user-facing message."""
+    if guild.id != actor.guild.id or guild.id != target.guild.id:
+        raise PlayerLinkError("⚠️ Players can only be managed inside their originating server.")
+
+    action_lower = action.lower()
+    if action_lower not in {"link", "unlink"}:
+        raise PlayerLinkError("⚠️ Unknown action; please choose link or unlink.")
+
+    normalised_tag = _normalise_player_tag(player_tag)
+    if normalised_tag is None:
+        raise PlayerLinkError("⚠️ Please provide a valid player tag like `#ABC123`.")
+
+    if target != actor and not actor.guild_permissions.administrator:
+        raise PlayerLinkError("❌ Only administrators can manage linked tags for other members.")
+
+    guild_config = _ensure_guild_config(guild.id)
+    accounts = guild_config.setdefault("player_accounts", {})
+    user_key = str(target.id)
+    existing_entries = accounts.setdefault(user_key, [])
+
+    if action_lower == "link":
+        try:
+            player_payload = await client.get_player(normalised_tag)
+        except coc.errors.NotFound:
+            raise PlayerLinkError(f"⚠️ I couldn't find a Clash of Clans profile with tag `{normalised_tag}`.")
+        except Exception as exc:  # pylint: disable=broad-except
+            log.exception("Unexpected error while linking player tag", exc_info=exc)
+            raise PlayerLinkError(f"⚠️ Unable to verify that tag right now: {exc}") from exc
+
+        inferred_alias = alias.strip() if isinstance(alias, str) and alias.strip() else None
+        if inferred_alias is None:
+            inferred_alias = player_payload.get("profile", {}).get("name")
+        if isinstance(inferred_alias, str):
+            inferred_alias = inferred_alias.strip() or None
+
+        updated = False
+        for record in existing_entries:
+            if isinstance(record, dict) and record.get("tag") == normalised_tag:
+                record["alias"] = inferred_alias
+                updated = True
+                break
+        if not updated:
+            existing_entries.append({"tag": normalised_tag, "alias": inferred_alias})
+
+        save_server_config()
+        alias_note = f" as `{inferred_alias}`" if inferred_alias else ""
+        target_label = target.display_name if isinstance(target, discord.Member) else str(target.id)
+        return f"✅ Linked `{normalised_tag}`{alias_note} to {target_label}."
+
+    # Unlink branch.
+    before = len(existing_entries)
+    existing_entries[:] = [
+        entry
+        for entry in existing_entries
+        if not (isinstance(entry, dict) and entry.get("tag") == normalised_tag)
+    ]
+    if not existing_entries:
+        accounts.pop(user_key, None)
+    if before == len(existing_entries):
+        raise PlayerLinkError(f"⚠️ No link for `{normalised_tag}` was found for that member.")
+
+    save_server_config()
+    target_label = target.display_name if isinstance(target, discord.Member) else str(target.id)
+    return f"✅ Removed `{normalised_tag}` from {target_label}."
+
+
 # ---------------------------------------------------------------------------
 # Slash command: /set_clan
 # ---------------------------------------------------------------------------
-
-@bot.tree.command(name="set_clan", description="Set a default clan for this server")
+@bot.tree.command(name="set_clan", description="Manage the clans configured for this server.")
 @app_commands.describe(
-    clan_name="Name of the clan",
-    tag="Clan tag (e.g. #ABC123)",
-    enable_alerts="Whether automatic war alerts should be enabled for this clan",
+    clan_name="Optional clan to load when opening the editor.",
 )
 async def set_clan(
     interaction: discord.Interaction,
-    clan_name: str,
-    tag: str,
-    enable_alerts: bool,
-):
-    """Allow administrators to bind a clan name to its Clash of Clans tag."""
+    clan_name: Optional[str] = None,
+) -> None:
+    """Launch the interactive clan manager for this server."""
     _record_command_usage(interaction, "set_clan")
-    log.debug("set_clan invoked")
+    log.debug("set_clan invoked clan=%s", clan_name)
+
     if interaction.guild is None:
         await send_text_response(
             interaction,
-            "❌ This command can only be used inside a Discord server.",
+            "This command can only be used inside a Discord server.",
             ephemeral=True,
         )
         return
 
-    member = interaction.user
-    if not isinstance(member, discord.Member) or not member.guild_permissions.administrator:
+    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
         await send_text_response(
             interaction,
-            "❌ You need the Administrator permission to configure this command.",
+            "You need the Administrator permission to configure this command.",
             ephemeral=True,
         )
         return
 
-    guild = interaction.guild
-    guild_id = guild.id
-    normalized_tag = tag.upper()
-    guild_config = _ensure_guild_config(guild_id)
-    clans = guild_config["clans"]
+    clan_map = _clan_names_for_guild(interaction.guild.id)
+    selected_clan = clan_name if isinstance(clan_name, str) and clan_name in clan_map else None
 
-    # Detect duplicate tags under a different clan alias.
-    conflicting_name = next(
-        (
-            name
-            for name, data in clans.items()
-            if name != clan_name
-            and isinstance(data, dict)
-            and str(data.get("tag", "")).upper() == normalized_tag
-        ),
-        None,
+    view = SetClanView(
+        guild=interaction.guild,
+        selected_clan=selected_clan,
     )
 
-    if conflicting_name:
-        log.debug(
-            "set_clan detected duplicate tag %s between %s and %s in guild %s",
-            normalized_tag,
-            conflicting_name,
-            clan_name,
-            guild_id,
-        )
-        view = ReplaceClanTagView(
-            guild=guild,
-            existing_name=conflicting_name,
-            new_name=clan_name,
-            tag=normalized_tag,
-            enable_alerts=enable_alerts,
-        )
-        await send_text_response(
-            interaction,
-            (
-                f"⚠️ The tag {normalized_tag} is already linked to `{conflicting_name}`.\n"
-                "Would you like to replace that clan name with this new one?"
-            ),
-            ephemeral=True,
-            view=view,
-        )
-        return
-
-    response, followup = _apply_clan_update(guild, clan_name, normalized_tag, enable_alerts)
-    await send_text_response(interaction, response, ephemeral=True)
-    if followup:
-        await interaction.followup.send(followup, ephemeral=True)
+    await interaction.response.send_message(
+        view.render_message(),
+        ephemeral=True,
+        view=view,
+    )
+    try:
+        view.message = await interaction.original_response()
+    except discord.HTTPException as exc:
+        log.warning("Failed to capture set_clan view message: %s", exc)
 
 
+# ---------------------------------------------------------------------------
+# Slash command: /help
+# ---------------------------------------------------------------------------
 @bot.tree.command(name="help", description="Show a quick primer on using the Clan Bot.")
 async def help_command(interaction: discord.Interaction):
     """Provide a concise overview plus a link to the full documentation."""
@@ -342,7 +653,9 @@ async def help_command(interaction: discord.Interaction):
     )
     await send_text_response(interaction, message, ephemeral=True)
 
-
+# ---------------------------------------------------------------------------
+# Slash command: /help_war_info
+# ---------------------------------------------------------------------------
 @bot.tree.command(name="help_war_info", description="Explain how to use the war info menu.")
 async def help_war_info(interaction: discord.Interaction) -> None:
     """Describe the workflow for the interactive war information command."""
@@ -359,7 +672,9 @@ async def help_war_info(interaction: discord.Interaction) -> None:
         ephemeral=True,
     )
 
-
+# ---------------------------------------------------------------------------
+# Slash command: /help_assign_bases
+# ---------------------------------------------------------------------------
 @bot.tree.command(name="help_assign_bases", description="Explain the target assignment workflow.")
 async def help_assign_bases(interaction: discord.Interaction) -> None:
     """Outline how to share assignments with `/assign_bases`."""
@@ -377,7 +692,9 @@ async def help_assign_bases(interaction: discord.Interaction) -> None:
         ephemeral=True,
     )
 
-
+# ---------------------------------------------------------------------------
+# Slash command: /help_plan_upgrade
+# ---------------------------------------------------------------------------
 @bot.tree.command(name="help_plan_upgrade", description="Explain how to log planned upgrades.")
 async def help_plan_upgrade(interaction: discord.Interaction) -> None:
     """Explain how members can submit upgrade plans."""
@@ -385,8 +702,8 @@ async def help_plan_upgrade(interaction: discord.Interaction) -> None:
     log.debug("help_plan_upgrade invoked")
     bullets = [
         "Link each Clash account to your Discord profile with `/link_player`.",
-        "Run `/plan_upgrade` and choose the account tag plus a short description of the upgrade.",
-        "Add optional notes (timing, cost) and an optional clan name; the bot posts to the configured upgrade channel.",
+        "Run `/plan_upgrade`, pick your linked account, and use **Enter Upgrade Details** to supply the building, levels, and duration.",
+        "Review the draft summary, add optional notes or clan association, then press **Submit Upgrade** to post in the configured channel.",
         "Admins set or change the destination channel with `/set_upgrade_channel`.",
     ]
     await send_text_response(
@@ -395,7 +712,9 @@ async def help_plan_upgrade(interaction: discord.Interaction) -> None:
         ephemeral=True,
     )
 
-
+# ---------------------------------------------------------------------------
+# Slash command: /help_dashboard
+# ---------------------------------------------------------------------------
 @bot.tree.command(name="help_dashboard", description="Explain how to configure and post dashboards.")
 async def help_dashboard(interaction: discord.Interaction) -> None:
     """Describe the dashboard configuration and posting commands."""
@@ -413,14 +732,17 @@ async def help_dashboard(interaction: discord.Interaction) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Slash command: /help_schedule_report
+# ---------------------------------------------------------------------------
 @bot.tree.command(name="help_schedule_report", description="Explain how to automate recurring reports.")
 async def help_schedule_report(interaction: discord.Interaction) -> None:
     """Summarise the scheduled report command family."""
     _record_command_usage(interaction, "help_schedule_report")
     log.debug("help_schedule_report invoked")
     bullets = [
-        "Admins use `/schedule_report` to choose the clan, report type, cadence (daily or weekly), and a UTC time.",
-        "Optional fields let you override dashboard modules/format or choose which season summary sections to include.",
+        "Run `/schedule_report` to open the interactive editor, pick the clan, report type, cadence, and time, then press **Save**.",
+        "Use the on-screen buttons to adjust dashboard modules/format or toggle season summary sections as needed.",
         "Run `/list_schedules` to review upcoming jobs and `/cancel_schedule` with an ID to remove an entry.",
         "The scheduler posts automatically as soon as the next run time arrives.",
     ]
@@ -431,6 +753,9 @@ async def help_schedule_report(interaction: discord.Interaction) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Slash command: /help_usage
+# ---------------------------------------------------------------------------
 @bot.tree.command(name="help_usage", description="Show aggregate command usage analytics (admin only).")
 async def help_usage(interaction: discord.Interaction):
     """Display anonymised command analytics for administrators.
@@ -498,6 +823,9 @@ async def help_usage(interaction: discord.Interaction):
     )
 
 
+# ---------------------------------------------------------------------------
+# Slash command: /choose_war_alert_channel
+# ---------------------------------------------------------------------------
 @bot.tree.command(
     name="choose_war_alert_channel",
     description="Select the text channel where war alerts will be posted for a clan.",
@@ -515,6 +843,12 @@ async def choose_war_alert_channel(interaction: discord.Interaction, clan_name: 
             ephemeral=True,
         )
         return
+
+    if not interaction.response.is_done():
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=False)
+        except discord.HTTPException as exc:
+            log.warning("Failed to defer interaction for choose_war_alert_channel: %s", exc)
 
     member = interaction.user
     if not isinstance(member, discord.Member) or not member.guild_permissions.administrator:
@@ -599,43 +933,28 @@ async def choose_war_alert_channel(interaction: discord.Interaction, clan_name: 
     await send_text_response(interaction, intro, ephemeral=True, view=view)
 
 
+# ---------------------------------------------------------------------------
+# Slash command: /configure_war_nudge
+# ---------------------------------------------------------------------------
 @bot.tree.command(
     name="configure_war_nudge",
     description="Add, remove, or list war nudge reasons for a clan.",
 )
 @app_commands.describe(
-    clan_name="Configured clan to manage.",
-    action="Choose add/remove/list.",
-    reason_name="Name of the reason (e.g., Unused Attacks).",
-    reason_type="Which war metric the reason should evaluate.",
-    mention_role="Role to ping when this nudge is sent.",
-    mention_user="Specific member to ping when this nudge is sent.",
-    description="Optional extra context to prepend to the nudge message.",
+    clan_name="Optional clan to preselect for configuration.",
 )
 async def configure_war_nudge(
     interaction: discord.Interaction,
-    clan_name: str,
-    action: Literal["add", "remove", "list"],
-    reason_name: Optional[str] = None,
-    reason_type: Optional[Literal["unused_attacks", "no_attacks", "low_stars"]] = None,
-    mention_role: Optional[discord.Role] = None,
-    mention_user: Optional[discord.Member] = None,
-    description: Optional[str] = None,
+    clan_name: Optional[str] = None,
 ):
     """Maintain the list of war nudge reasons stored per clan."""
     _record_command_usage(interaction, "configure_war_nudge")
-    log.debug(
-        "configure_war_nudge invoked action=%s clan=%s reason=%s type=%s",
-        action,
-        clan_name,
-        reason_name,
-        reason_type,
-    )
+    log.debug("configure_war_nudge invoked clan=%s", clan_name)
 
     if interaction.guild is None:
         await send_text_response(
             interaction,
-            "❌ This command must be used inside a Discord server.",
+            "⚠️ This command must be used inside a Discord server.",
             ephemeral=True,
         )
         return
@@ -643,112 +962,37 @@ async def configure_war_nudge(
     if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
         await send_text_response(
             interaction,
-            "❌ Only administrators can configure war nudges.",
+            "⚠️ Only administrators can configure war nudges.",
             ephemeral=True,
         )
         return
 
-    clan_entry = _get_clan_entry(interaction.guild.id, clan_name)
-    if clan_entry is None:
+    clan_map = _clan_names_for_guild(interaction.guild.id)
+    if not clan_map:
         await send_text_response(
             interaction,
-            f"⚠️ `{clan_name}` is not configured for this server.",
+            "⚠️ No clans are configured yet. Use `/set_clan` before managing war nudges.",
             ephemeral=True,
         )
         return
 
-    war_nudge = clan_entry.setdefault("war_nudge", {})
-    reasons: List[Dict[str, Any]] = war_nudge.setdefault("reasons", [])
+    default_clan = clan_name if clan_name in clan_map else next(iter(clan_map))
+    view = WarNudgeConfigView(interaction.guild, default_clan)
 
-    if action == "list":
-        if not reasons:
-            await send_text_response(
-                interaction,
-                f"ℹ️ No war nudge reasons are configured for `{clan_name}`.",
-                ephemeral=True,
-            )
-            return
-        lines = [
-            f"• **{reason.get('name', 'Unnamed')}** — type: {reason.get('type', 'unknown')}"
-            for reason in reasons
-        ]
-        await send_text_response(
-            interaction,
-            f"Configured war nudge reasons for `{clan_name}`:\n" + "\n".join(lines),
-            ephemeral=True,
-        )
-        return
-
-    if reason_name is None:
-        await send_text_response(
-            interaction,
-            "⚠️ Please provide a `reason_name` when adding or removing a reason.",
-            ephemeral=True,
-        )
-        return
-
-    if action == "remove":
-        original_len = len(reasons)
-        reasons[:] = [
-            reason for reason in reasons if reason.get("name", "").lower() != reason_name.lower()
-        ]
-        if len(reasons) == original_len:
-            await send_text_response(
-                interaction,
-                f"⚠️ No reason named `{reason_name}` was found for `{clan_name}`.",
-                ephemeral=True,
-            )
-            return
-        save_server_config()
-        await send_text_response(
-            interaction,
-            f"🗑️ Removed war nudge reason `{reason_name}` for `{clan_name}`.",
-            ephemeral=True,
-        )
-        return
-
-    # action == "add"
-    if reason_type is None:
-        await send_text_response(
-            interaction,
-            "⚠️ Please choose a `reason_type` when adding a reason.",
-            ephemeral=True,
-        )
-        return
-    if mention_role is None and mention_user is None:
-        await send_text_response(
-            interaction,
-            "⚠️ Provide at least one mention target (role or user) so members know who is being nudged.",
-            ephemeral=True,
-        )
-        return
-
-    reason_payload = {
-        "name": reason_name,
-        "type": reason_type,
-        "mention_role_id": mention_role.id if mention_role else None,
-        "mention_user_id": mention_user.id if mention_user else None,
-        "description": description or "",
-    }
-
-    updated = False
-    for idx, existing in enumerate(reasons):
-        if existing.get("name", "").lower() == reason_name.lower():
-            reasons[idx] = reason_payload
-            updated = True
-            break
-    if not updated:
-        reasons.append(reason_payload)
-
-    save_server_config()
-    verb = "Updated" if updated else "Added"
-    await send_text_response(
-        interaction,
-        f"✅ {verb} war nudge reason `{reason_name}` for `{clan_name}`.",
+    await interaction.response.send_message(
+        view.render_message(),
         ephemeral=True,
+        view=view,
     )
+    try:
+        view.message = await interaction.original_response()
+    except discord.HTTPException as exc:
+        log.warning("Unable to capture configure_war_nudge message handle: %s", exc)
 
 
+# ---------------------------------------------------------------------------
+# Slash command: /war_nudge
+# ---------------------------------------------------------------------------
 @bot.tree.command(name="war_nudge", description="Send a targeted reminder to war participants.")
 @app_commands.describe(
     clan_name="Configured clan currently in war.",
@@ -881,6 +1125,9 @@ async def war_nudge(interaction: discord.Interaction, clan_name: str, reason_nam
     )
 
 
+# ---------------------------------------------------------------------------
+# Slash command: /configure_dashboard
+# ---------------------------------------------------------------------------
 @bot.tree.command(
     name="configure_dashboard",
     description="Interactively configure the dashboard modules for a clan.",
@@ -942,100 +1189,82 @@ async def configure_dashboard(
     )
 
 
+# ---------------------------------------------------------------------------
+# Slash command: /dashboard
+# ---------------------------------------------------------------------------
 @bot.tree.command(name="dashboard", description="Display the configured dashboard for a clan.")
 @app_commands.describe(
-    clan_name="Configured clan to inspect.",
-    modules="Optional comma-separated list of modules to override the default configuration.",
-    format="Optional output format override (embed, csv, or both).",
-    target_channel="Channel to post the dashboard in; defaults to the configured channel or the current channel.",
+    clan_name="Optional clan to preselect when opening the dashboard UI.",
 )
 async def dashboard(
     interaction: discord.Interaction,
-    clan_name: str,
-    modules: Optional[str] = None,
-    format: Optional[Literal["embed", "csv", "both"]] = None,
-    target_channel: Optional[discord.TextChannel] = None,
+    clan_name: Optional[str] = None,
 ):
-    """Render and post a dashboard summary."""
+    """Render dashboard content using an interactive UI."""
     _record_command_usage(interaction, "dashboard")
-    log.debug(
-        "dashboard invoked clan=%s modules=%s format=%s channel=%s",
-        clan_name,
-        modules,
-        format,
-        getattr(target_channel, "id", None),
-    )
+    log.debug("dashboard invoked clan=%s", clan_name)
 
     if interaction.guild is None:
         await send_text_response(
             interaction,
-            "❌ This command must be used inside a Discord server.",
+            "This command must be used inside a Discord server.",
             ephemeral=True,
         )
         return
 
-    clan_entry = _get_clan_entry(interaction.guild.id, clan_name)
+    clan_map = _clan_names_for_guild(interaction.guild.id)
+    if not clan_map:
+        await send_text_response(
+            interaction,
+            "?? No clans are configured yet. Use `/set_clan` before running the dashboard.",
+            ephemeral=True,
+        )
+        return
+
+    selected_clan = clan_name if isinstance(clan_name, str) and clan_name in clan_map else next(iter(clan_map))
+    clan_entry = _get_clan_entry(interaction.guild.id, selected_clan)
     if clan_entry is None:
         await send_text_response(
             interaction,
-            f"⚠️ `{clan_name}` is not configured.",
+            f"?? `{selected_clan}` is not configured.",
             ephemeral=True,
         )
         return
 
-    default_modules, default_format, default_channel_id = _dashboard_defaults(clan_entry)
-    module_list = _sanitise_modules(
-        [item.strip() for item in modules.split(",") if item.strip()]
-    ) if modules else default_modules
+    modules, fmt, default_channel_id = _dashboard_defaults(clan_entry)
+    default_channel = None
+    if isinstance(default_channel_id, int):
+        candidate = interaction.guild.get_channel(default_channel_id)
+        if isinstance(candidate, discord.TextChannel):
+            default_channel = candidate
 
-    output_format = format or default_format
-    if output_format not in DASHBOARD_FORMATS:
-        await send_text_response(
-            interaction,
-            "⚠️ Format must be embed, csv, or both.",
-            ephemeral=True,
-        )
-        return
+    fallback_channel = interaction.channel if isinstance(interaction.channel, discord.TextChannel) else None
+    initial_channel = default_channel or fallback_channel
 
-    destination = target_channel
-    if destination is None and isinstance(default_channel_id, int):
-        destination = interaction.guild.get_channel(default_channel_id)
-    if destination is None:
-        destination = interaction.channel if isinstance(interaction.channel, discord.TextChannel) else None
+    view = DashboardRunView(
+        guild=interaction.guild,
+        clan_map=clan_map,
+        selected_clan=selected_clan,
+        initial_modules=modules,
+        initial_format=fmt,
+        initial_channel=initial_channel,
+        fallback_channel=fallback_channel,
+    )
 
-    if destination is None:
-        await send_text_response(
-            interaction,
-            "⚠️ I couldn't determine a channel to post in. Provide `target_channel` or configure a default.",
-            ephemeral=True,
-        )
-        return
-    if not destination.permissions_for(destination.guild.me).send_messages:
-        await send_text_response(
-            interaction,
-            "⚠️ I don't have permission to post in that channel.",
-            ephemeral=True,
-        )
-        return
-
+    await interaction.response.send_message(
+        view.render_message(),
+        ephemeral=True,
+        view=view,
+    )
     try:
-        await _send_dashboard(
-            interaction,
-            guild=interaction.guild,
-            clan_name=clan_name,
-            modules=module_list,
-            output_format=output_format,
-            destination=destination,
-        )
-    except ValueError as exc:
-        await send_text_response(
-            interaction,
-            f"⚠️ {exc}",
-            ephemeral=True,
-        )
+        view.message = await interaction.original_response()
+    except discord.HTTPException as exc:
+        log.warning("Failed to capture dashboard view message: %s", exc)
 
 
-
+# ---------------------------------------------------------------------------
+# Slash command: /link_player
+# ---------------------------------------------------------------------------
 @bot.tree.command(
     name="link_player",
     description="Link or unlink Clash of Clans player tags to Discord members.",
@@ -1065,12 +1294,16 @@ async def link_player(
     if interaction.guild is None:
         await send_text_response(
             interaction,
-            "❌ This command must be used inside a Discord server.",
+            "❓ This command must be used inside a Discord server.",
             ephemeral=True,
         )
         return
 
-    actor = interaction.user if isinstance(interaction.user, discord.Member) else interaction.guild.get_member(interaction.user.id)
+    actor = (
+        interaction.user
+        if isinstance(interaction.user, discord.Member)
+        else interaction.guild.get_member(interaction.user.id)
+    )
     if actor is None:
         await send_text_response(
             interaction,
@@ -1081,172 +1314,100 @@ async def link_player(
 
     target = target_member or actor
     action_lower = action.lower()
-    normalized_tag = _normalise_player_tag(player_tag)
-    if normalized_tag is None:
-        await send_text_response(
-            interaction,
-            "⚠️ Please provide a valid player tag (for example `#ABC123`).",
-            ephemeral=True,
-        )
-        return
 
-    if target != actor and not actor.guild_permissions.administrator:
-        await send_text_response(
-            interaction,
-            "❌ Only administrators can manage linked tags for other members.",
-            ephemeral=True,
+    try:
+        message = await _link_player_account(
+            guild=interaction.guild,
+            actor=actor,
+            target=target,
+            action=action_lower,
+            player_tag=player_tag,
+            alias=alias,
         )
+    except PlayerLinkError as exc:
+        await send_text_response(interaction, exc.message, ephemeral=True)
         return
-
-    guild = interaction.guild
-    guild_config = _ensure_guild_config(guild.id)
-    accounts = guild_config.setdefault("player_accounts", {})
-    user_key = str(target.id)
-    existing_entries = accounts.setdefault(user_key, [])
 
     if action_lower == "link":
-        try:
-            player_payload = await client.get_player(normalized_tag)
-        except coc.errors.NotFound:
-            await send_text_response(
-                interaction,
-                f"⚠️ I couldn't find a Clash of Clans profile with tag `{normalized_tag}`.",
-                ephemeral=True,
-            )
-            return
-        except Exception as exc:
-            log.exception("Unexpected error while linking player")
-            await send_text_response(
-                interaction,
-                f"⚠️ Unable to verify that tag right now: {exc}",
-                ephemeral=True,
-            )
-            return
+        message += " You can now reference it quickly with `/player_info`."
+    elif action_lower == "unlink":
+        message += " You can relink it anytime with `/link_player action:link`."
 
-        inferred_alias = alias.strip() if isinstance(alias, str) and alias.strip() else None
-        if inferred_alias is None:
-            inferred_alias = player_payload.get("profile", {}).get("name")
-        if inferred_alias:
-            inferred_alias = inferred_alias.strip()
-
-        # Update existing entry if the tag is already linked.
-        updated = False
-        for record in existing_entries:
-            if isinstance(record, dict) and record.get("tag") == normalized_tag:
-                record["alias"] = inferred_alias
-                updated = True
-                break
-        if not updated:
-            existing_entries.append({"tag": normalized_tag, "alias": inferred_alias})
-
-        save_server_config()
-        alias_note = f" as `{inferred_alias}`" if inferred_alias else ""
-        target_label = target.display_name if isinstance(target, discord.Member) else target.id
-        await send_text_response(
-            interaction,
-            f"✅ Linked `{normalized_tag}`{alias_note} to {target_label}. "
-            "You can now reference it quickly with `/player_info`.",
-            ephemeral=True,
-        )
-        return
-
-    if action_lower == "unlink":
-        before = len(existing_entries)
-        existing_entries[:] = [
-            entry
-            for entry in existing_entries
-            if not (isinstance(entry, dict) and entry.get("tag") == normalized_tag)
-        ]
-        if not existing_entries:
-            accounts.pop(user_key, None)
-        if before == len(existing_entries):
-            await send_text_response(
-                interaction,
-                f"⚠️ No link for `{normalized_tag}` was found for that member.",
-                ephemeral=True,
-            )
-            return
-        save_server_config()
-        target_label = target.display_name if isinstance(target, discord.Member) else target.id
-        await send_text_response(
-            interaction,
-            f"🗑️ Removed `{normalized_tag}` from {target_label}'s linked accounts.",
-            ephemeral=True,
-        )
-        return
-
-    await send_text_response(
-        interaction,
-        "⚠️ Please choose either 'link' or 'unlink' for the action.",
-        ephemeral=True,
-    )
+    await send_text_response(interaction, message, ephemeral=True)
 
 
+# ---------------------------------------------------------------------------
+# Slash command: /save_war_plan
+# ---------------------------------------------------------------------------
 @bot.tree.command(name="save_war_plan", description="Save or update a war plan template for a clan.")
 @app_commands.describe(
-    clan_name="Configured clan the plan belongs to.",
-    plan_name="Friendly name for the plan.",
-    content="The full strategy text you want to store.",
-    overwrite="Set to true to replace an existing plan with the same name.",
+    clan_name="Optional clan to preselect when opening the editor.",
+    plan_name="Optional plan to preselect when the editor opens.",
 )
 async def save_war_plan(
     interaction: discord.Interaction,
-    clan_name: str,
-    plan_name: str,
-    content: str,
-    overwrite: bool = False,
+    clan_name: Optional[str] = None,
+    plan_name: Optional[str] = None,
 ):
-    """Persist a war plan template for later reuse."""
+    """Launch an interactive editor for creating or updating war plans."""
     _record_command_usage(interaction, "save_war_plan")
-    log.debug("save_war_plan invoked clan=%s plan=%s overwrite=%s", clan_name, plan_name, overwrite)
+    log.debug("save_war_plan invoked clan=%s plan=%s", clan_name, plan_name)
 
     if interaction.guild is None:
         await send_text_response(
             interaction,
-            "❌ This command must be used inside a Discord server.",
+            "This command must be used inside a Discord server.",
             ephemeral=True,
         )
         return
+
     if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
         await send_text_response(
             interaction,
-            "❌ Only administrators can save war plans.",
+            "Only administrators can save war plans.",
             ephemeral=True,
         )
         return
 
-    clan_entry = _get_clan_entry(interaction.guild.id, clan_name)
-    if clan_entry is None:
+    clan_map = _clan_names_for_guild(interaction.guild.id)
+    if not clan_map:
         await send_text_response(
             interaction,
-            f"⚠️ `{clan_name}` is not configured.",
+            "No clans are configured yet. Use `/set_clan` before saving war plans.",
             ephemeral=True,
         )
         return
 
-    war_plans = clan_entry.setdefault("war_plans", {})
-    if plan_name in war_plans and not overwrite:
-        await send_text_response(
-            interaction,
-            "⚠️ A plan with that name already exists. Re-run with `overwrite=True` to replace it.",
-            ephemeral=True,
-        )
-        return
+    selected_clan = None
+    if isinstance(clan_name, str) and clan_name in clan_map:
+        selected_clan = clan_name
+    else:
+        selected_clan = next(iter(clan_map))
 
-    war_plans[plan_name] = {
-        "content": content,
-        "updated_by": interaction.user.id if isinstance(interaction.user, discord.Member) else None,
-        "updated_at": datetime.utcnow().isoformat(),
-    }
-    save_server_config()
-    verb = "Updated" if plan_name in war_plans else "Saved"
-    await send_text_response(
-        interaction,
-        f"✅ {verb} war plan `{plan_name}` for `{clan_name}`.",
-        ephemeral=True,
+    if isinstance(plan_name, str):
+        plan_name = plan_name.strip() or None
+
+    view = WarPlanView(
+        guild=interaction.guild,
+        clan_map=clan_map,
+        selected_clan=selected_clan,
+        preselected_plan=plan_name,
     )
 
+    await interaction.response.send_message(
+        view.render_message(),
+        ephemeral=True,
+        view=view,
+    )
+    try:
+        view.message = await interaction.original_response()
+    except discord.HTTPException as exc:
+        log.warning("Failed to capture save_war_plan view message: %s", exc)
 
+
+# ---------------------------------------------------------------------------
+# Slash command: /list_war_plans
+# ---------------------------------------------------------------------------
 @bot.tree.command(name="list_war_plans", description="List saved war plan templates for a clan.")
 @app_commands.describe(clan_name="Configured clan to inspect.")
 async def list_war_plans(interaction: discord.Interaction, clan_name: str):
@@ -1291,75 +1452,73 @@ async def list_war_plans(interaction: discord.Interaction, clan_name: str):
     )
 
 
+# ---------------------------------------------------------------------------
+# Slash command: /war_plan
+# ---------------------------------------------------------------------------
 @bot.tree.command(name="war_plan", description="Post a saved war plan template.")
 @app_commands.describe(
-    clan_name="Configured clan to load the plan from.",
-    plan_name="Name of the saved plan.",
-    target_channel="Optional channel to post the plan in (defaults to the current channel).",
+    clan_name="Optional clan to preselect when opening the poster.",
+    plan_name="Optional plan to preselect in the poster.",
+    target_channel="Optional channel to preselect (defaults to the current channel).",
 )
 async def war_plan(
     interaction: discord.Interaction,
-    clan_name: str,
-    plan_name: str,
+    clan_name: Optional[str] = None,
+    plan_name: Optional[str] = None,
     target_channel: Optional[discord.TextChannel] = None,
-):
-    """Post the specified war plan into the channel."""
+) -> None:
+    """Launch an interactive flow for posting a stored war plan."""
     _record_command_usage(interaction, "war_plan")
     log.debug("war_plan invoked clan=%s plan=%s", clan_name, plan_name)
 
     if interaction.guild is None:
         await send_text_response(
             interaction,
-            "❌ This command must be used inside a Discord server.",
+            "?? This command must be used inside a Discord server.",
             ephemeral=True,
         )
         return
 
-    clan_entry = _get_clan_entry(interaction.guild.id, clan_name)
-    if clan_entry is None:
+    if isinstance(plan_name, str):
+        plan_name = plan_name.strip() or None
+
+    clan_map = _clan_names_for_guild(interaction.guild.id)
+    if not clan_map:
         await send_text_response(
             interaction,
-            f"⚠️ `{clan_name}` is not configured.",
+            "?? No clans are configured yet. Use `/set_clan` before posting war plans.",
             ephemeral=True,
         )
         return
 
-    war_plans = clan_entry.get("war_plans", {})
-    plan = war_plans.get(plan_name)
-    if plan is None:
-        await send_text_response(
-            interaction,
-            f"⚠️ I couldn't find a plan named `{plan_name}`.",
-            ephemeral=True,
-        )
-        return
+    if isinstance(clan_name, str) and clan_name in clan_map:
+        selected_clan = clan_name
+    else:
+        selected_clan = next(iter(clan_map))
 
-    destination = target_channel
-    if destination is None:
-        destination = interaction.channel if isinstance(interaction.channel, discord.TextChannel) else None
+    explicit_channel = target_channel if isinstance(target_channel, discord.TextChannel) else None
+    fallback_channel = interaction.channel if isinstance(interaction.channel, discord.TextChannel) else None
 
-    if destination is None or not destination.permissions_for(destination.guild.me).send_messages:
-        await send_text_response(
-            interaction,
-            "⚠️ I don't have permission to post in that channel.",
-            ephemeral=True,
-        )
-        return
-
-    header = f"📋 **War Plan — {plan_name}** (Clan: `{clan_name}`)"
-    content = plan.get("content", "")
-    payload = f"{header}\n\n{content}"
-
-    for chunk in _chunk_content(payload):
-        await destination.send(chunk)
-
-    await send_text_response(
-        interaction,
-        f"✅ Posted war plan `{plan_name}` to {destination.mention}.",
-        ephemeral=True,
+    view = WarPlanPostView(
+        guild=interaction.guild,
+        clan_map=clan_map,
+        selected_clan=selected_clan,
+        preselected_plan=plan_name,
+        explicit_channel=explicit_channel,
+        fallback_channel=fallback_channel,
     )
 
-
+    await interaction.response.send_message(
+        view.render_message(),
+        ephemeral=True,
+        view=view,
+    )
+    try:
+        view.message = await interaction.original_response()
+    except discord.HTTPException as exc:
+        log.warning("Failed to capture war_plan view message: %s", exc)
+# Slash command: /player_info
+# ---------------------------------------------------------------------------
 @bot.tree.command(name="player_info", description="Display detailed information about a Clash of Clans player.")
 @app_commands.describe(
     player_reference="Enter a player tag (e.g. #ABC123) or select a saved player name."
@@ -1387,80 +1546,11 @@ async def player_info(interaction: discord.Interaction, player_reference: str):
         return
 
     guild = interaction.guild
-    guild_config = _ensure_guild_config(guild.id)
-    player_tags: Dict[str, str] = guild_config.get("player_tags", {})
-    player_accounts: Dict[str, List[Dict[str, Optional[str]]]] = guild_config.get("player_accounts", {})
+    resolved_tag = _resolve_player_reference(guild, reference)
+    if resolved_tag is None:
+        resolved_tag = _normalise_player_tag(reference)
 
-    alias_lookup: Dict[str, str] = {}
-    mention_lookup: Dict[str, str] = {}
-    for user_id_str, records in player_accounts.items():
-        if not isinstance(records, list):
-            continue
-        member = None
-        if user_id_str.isdigit():
-            member = guild.get_member(int(user_id_str))
-        display_name = member.display_name if member else None
-        first_tag: Optional[str] = None
-        for record in records:
-            if not isinstance(record, dict):
-                continue
-            tag = record.get("tag")
-            normalised_tag = _normalise_player_tag(tag) if isinstance(tag, str) else None
-            if normalised_tag is None:
-                continue
-            alias = record.get("alias")
-            if isinstance(alias, str) and alias.strip():
-                alias_lookup[alias.strip().lower()] = normalised_tag
-            if display_name:
-                alias_lookup.setdefault(display_name.lower(), normalised_tag)
-            first_tag = first_tag or normalised_tag
-        if first_tag:
-            mention_lookup[user_id_str] = first_tag
-            if display_name:
-                alias_lookup.setdefault(f"@{display_name.lower()}", first_tag)
-
-    normalised_reference = reference.upper() if reference.startswith("#") else None
-    player_tag: Optional[str] = None
-
-    if normalised_reference:
-        player_tag = _normalise_player_tag(reference)
-    else:
-        lowered = reference.lower()
-        # Mentions arrive as <@123> or <@!123>
-        if reference.startswith("<@") and reference.endswith(">"):
-            candidate = reference.strip("<@!>")
-            player_tag = mention_lookup.get(candidate)
-        if player_tag is None:
-            player_tag = alias_lookup.get(lowered)
-        if player_tag is None:
-            player_tag = alias_lookup.get(reference)
-        if player_tag is None:
-            mapped_tag = player_tags.get(reference)
-            if mapped_tag is None:
-                mapped_tag = player_tags.get(reference.title())
-            if mapped_tag is None:
-                mapped_tag = player_tags.get(reference.lower())
-            if mapped_tag:
-                player_tag = _normalise_player_tag(mapped_tag)
-        if player_tag is None:
-            mapped_tag = alias_lookup.get(lowered.strip())
-            if mapped_tag:
-                player_tag = mapped_tag
-        if player_tag is None:
-            mapped_tag = player_tags.get(reference.lower())
-            if mapped_tag:
-                player_tag = _normalise_player_tag(mapped_tag)
-        if player_tag is None:
-            mapped_tag = player_tags.get(reference)
-            if mapped_tag:
-                player_tag = _normalise_player_tag(mapped_tag)
-        if player_tag is None:
-            # If the user typed a raw tag without leading '#'
-            potential_tag = _normalise_player_tag(reference)
-            if potential_tag and potential_tag.lstrip("#").isalnum():
-                player_tag = potential_tag
-
-    if player_tag is None:
+    if resolved_tag is None:
         await send_text_response(
             interaction,
             (
@@ -1471,15 +1561,17 @@ async def player_info(interaction: discord.Interaction, player_reference: str):
         )
         return
 
+    log.debug("player_info resolved %s -> %s", reference, resolved_tag)
+
     await interaction.response.defer(ephemeral=True, thinking=True)
     try:
-        player_info = await client.get_player(player_tag)
+        player_info = await client.get_player(resolved_tag)
     except coc.errors.NotFound:
-        await interaction.followup.send(f"⚠️ I could not find a player with tag `{player_tag}`.", ephemeral=True)
+        await interaction.followup.send(f"⚠️ I could not find a player with tag `{resolved_tag}`.", ephemeral=True)
         return
     except coc.errors.GatewayError as exc:
         await interaction.followup.send(
-            f"⚠️ Clash of Clans API error while fetching `{player_tag}`: {exc}", ephemeral=True
+            f"⚠️ Clash of Clans API error while fetching `{resolved_tag}`: {exc}", ephemeral=True
         )
         return
     except Exception as exc:
@@ -1489,7 +1581,7 @@ async def player_info(interaction: discord.Interaction, player_reference: str):
 
     profile = player_info.get("profile", {})
     player_name = profile.get("name") or "Unknown Player"
-    header = f"{player_name} ({player_tag})"
+    header = f"{player_name} ({resolved_tag})"
 
     view = PlayerInfoView(header, player_info)
     initial_output = _build_player_output(header, [], player_info)
@@ -1497,178 +1589,125 @@ async def player_info(interaction: discord.Interaction, player_reference: str):
     await interaction.followup.send(initial_output, ephemeral=True, view=view)
 
 
+# ---------------------------------------------------------------------------
+# Slash command: /plan_upgrade
+# ---------------------------------------------------------------------------
 @bot.tree.command(
     name="plan_upgrade",
     description="Submit a planned upgrade for your linked account.",
 )
 @app_commands.describe(
-    player_tag="Player tag (e.g. #ABC123) associated with your account.",
-    upgrade="Short description of the planned upgrade.",
-    notes="Optional timing or resource notes.",
-    clan_name="Optional configured clan this upgrade belongs to.",
+    clan_name="Optional clan to preselect when planning the upgrade.",
 )
 async def plan_upgrade(
     interaction: discord.Interaction,
-    player_tag: str,
-    upgrade: str,
-    notes: Optional[str] = None,
     clan_name: Optional[str] = None,
 ):
-    """Record a planned upgrade and broadcast it to the configured channel.
-
-    Parameters:
-        interaction (discord.Interaction): Invocation context responsible for replying.
-        player_tag (str): Clash of Clans player tag (with or without leading '#').
-        upgrade (str): Human readable description of the upgrade.
-        notes (Optional[str]): Additional free-form context about timing or costs.
-        clan_name (Optional[str]): Configured clan to associate with the upgrade.
-    """
+    """Launch the interactive planner used to record upgrade details."""
     _record_command_usage(interaction, "plan_upgrade")
-    log.debug("plan_upgrade invoked tag=%s upgrade=%s", player_tag, upgrade)
+    log.debug("plan_upgrade invoked clan=%s", clan_name)
 
     if interaction.guild is None:
         await send_text_response(
             interaction,
-            "❌ This command must be used inside a Discord server.",
+            "This command must be used inside a Discord server.",
             ephemeral=True,
         )
         return
 
-    member = interaction.user if isinstance(interaction.user, discord.Member) else interaction.guild.get_member(interaction.user.id)
+    member = (
+        interaction.user
+        if isinstance(interaction.user, discord.Member)
+        else interaction.guild.get_member(interaction.user.id)
+    )
     if member is None:
         await send_text_response(
             interaction,
-            "⚠️ I couldn't resolve your member account for this server.",
-            ephemeral=True,
-        )
-        return
-
-    normalised_tag = _normalise_player_tag(player_tag)
-    if normalised_tag is None:
-        await send_text_response(
-            interaction,
-            "⚠️ Please provide a valid player tag like `#ABC123`.",
+            "I couldn't resolve your member account for this server.",
             ephemeral=True,
         )
         return
 
     guild_config = _ensure_guild_config(interaction.guild.id)
-    accounts = guild_config.get("player_accounts", {}).get(str(member.id), [])
-    alias = None
-    for record in accounts:
-        if isinstance(record, dict) and record.get("tag") == normalised_tag:
-            alias = record.get("alias")
-            break
+    raw_accounts = guild_config.get("player_accounts", {}).get(str(member.id), [])
+    linked_accounts: List[Dict[str, Optional[str]]] = []
+    for record in raw_accounts:
+        if not isinstance(record, dict):
+            continue
+        tag = _normalise_player_tag(record.get("tag"))
+        if tag is None:
+            continue
+        alias_value = record.get("alias")
+        linked_accounts.append(
+            {
+                "tag": tag,
+                "alias": alias_value.strip() if isinstance(alias_value, str) and alias_value.strip() else None,
+            }
+        )
 
-    if alias is None:
+    if not linked_accounts:
         await send_text_response(
             interaction,
-            "⚠️ You can only log upgrades for tags linked to your Discord account. Use `/link_player` first.",
+            "Link at least one Clash of Clans account with `/link_player` before planning an upgrade.",
             ephemeral=True,
         )
         return
 
     configured_clans = _clan_names_for_guild(interaction.guild.id)
-    resolved_clan_name = None
-    if isinstance(clan_name, str) and clan_name.strip():
-        candidate_name = clan_name.strip()
-        if candidate_name not in configured_clans:
-            await send_text_response(
-                interaction,
-                f"⚠️ `{candidate_name}` is not a configured clan for this server.",
-                ephemeral=True,
-            )
-            return
-        resolved_clan_name = candidate_name
-    resolved_clan_tag: Optional[str] = configured_clans.get(resolved_clan_name) if resolved_clan_name else None
-
-    player_payload: Optional[Dict[str, Any]] = None
-    try:
-        player_payload = await client.get_player(normalised_tag)
-    except Exception as exc:  # pylint: disable=broad-except
-        log.debug("plan_upgrade unable to fetch player payload for %s: %s", normalised_tag, exc)
-
-    player_name = None
-    if isinstance(player_payload, dict):
-        profile = player_payload.get("profile", {})
-        player_name = profile.get("name")
-        clan_info = player_payload.get("clan") or {}
-        player_clan_tag = clan_info.get("tag")
-        if player_clan_tag:
-            if resolved_clan_tag is None:
-                resolved_clan_tag = player_clan_tag
-            if resolved_clan_name is None:
-                for configured_name, configured_tag in configured_clans.items():
-                    if configured_tag == player_clan_tag:
-                        resolved_clan_name = configured_name
-                        break
 
     channel_id = guild_config.get("channels", {}).get("upgrade")
     destination = interaction.guild.get_channel(channel_id) if isinstance(channel_id, int) else None
     if destination is None:
         await send_text_response(
             interaction,
-            "⚠️ No upgrade channel is configured yet. Ask an administrator to run `/set_upgrade_channel`.",
+            "No upgrade channel is configured yet. Ask an administrator to run `/set_upgrade_channel`.",
             ephemeral=True,
         )
         return
     if not destination.permissions_for(destination.guild.me).send_messages:
         await send_text_response(
             interaction,
-            "⚠️ I don't have permission to post in the configured upgrade channel.",
+            "I don't have permission to post in the configured upgrade channel.",
             ephemeral=True,
         )
         return
-    submission_dt = datetime.utcnow().replace(tzinfo=timezone.utc)
-    submission_time = submission_dt.strftime("%Y-%m-%d %H:%M UTC")
-    raw_notes = notes.strip() if isinstance(notes, str) and notes.strip() else None
-    display_notes = raw_notes or "No additional notes."
-    account_label = alias or normalised_tag
-    message_lines = [
-        "🛠️ **Planned Upgrade**",
-        f"Member: {member.mention}",
-        f"Account: `{account_label}`",
-    ]
-    if player_name:
-        message_lines.append(f"In-game name: {player_name}")
-    if resolved_clan_name:
-        message_lines.append(f"Clan: `{resolved_clan_name}`")
-    message_lines.extend(
-        [
-            f"Upgrade: {upgrade}",
-            f"Notes: {display_notes}",
-            f"Submitted: {submission_time}",
-        ]
-    )
-    message = "\n".join(message_lines)
 
-    for chunk in _chunk_content(message):
-        await destination.send(chunk)
+    preselected_clan = None
+    if isinstance(clan_name, str) and clan_name.strip():
+        candidate = clan_name.strip()
+        if candidate not in configured_clans:
+            await send_text_response(
+                interaction,
+                f"`{candidate}` is not a configured clan for this server.",
+                ephemeral=True,
+            )
+            return
+        preselected_clan = candidate
+    elif configured_clans:
+        preselected_clan = next(iter(configured_clans))
 
-    _append_upgrade_log(
-        interaction.guild.id,
-        {
-            "id": str(uuid4()),
-            "timestamp": submission_dt.isoformat(),
-            "user_id": member.id,
-            "user_name": member.display_name,
-            "player_tag": normalised_tag,
-            "player_name": player_name,
-            "alias": alias,
-            "upgrade": upgrade,
-            "notes": raw_notes,
-            "clan_name": resolved_clan_name,
-            "clan_tag": resolved_clan_tag,
-        },
+    view = PlanUpgradeView(
+        guild=interaction.guild,
+        member=member,
+        accounts=linked_accounts,
+        destination_channel=destination,
+        clan_map=configured_clans,
+        selected_clan=preselected_clan,
     )
 
-    await send_text_response(
-        interaction,
-        f"✅ Logged upgrade for `{account_label}` in {destination.mention}.",
+    await interaction.response.send_message(
+        view.render_message(),
         ephemeral=True,
+        view=view,
     )
+    try:
+        view.message = await interaction.original_response()
+    except discord.HTTPException as exc:
+        log.warning("Failed to capture plan_upgrade view message: %s", exc)
 
-
+# ---------------------------------------------------------------------------
+# Slash command: /set_upgrade_channel
+# ---------------------------------------------------------------------------
 @bot.tree.command(
     name="set_upgrade_channel",
     description="Choose the channel where planned upgrades will be posted.",
@@ -1711,74 +1750,63 @@ async def set_upgrade_channel(interaction: discord.Interaction, channel: discord
     )
 
 
+# ---------------------------------------------------------------------------
+# Slash command: /configure_donation_metrics
+# ---------------------------------------------------------------------------
 @bot.tree.command(
     name="configure_donation_metrics",
     description="Adjust which donation metrics are highlighted for a clan.",
 )
 @app_commands.describe(
-    clan_name="Configured clan to adjust.",
-    top_donors="Track and report top donors.",
-    low_donors="Track members with low donation counts.",
-    negative_balance="Highlight members who received more than they donated.",
+    clan_name="Optional clan to preselect for configuration.",
 )
 async def configure_donation_metrics(
     interaction: discord.Interaction,
-    clan_name: str,
-    top_donors: Optional[bool] = None,
-    low_donors: Optional[bool] = None,
-    negative_balance: Optional[bool] = None,
+    clan_name: Optional[str] = None,
 ):
     """Update donation-tracking preferences for a clan."""
     _record_command_usage(interaction, "configure_donation_metrics")
-    log.debug(
-        "configure_donation_metrics invoked clan=%s top=%s low=%s negative=%s",
-        clan_name,
-        top_donors,
-        low_donors,
-        negative_balance,
-    )
+    log.debug("configure_donation_metrics invoked clan=%s", clan_name)
 
     if interaction.guild is None:
         await send_text_response(
             interaction,
-            "❌ This command must be used inside a Discord server.",
+            "⚠️ This command must be used inside a Discord server.",
             ephemeral=True,
         )
         return
     if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
         await send_text_response(
             interaction,
-            "❌ Only administrators can configure donation metrics.",
+            "⚠️ Only administrators can configure donation metrics.",
             ephemeral=True,
         )
         return
 
-    clan_entry = _get_clan_entry(interaction.guild.id, clan_name)
-    if clan_entry is None:
+    clan_map = _clan_names_for_guild(interaction.guild.id)
+    if not clan_map:
         await send_text_response(
             interaction,
-            f"⚠️ `{clan_name}` is not configured.",
+            "⚠️ No clans are configured yet. Use `/set_clan` before managing donation metrics.",
             ephemeral=True,
         )
         return
 
-    donation_tracking = clan_entry.setdefault("donation_tracking", {})
-    metrics = donation_tracking.setdefault("metrics", {})
-    if top_donors is not None:
-        metrics["top_donors"] = top_donors
-    if low_donors is not None:
-        metrics["low_donors"] = low_donors
-    if negative_balance is not None:
-        metrics["negative_balance"] = negative_balance
-    save_server_config()
+    default_clan = clan_name if clan_name in clan_map else next(iter(clan_map))
+    view = DonationConfigView(interaction.guild, default_clan)
 
-    await send_text_response(
-        interaction,
-        "✅ Donation metrics updated.",
+    await interaction.response.send_message(
+        view.render_message(),
         ephemeral=True,
+        view=view,
     )
-
-
+    try:
+        view.message = await interaction.original_response()
+    except discord.HTTPException as exc:
+        log.warning("Unable to capture configure_donation_metrics message handle: %s", exc)
+# ---------------------------------------------------------------------------
+# Slash command: /set_donation_channel
+# ---------------------------------------------------------------------------
 @bot.tree.command(
     name="set_donation_channel",
     description="Choose the channel where donation summaries will be posted.",
@@ -1836,6 +1864,9 @@ async def set_donation_channel(
     )
 
 
+# ---------------------------------------------------------------------------
+# Slash command: /donation_summary
+# ---------------------------------------------------------------------------
 @bot.tree.command(name="donation_summary", description="Generate a donation leaderboard for a clan.")
 @app_commands.describe(
     clan_name="Configured clan to analyse.",
@@ -1913,78 +1944,70 @@ async def donation_summary(
     )
 
 
+# ---------------------------------------------------------------------------
+# Slash command: /configure_event_role
+# ---------------------------------------------------------------------------
 @bot.tree.command(
     name="configure_event_role",
-    description="Set or create the opt-in role for clan events.",
+    description="Interactively manage event alert roles for this server.",
 )
 @app_commands.describe(
-    event_type="Which event the role applies to.",
-    role="Existing role to assign to this event.",
-    create_role="Create a new role automatically if one isn't supplied.",
+    event_key="Optional event to preselect when the view opens.",
 )
 async def configure_event_role(
     interaction: discord.Interaction,
-    event_type: Literal["clan_games", "raid_weekend"],
-    role: Optional[discord.Role] = None,
-    create_role: bool = False,
+    event_key: Optional[str] = None,
 ):
-    """Allow administrators to configure event opt-in roles."""
-    _record_command_usage(interaction, "configure_event_role")
-    log.debug("configure_event_role invoked event=%s role=%s create=%s", event_type, getattr(role, "id", None), create_role)
+    '''Allow administrators to manage event opt-in roles via an interactive UI.'''
+    _record_command_usage(interaction, 'configure_event_role')
+    log.debug('configure_event_role invoked event_key=%s', event_key)
 
     if interaction.guild is None:
         await send_text_response(
             interaction,
-            "❌ This command must be used inside a Discord server.",
+            '? This command must be used inside a Discord server.',
             ephemeral=True,
         )
         return
+
     if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
         await send_text_response(
             interaction,
-            "❌ Only administrators can configure event roles.",
+            '? Only administrators can configure event roles.',
             ephemeral=True,
         )
         return
 
-    resolved_role = role
-    if resolved_role is None and create_role:
-        if interaction.guild.me is None or not interaction.guild.me.guild_permissions.manage_roles:
-            await send_text_response(
-                interaction,
-                "⚠️ I lack permission to create roles. Grant Manage Roles or supply an existing role.",
-                ephemeral=True,
-            )
-            return
-        default_name = "Clan Games Alerts" if event_type == "clan_games" else "Raid Weekend Alerts"
-        try:
-            resolved_role = await interaction.guild.create_role(name=default_name, reason="Create event opt-in role")
-        except discord.HTTPException as exc:
-            await send_text_response(
-                interaction,
-                f"⚠️ Failed to create role: {exc}",
-                ephemeral=True,
-            )
-            return
-
-    if resolved_role is None:
+    events = _get_event_roles_for_guild(interaction.guild.id)
+    if not events:
         await send_text_response(
             interaction,
-            "⚠️ Provide an existing role or set `create_role` to true.",
+            '?? Event role settings are unavailable. Try again later.',
             ephemeral=True,
         )
         return
 
-    guild_config = _ensure_guild_config(interaction.guild.id)
-    guild_config.setdefault("event_roles", {})[event_type] = resolved_role.id
-    save_server_config()
-    await send_text_response(
-        interaction,
-        f"✅ `{resolved_role.name}` will be used for {event_type.replace('_', ' ')} alerts.",
-        ephemeral=True,
+    selected_key = event_key if isinstance(event_key, str) and event_key in events else next(iter(events))
+    view = EventRoleConfigView(
+        guild=interaction.guild,
+        events=events,
+        selected_key=selected_key,
     )
 
+    await interaction.response.send_message(
+        view.render_message(),
+        ephemeral=True,
+        view=view,
+    )
+    try:
+        view.message = await interaction.original_response()
+    except discord.HTTPException as exc:
+        log.warning('Unable to capture configure_event_role message handle: %s', exc)
 
+
+# ---------------------------------------------------------------------------
+# Slash command: /event_alert_opt
+# ---------------------------------------------------------------------------
 @bot.tree.command(
     name="event_alert_opt",
     description="Opt yourself (or, if an admin, another member) into event alerts.",
@@ -1996,7 +2019,7 @@ async def configure_event_role(
 )
 async def event_alert_opt(
     interaction: discord.Interaction,
-    event_type: Literal["clan_games", "raid_weekend"],
+    event_type: str,
     enable: bool,
     target_member: Optional[discord.Member] = None,
 ):
@@ -2007,7 +2030,7 @@ async def event_alert_opt(
     if interaction.guild is None:
         await send_text_response(
             interaction,
-            "❌ This command must be used inside a Discord server.",
+            "This command must be used inside a Discord server.",
             ephemeral=True,
         )
         return
@@ -2016,7 +2039,22 @@ async def event_alert_opt(
     if actor is None:
         await send_text_response(
             interaction,
-            "⚠️ I couldn't resolve your member account.",
+            "?? I couldn't resolve your member account.",
+            ephemeral=True,
+        )
+        return
+
+    events = _get_event_roles_for_guild(interaction.guild.id)
+    resolved_key = None
+    resolved_entry: Optional[Dict[str, Any]] = None
+    if events:
+        resolved_key, resolved_entry = _resolve_event_selection(interaction.guild, event_type)
+    if resolved_key is None or resolved_entry is None:
+        available = ", ".join(entry.get("label", key) for key, entry in events.items())
+        details = f" Available events: {available}." if available else ""
+        await send_text_response(
+            interaction,
+            f"?? I couldn't find an event named `{event_type}`.{details}",
             ephemeral=True,
         )
         return
@@ -2025,16 +2063,17 @@ async def event_alert_opt(
     if target != actor and not actor.guild_permissions.administrator:
         await send_text_response(
             interaction,
-            "❌ Only administrators can toggle event roles for other members.",
+            "? Only administrators can toggle event roles for other members.",
             ephemeral=True,
         )
         return
 
-    role = _get_event_role(interaction.guild, event_type)
+    role = _get_event_role(interaction.guild, resolved_key)
+    label = resolved_entry.get("label", resolved_key.replace("_", " " ).title())
     if role is None:
         await send_text_response(
             interaction,
-            "⚠️ No role configured for that event. Ask an administrator to run `/configure_event_role` first.",
+            f"?? `{label}` does not have a role configured yet. Ask an administrator to run `/configure_event_role` first.",
             ephemeral=True,
         )
         return
@@ -2047,14 +2086,14 @@ async def event_alert_opt(
     except discord.Forbidden:
         await send_text_response(
             interaction,
-            "⚠️ I don't have permission to modify that role for the target member.",
+            "?? I don't have permission to modify that role for the target member.",
             ephemeral=True,
         )
         return
     except discord.HTTPException as exc:
         await send_text_response(
             interaction,
-            f"⚠️ Failed to update roles: {exc}",
+            f"?? Failed to update roles: {exc}",
             ephemeral=True,
         )
         return
@@ -2062,11 +2101,35 @@ async def event_alert_opt(
     action = "now receiving" if enable else "no longer receiving"
     await send_text_response(
         interaction,
-        f"✅ {target.mention} is {action} {event_type.replace('_', ' ')} alerts.",
+        f"? {target.mention} is {action} {label} alerts.",
         ephemeral=True,
     )
 
 
+
+@event_alert_opt.autocomplete("event_type")
+async def event_alert_opt_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> List[app_commands.Choice[str]]:
+    """Provide dynamic autocomplete entries for configured events."""
+    if interaction.guild is None:
+        return []
+    events = _get_event_roles_for_guild(interaction.guild.id)
+    normalized = current.strip().casefold() if current else ""
+    choices: List[app_commands.Choice[str]] = []
+    for key, entry in events.items():
+        label = entry.get("label", _default_event_label(key))
+        if normalized and normalized not in label.casefold() and normalized not in key.casefold():
+            continue
+        choices.append(app_commands.Choice(name=label[:100], value=key))
+        if len(choices) >= 25:
+            break
+    return choices
+
+# ---------------------------------------------------------------------------
+# Slash command: /register_me
+# ---------------------------------------------------------------------------
 @bot.tree.command(name="register_me", description="Guided onboarding for new clan members.")
 async def register_me(interaction: discord.Interaction):
     """Provide buttons and guidance to help new members get set up quickly."""
@@ -2082,35 +2145,39 @@ async def register_me(interaction: discord.Interaction):
         return
 
     war_alert_role = discord.utils.get(interaction.guild.roles, name=ALERT_ROLE_NAME)
-    clan_games_role = _get_event_role(interaction.guild, "clan_games")
-    raid_role = _get_event_role(interaction.guild, "raid_weekend")
-
-    guild_config = _ensure_guild_config(interaction.guild.id)
-    accounts = guild_config.get("player_accounts", {}).get(str(interaction.user.id), [])
-    linked_accounts = ", ".join(record.get("alias") or record.get("tag") for record in accounts) if accounts else "None linked yet"
-
-    message = (
-        "Welcome! Here's how to get set up:\n"
-        "1️⃣ Use the buttons below to opt into the alert roles you want.\n"
-        "2️⃣ Run `/link_player action:link` to register your in-game tags (you already linked: " + linked_accounts + ").\n"
-        "3️⃣ Consider using `/plan_upgrade` and other slash commands to stay organised."
-    )
+    event_roles: List[Dict[str, Any]] = []
+    for key, entry in _get_event_roles_for_guild(interaction.guild.id).items():
+        label = entry.get("label", _default_event_label(key))
+        role = _get_event_role(interaction.guild, key)
+        event_roles.append(
+            {
+                "key": key,
+                "label": label,
+                "role": role,
+            }
+        )
 
     view = RegisterMeView(
         member=interaction.user,
         war_alert_role=war_alert_role,
-        clan_games_role=clan_games_role,
-        raid_weekend_role=raid_role,
+        event_roles=event_roles,
     )
 
-    await send_text_response(
-        interaction,
-        message,
+    await interaction.response.send_message(
+        view.build_intro_message(),
         ephemeral=True,
         view=view,
     )
+    try:
+        view.message = await interaction.original_response()
+    except discord.HTTPException as exc:
+        log.warning("Failed to capture register_me message handle: %s", exc)
 
 
+
+# ---------------------------------------------------------------------------
+# Slash command: /set_season_summary_channel
+# ---------------------------------------------------------------------------
 @bot.tree.command(
     name="set_season_summary_channel",
     description="Choose the channel used for end-of-season summaries.",
@@ -2168,103 +2235,88 @@ async def set_season_summary_channel(
     )
 
 
+# ---------------------------------------------------------------------------
+# Slash command: /season_summary
+# ---------------------------------------------------------------------------
 @bot.tree.command(
     name="season_summary",
     description="Generate an end-of-season summary for a clan.",
 )
 @app_commands.describe(
-    clan_name="Configured clan to analyse.",
-    include_donations="Include donation highlights.",
-    include_wars="Include war statistics.",
-    include_members="Include member leaderboard data.",
-    target_channel="Optional channel to post the summary in.",
+    clan_name="Optional clan to preselect when opening the composer.",
+    channel="Optional channel to preselect for posting.",
 )
 async def season_summary(
     interaction: discord.Interaction,
-    clan_name: str,
-    include_donations: bool = True,
-    include_wars: bool = True,
-    include_members: bool = False,
-    target_channel: Optional[discord.TextChannel] = None,
-):
-    """Compose a configurable seasonal summary and broadcast it."""
+    clan_name: Optional[str] = None,
+    channel: Optional[discord.TextChannel] = None,
+) -> None:
+    """Launch the interactive composer used to build season summaries."""
     _record_command_usage(interaction, "season_summary")
-    log.debug(
-        "season_summary invoked clan=%s donations=%s wars=%s members=%s",
-        clan_name,
-        include_donations,
-        include_wars,
-        include_members,
-    )
+    log.debug("season_summary invoked clan=%s channel=%s", clan_name, getattr(channel, "id", None))
 
     if interaction.guild is None:
         await send_text_response(
             interaction,
-            "❌ This command must be used inside a Discord server.",
+            "This command must be used inside a Discord server.",
             ephemeral=True,
         )
         return
+
     if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
         await send_text_response(
             interaction,
-            "❌ Only administrators can generate seasonal summaries.",
+            "Only administrators can generate seasonal summaries.",
             ephemeral=True,
         )
         return
 
-    clan_entry = _get_clan_entry(interaction.guild.id, clan_name)
-    if clan_entry is None:
+    clan_map = _clan_names_for_guild(interaction.guild.id)
+    if not clan_map:
         await send_text_response(
             interaction,
-            f"⚠️ `{clan_name}` is not configured.",
+            "No clans are configured yet. Use `/set_clan` before generating summaries.",
             ephemeral=True,
         )
         return
 
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    try:
-        payload, default_channel_id = await _compose_season_summary(
-            interaction.guild,
-            clan_name,
-            clan_entry,
-            include_donations=include_donations,
-            include_wars=include_wars,
-            include_members=include_members,
-        )
-    except ValueError as exc:
-        await interaction.followup.send(f"⚠️ {exc}", ephemeral=True)
-        return
+    selected_clan = clan_name if isinstance(clan_name, str) and clan_name in clan_map else next(iter(clan_map))
 
-    destination = target_channel
-    if destination is None:
-        destination = (
-            interaction.guild.get_channel(default_channel_id)
-            if isinstance(default_channel_id, int)
-            else None
-        )
-    if destination is None:
-        destination = interaction.channel if isinstance(interaction.channel, discord.TextChannel) else None
+    channel_id = None
+    if channel is not None:
+        if not channel.permissions_for(channel.guild.me).send_messages:
+            await send_text_response(
+                interaction,
+                "I do not have permission to send messages in that channel.",
+                ephemeral=True,
+            )
+            return
+        channel_id = channel.id
 
-    if destination is None:
-        await interaction.followup.send(
-            "⚠️ I couldn't find a channel to post the summary. Use `/set_season_summary_channel` or supply `target_channel`.",
-            ephemeral=True,
-        )
-        return
-    if not destination.permissions_for(destination.guild.me).send_messages:
-        await interaction.followup.send(
-            "⚠️ I don't have permission to post in the selected channel.",
-            ephemeral=True,
-        )
-        return
+    fallback_channel = channel
+    if fallback_channel is None and isinstance(interaction.channel, discord.TextChannel):
+        fallback_channel = interaction.channel
 
-    for chunk in _chunk_content(payload):
-        await destination.send(chunk)
-
-    await interaction.followup.send(
-        f"✅ Season summary posted to {destination.mention}.",
-        ephemeral=True,
+    view = SeasonSummaryView(
+        guild=interaction.guild,
+        clan_map=clan_map,
+        selected_clan=selected_clan,
+        include_donations=True,
+        include_wars=True,
+        include_members=False,
+        channel_id=channel_id,
+        fallback_channel_id=fallback_channel.id if isinstance(fallback_channel, discord.TextChannel) else None,
     )
+
+    await interaction.response.send_message(
+        view.render_message(),
+        ephemeral=True,
+        view=view,
+    )
+    try:
+        view.message = await interaction.original_response()
+    except discord.HTTPException as exc:
+        log.warning("Failed to capture season_summary view message: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -2577,6 +2629,138 @@ def _normalise_player_accounts_map(raw: Any) -> Dict[str, List[Dict[str, Optiona
     return normalised
 
 
+def _normalise_clan_tag(raw_tag: str) -> Optional[str]:
+    """Normalise a clan tag string."""
+    if not isinstance(raw_tag, str):
+        return None
+    cleaned = raw_tag.strip().upper()
+    if not cleaned:
+        return None
+    if not cleaned.startswith("#"):
+        cleaned = f"#{cleaned}"
+    if any(
+        char not in "#0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        for char in cleaned
+    ):
+        return None
+    if len(cleaned) < 6:
+        return None
+    return cleaned
+
+
+def _default_event_label(event_key: str) -> str:
+    """Return a human-friendly label for an event key."""
+    if not isinstance(event_key, str) or not event_key:
+        return "Event"
+    template = DEFAULT_EVENT_DEFINITIONS.get(event_key)
+    if isinstance(template, dict):
+        label = template.get("label")
+        if isinstance(label, str) and label.strip():
+            return label.strip()
+    return event_key.replace("_", " ").title()
+
+
+def _normalise_event_roles(container: Any) -> "OrderedDict[str, Dict[str, Any]]":
+    """Convert legacy or partial event role config data into a consistent form."""
+    events: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+    if isinstance(container, dict):
+        if isinstance(container.get("events"), dict):
+            source_items = list(container["events"].items())
+        else:
+            source_items = [(key, value) for key, value in container.items() if key != "events"]
+        for key, raw_entry in source_items:
+            if not isinstance(key, str) or not key:
+                continue
+            if isinstance(raw_entry, dict):
+                label_value = raw_entry.get("label", "")
+                label = label_value.strip() if isinstance(label_value, str) else ""
+                role_id_value = raw_entry.get("role_id")
+                role_id = role_id_value if isinstance(role_id_value, int) else None
+            elif isinstance(raw_entry, int):
+                label = ""
+                role_id = raw_entry
+            else:
+                continue
+
+            if not label:
+                label = _default_event_label(key)
+            events[key] = {"label": label, "role_id": role_id}
+
+    if not events:
+        for key, template in DEFAULT_EVENT_DEFINITIONS.items():
+            label = template.get("label", _default_event_label(key))
+            events[key] = {"label": label, "role_id": None}
+
+    return events
+
+
+def _ensure_event_role_entries(guild_config: Dict[str, Any]) -> "OrderedDict[str, Dict[str, Any]]":
+    """Ensure the guild's event role configuration uses the standard schema."""
+    container = guild_config.get("event_roles")
+    if not isinstance(container, dict):
+        container = {}
+        guild_config["event_roles"] = container
+
+    events = _normalise_event_roles(container)
+    preserved_keys = {key: value for key, value in container.items() if key != "events"}
+    container.clear()
+    container.update(preserved_keys)
+    container["events"] = events
+    return events
+
+
+def _get_event_roles_for_guild(guild_id: int) -> "OrderedDict[str, Dict[str, Any]]":
+    """Fetch a copy of the event role configuration for the given guild."""
+    guild_config = _ensure_guild_config(guild_id)
+    entries = _ensure_event_role_entries(guild_config)
+    return OrderedDict(
+        (key, {"label": value.get("label", _default_event_label(key)), "role_id": value.get("role_id") if isinstance(value.get("role_id"), int) else None})
+        for key, value in entries.items()
+    )
+
+
+def _slugify_event_key(name: str, existing_keys: Iterable[str]) -> str:
+    """Generate a stable event key from a human-friendly label."""
+    base = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+    if not base:
+        base = "event"
+    candidate = base
+    suffix = 2
+    existing = set(existing_keys)
+    while candidate in existing:
+        candidate = f"{base}_{suffix}"
+        suffix += 1
+    return candidate
+
+
+def _resolve_event_selection(
+    guild: discord.Guild,
+    raw_value: str,
+) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """Resolve user-supplied event text into a configured event entry."""
+    events = _get_event_roles_for_guild(guild.id)
+    if not raw_value or not raw_value.strip():
+        return None, None
+
+    def _normalise(text: str) -> str:
+        return re.sub(r"[\s_\-]+", "", text.casefold())
+
+    lookup = raw_value.strip()
+    normalised_lookup = _normalise(lookup)
+
+    for key, entry in events.items():
+        if key.casefold() == lookup.casefold() or _normalise(key) == normalised_lookup:
+            return key, entry
+
+    for key, entry in events.items():
+        label = entry.get("label")
+        if isinstance(label, str):
+            if label.casefold() == lookup.casefold() or _normalise(label) == normalised_lookup:
+                return key, entry
+
+    return None, None
+
+
 def _ensure_guild_config(guild_id: int) -> Dict[str, Any]:
     """Return the guild config, ensuring required keys exist."""
     guild_config = server_config.setdefault(guild_id, {"clans": {}, "player_tags": {}})
@@ -2619,9 +2803,7 @@ def _ensure_guild_config(guild_id: int) -> Dict[str, Any]:
     channels.setdefault("upgrade", None)
     channels.setdefault("donation", None)
     channels.setdefault("dashboard", None)
-    event_roles = guild_config.setdefault("event_roles", {})
-    event_roles.setdefault("clan_games", None)
-    event_roles.setdefault("raid_weekend", None)
+    _ensure_event_role_entries(guild_config)
     schedules: List[Dict[str, Any]] = []
     raw_schedules = guild_config.get("schedules", [])
     if isinstance(raw_schedules, list):
@@ -2841,10 +3023,14 @@ def _build_reason_mention(guild: discord.Guild, reason: Dict[str, Any]) -> str:
 
 def _get_event_role(guild: discord.Guild, event_type: str) -> Optional[discord.Role]:
     """Retrieve the configured event role for the given event type."""
-    if event_type not in EVENT_TYPES:
+    if guild is None or not isinstance(event_type, str):
         return None
     guild_config = _ensure_guild_config(guild.id)
-    role_id = guild_config.get("event_roles", {}).get(event_type)
+    events = _ensure_event_role_entries(guild_config)
+    entry = events.get(event_type)
+    if not isinstance(entry, dict):
+        return None
+    role_id = entry.get("role_id")
     if isinstance(role_id, int):
         return guild.get_role(role_id)
     return None
@@ -3085,11 +3271,15 @@ async def _compose_donation_summary(
 
 
 def _compose_event_opt_in_summary(guild: discord.Guild) -> Tuple[str, str]:
+    entries = _get_event_roles_for_guild(guild.id)
     lines: List[str] = []
-    for event_type in EVENT_TYPES:
-        role = _get_event_role(guild, event_type)
+    for key, entry in entries.items():
+        label = entry.get("label", _default_event_label(key))
+        role = _get_event_role(guild, key)
         if role:
-            lines.append(f"{role.name}: {len(role.members)} opted in")
+            lines.append(f"{label}: {len(role.members)} opted in")
+        else:
+            lines.append(f"{label}: no role configured")
     if not lines:
         lines.append("No event alert roles are configured yet.")
     return ("Event Opt-Ins", "\n".join(lines))
@@ -3250,7 +3440,7 @@ def _create_dashboard_embed(
             chunks = _chunk_content(text, 1024)
             embed.add_field(name=title, value=chunks[0], inline=False)
             for chunk in chunks[1:]:
-                embed.add_field(name="", value=chunk, inline=False)
+                embed.add_field(name=f"{title} (cont.)", value=chunk, inline=False)
         else:
             embed.add_field(name=title, value=text, inline=False)
     return embed
@@ -3478,171 +3668,89 @@ async def _execute_schedule(guild: discord.Guild, schedule: Dict[str, Any]) -> N
         log.debug("Unknown schedule type %s", schedule_type)
 
 
+# ---------------------------------------------------------------------------
+# Slash command: /schedule_report
+# ---------------------------------------------------------------------------
 @bot.tree.command(
     name="schedule_report",
     description="Create or update a scheduled report for a configured clan.",
 )
 @app_commands.describe(
-    clan_name="Configured clan to report on.",
-    report_type="Choose which report to schedule.",
-    frequency="How often to run the report.",
-    time_utc="Time to run (HH:MM in UTC).",
-    weekday="Required for weekly schedules: which weekday to run.",
-    channel="Channel to post in; defaults to configured destination.",
-    dashboard_modules="Dashboard only: comma-separated modules (e.g. war_overview,donation_snapshot).",
-    dashboard_format="Dashboard only: embed, csv, or both.",
-    include_donations="Season summary only: include donation stats.",
-    include_wars="Season summary only: include war stats.",
-    include_members="Season summary only: include member stats.",
+    schedule_id="Optional schedule ID to load for editing.",
+    clan_name="Optional clan to preselect when creating a new schedule.",
 )
 async def schedule_report(
     interaction: discord.Interaction,
-    clan_name: str,
-    report_type: Literal["dashboard", "donation_summary", "season_summary"],
-    frequency: Literal["daily", "weekly"],
-    time_utc: str,
-    weekday: Optional[Literal["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]] = None,
-    channel: Optional[discord.TextChannel] = None,
-    dashboard_modules: Optional[str] = None,
-    dashboard_format: Optional[Literal["embed", "csv", "both"]] = None,
-    include_donations: Optional[bool] = None,
-    include_wars: Optional[bool] = None,
-    include_members: Optional[bool] = None,
+    schedule_id: Optional[str] = None,
+    clan_name: Optional[str] = None,
 ) -> None:
-    """Persist a scheduled report so it runs automatically.
-
-    Parameters:
-        interaction (discord.Interaction): Invocation context used to validate permissions and respond.
-        clan_name (str): Configured clan that the report should cover.
-        report_type (Literal): Report flavour (`dashboard`, `donation_summary`, or `season_summary`).
-        frequency (Literal): Either `daily` or `weekly` cadence for the scheduler.
-        time_utc (str): Time to run expressed as HH:MM in UTC.
-        weekday (Optional[Literal]): Required when `frequency` is weekly to pick the day.
-        channel (Optional[discord.TextChannel]): Override destination channel; falls back to stored defaults.
-        dashboard_modules (Optional[str]): Dashboard-specific override listing modules separated by commas.
-        dashboard_format (Optional[Literal]): Dashboard output format (`embed`, `csv`, or `both`).
-        include_donations (Optional[bool]): Season summary flag to include donation metrics.
-        include_wars (Optional[bool]): Season summary flag to include war metrics.
-        include_members (Optional[bool]): Season summary flag to include member leaderboard metrics.
-    """
+    """Launch the interactive scheduler used to manage automated reports."""
     _record_command_usage(interaction, "schedule_report")
-    log.debug(
-        "schedule_report invoked clan=%s type=%s frequency=%s time=%s channel=%s",
-        clan_name,
-        report_type,
-        frequency,
-        time_utc,
-        getattr(channel, "id", None),
-    )
+    log.debug("schedule_report invoked schedule_id=%s clan=%s", schedule_id, clan_name)
 
     if interaction.guild is None:
         await send_text_response(
             interaction,
-            "❌ This command must be used inside a Discord server.",
+            "This command must be used inside a Discord server.",
             ephemeral=True,
         )
         return
-    member = interaction.user
-    if not isinstance(member, discord.Member) or not member.guild_permissions.administrator:
+
+    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
         await send_text_response(
             interaction,
-            "❌ Only administrators can manage report schedules.",
+            "Only administrators can manage report schedules.",
+            ephemeral=True,
+        )
+        return
+
+    clan_map = _clan_names_for_guild(interaction.guild.id)
+    if not clan_map:
+        await send_text_response(
+            interaction,
+            "No clans are configured yet. Use `/set_clan` before scheduling reports.",
             ephemeral=True,
         )
         return
 
     guild_config = _ensure_guild_config(interaction.guild.id)
-    if clan_name not in _clan_names_for_guild(interaction.guild.id):
-        await send_text_response(
-            interaction,
-            f"⚠️ `{clan_name}` is not configured for this server.",
-            ephemeral=True,
-        )
-        return
+    schedules = copy.deepcopy(guild_config.get("schedules", []))
 
-    if frequency == "weekly" and weekday is None:
-        await send_text_response(
-            interaction,
-            "⚠️ Weekly schedules must include the `weekday` option.",
-            ephemeral=True,
-        )
-        return
+    valid_ids = {entry.get("id") for entry in schedules if isinstance(entry, dict)}
+    selected_schedule_id = schedule_id if schedule_id in valid_ids else None
 
-    try:
-        _parse_time_utc(time_utc)
-    except ValueError as exc:
-        await send_text_response(
-            interaction,
-            f"⚠️ {exc}",
-            ephemeral=True,
-        )
-        return
+    preselected_clan: Optional[str] = None
+    if isinstance(clan_name, str) and clan_name in clan_map:
+        preselected_clan = clan_name
+    elif selected_schedule_id:
+        for entry in schedules:
+            if entry.get("id") == selected_schedule_id:
+                candidate = entry.get("clan_name")
+                if isinstance(candidate, str) and candidate in clan_map:
+                    preselected_clan = candidate
+                break
 
-    destination_id: Optional[int] = None
-    if channel is not None:
-        if not channel.permissions_for(channel.guild.me).send_messages:
-            await send_text_response(
-                interaction,
-                "⚠️ I do not have permission to send messages in that channel.",
-                ephemeral=True,
-            )
-            return
-        destination_id = channel.id
-
-    options: Dict[str, Any] = {}
-    if report_type == "dashboard":
-        modules_list = None
-        if isinstance(dashboard_modules, str) and dashboard_modules.strip():
-            raw_modules = [item.strip() for item in dashboard_modules.split(",") if item.strip()]
-            modules_list = _sanitise_modules(raw_modules)
-            if not modules_list:
-                await send_text_response(
-                    interaction,
-                    "⚠️ I couldn't recognise any of those dashboard modules.",
-                    ephemeral=True,
-                )
-                return
-            options["modules"] = modules_list
-        if dashboard_format:
-            if dashboard_format not in DASHBOARD_FORMATS:
-                await send_text_response(
-                    interaction,
-                    "⚠️ Dashboard format must be embed, csv, or both.",
-                    ephemeral=True,
-                )
-                return
-            options["format"] = dashboard_format
-    elif report_type == "season_summary":
-        if include_donations is not None:
-            options["include_donations"] = include_donations
-        if include_wars is not None:
-            options["include_wars"] = include_wars
-        if include_members is not None:
-            options["include_members"] = include_members
-
-    schedule_id = str(uuid4())
-    next_run = _calculate_next_run(frequency, time_utc, weekday=weekday)
-    schedule_entry = {
-        "id": schedule_id,
-        "type": report_type,
-        "clan_name": clan_name,
-        "frequency": frequency,
-        "time_utc": time_utc,
-        "weekday": weekday if frequency == "weekly" else None,
-        "channel_id": destination_id,
-        "next_run": next_run,
-        "options": options,
-    }
-    guild_config.setdefault("schedules", []).append(schedule_entry)
-    save_server_config()
-
-    await send_text_response(
-        interaction,
-        f"✅ Scheduled `{report_type}` for `{clan_name}`. Next run at {next_run}. (ID `{schedule_id}`)",
-        ephemeral=True,
+    view = ScheduleConfigView(
+        guild=interaction.guild,
+        clan_map=clan_map,
+        schedules=schedules,
+        selected_schedule_id=selected_schedule_id,
+        selected_clan=preselected_clan,
     )
 
+    await interaction.response.send_message(
+        view.render_message(),
+        ephemeral=True,
+        view=view,
+    )
+    try:
+        view.message = await interaction.original_response()
+    except discord.HTTPException as exc:
+        log.warning("Failed to capture schedule_report view message: %s", exc)
 
+# ---------------------------------------------------------------------------
+# Slash command: /list_schedules
+# ---------------------------------------------------------------------------
 @bot.tree.command(name="list_schedules", description="List scheduled reports for this server.")
 @app_commands.describe(clan_name="Optional filter for a specific configured clan.")
 async def list_schedules(interaction: discord.Interaction, clan_name: Optional[str] = None) -> None:
@@ -3700,6 +3808,9 @@ async def list_schedules(interaction: discord.Interaction, clan_name: Optional[s
     )
 
 
+# ---------------------------------------------------------------------------
+# Slash command: /cancel_schedule
+# ---------------------------------------------------------------------------
 @bot.tree.command(name="cancel_schedule", description="Remove a scheduled report by its ID.")
 @app_commands.describe(schedule_id="Use `/list_schedules` to find the ID.")
 async def cancel_schedule(interaction: discord.Interaction, schedule_id: str) -> None:
@@ -3936,6 +4047,9 @@ class WarInfoView(discord.ui.View):
         await send_text_response(interaction, self.last_output, ephemeral=True)
 
 
+# ---------------------------------------------------------------------------
+# Slash command: /clan_war_info_menu
+# ---------------------------------------------------------------------------
 @bot.tree.command(name="clan_war_info_menu", description="Explore war data using a select menu.")
 @app_commands.describe(clan_name="Configured clan to inspect.")
 async def clan_war_info_menu(interaction: discord.Interaction, clan_name: str):
@@ -4035,80 +4149,6 @@ class PlayerInfoView(discord.ui.View):
             )
             return
         await send_text_response(interaction, self.last_output, ephemeral=True)
-
-class ReplaceClanTagView(discord.ui.View):
-    """Confirmation prompt for replacing an existing clan mapped to the same tag."""
-
-    def __init__(
-        self,
-        *,
-        guild: discord.Guild,
-        existing_name: str,
-        new_name: str,
-        tag: str,
-        enable_alerts: bool,
-        timeout: float = 120,
-    ):
-        super().__init__(timeout=timeout)
-        self.guild = guild
-        self.existing_name = existing_name
-        self.new_name = new_name
-        self.tag = tag
-        self.enable_alerts = enable_alerts
-
-    def _disable(self) -> None:
-        for item in self.children:
-            item.disabled = True
-
-    @discord.ui.button(label="Yes, replace it", style=discord.ButtonStyle.danger, emoji="♻️")
-    async def confirm(  # type: ignore[override]
-        self, interaction: discord.Interaction, _: discord.ui.Button
-    ) -> None:
-        log.debug(
-            "ReplaceClanTagView confirm: replacing %s with %s for guild %s",
-            self.existing_name,
-            self.new_name,
-            self.guild.id,
-        )
-        guild_config = _ensure_guild_config(self.guild.id)
-        clans = guild_config["clans"]
-        preserved_channel: Optional[int] = None
-        existing_entry = clans.pop(self.existing_name, None)
-        if isinstance(existing_entry, dict):
-            preserved_channel = (
-                existing_entry.get("alerts", {}).get("channel_id")
-                if isinstance(existing_entry.get("alerts", {}), dict)
-                else None
-            )
-        response, followup = _apply_clan_update(
-            self.guild,
-            self.new_name,
-            self.tag,
-            self.enable_alerts,
-            preserve_channel=preserved_channel,
-        )
-        notice = f"{response}\n\n`{self.existing_name}` has been removed."
-        self._disable()
-        await interaction.response.edit_message(content=notice, view=self)
-        if followup:
-            await interaction.followup.send(followup, ephemeral=True)
-        self.stop()
-
-    @discord.ui.button(label="No, keep existing", style=discord.ButtonStyle.secondary, emoji="✋")
-    async def cancel(  # type: ignore[override]
-        self, interaction: discord.Interaction, _: discord.ui.Button
-    ) -> None:
-        log.debug(
-            "ReplaceClanTagView cancel: keeping %s for guild %s",
-            self.existing_name,
-            self.guild.id,
-        )
-        self._disable()
-        await interaction.response.edit_message(
-            content="ℹ️ No changes were made; existing clan mappings remain intact.", view=self
-        )
-        self.stop()
-
 
 class ChannelChoiceSelect(discord.ui.Select):
     """Select component for choosing the destination text channel."""
@@ -4700,7 +4740,10 @@ class DashboardModuleSelect(discord.ui.Select):
         self.parent_view = parent_view
 
     async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
-        self.parent_view.selected_modules = list(self.values)
+        if hasattr(self.parent_view, "handle_module_update"):
+            self.parent_view.handle_module_update(list(self.values))
+        else:
+            self.parent_view.selected_modules = list(self.values)
         await interaction.response.edit_message(
             content=self.parent_view.render_message(),
             view=self.parent_view,
@@ -4722,7 +4765,11 @@ class DashboardFormatSelect(discord.ui.Select):
         self.parent_view = parent_view
 
     async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
-        self.parent_view.selected_format = self.values[0]
+        new_format = self.values[0]
+        if hasattr(self.parent_view, "handle_format_update"):
+            self.parent_view.handle_format_update(new_format)
+        else:
+            self.parent_view.selected_format = new_format
         await interaction.response.edit_message(
             content=self.parent_view.render_message(),
             view=self.parent_view,
@@ -4803,6 +4850,4350 @@ class DashboardConfigView(discord.ui.View):
     async def on_timeout(self) -> None:
         self.disable_all_items()
 
+
+class EventRoleCreateModal(discord.ui.Modal):
+    """Modal to capture details when adding a new event entry."""
+
+    def __init__(self, parent_view: "EventRoleConfigView"):
+        super().__init__(title="Add Event", timeout=None)
+        self.parent_view = parent_view
+        self.event_name = discord.ui.TextInput(
+            label="Event name",
+            placeholder="e.g. Clan Games",
+            max_length=80,
+        )
+        self.add_item(self.event_name)
+        self.role_name = discord.ui.TextInput(
+            label="Role name (optional)",
+            placeholder="Create and assign a new Discord role",
+            required=False,
+            max_length=100,
+        )
+        self.add_item(self.role_name)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await self.parent_view.handle_create_event(
+            interaction,
+            self.event_name.value,
+            self.role_name.value,
+        )
+
+
+class EventRoleRenameModal(discord.ui.Modal):
+    """Modal to rename an existing event entry."""
+
+    def __init__(self, parent_view: "EventRoleConfigView"):
+        super().__init__(title="Rename Event", timeout=None)
+        self.parent_view = parent_view
+        self.new_name = discord.ui.TextInput(
+            label="New name",
+            default=parent_view.current_label,
+            max_length=80,
+        )
+        self.add_item(self.new_name)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await self.parent_view.handle_rename_event(
+            interaction,
+            self.new_name.value,
+        )
+
+
+class EventRoleCreateRoleModal(discord.ui.Modal):
+    """Modal to capture a role name when creating a Discord role."""
+
+    def __init__(self, parent_view: "EventRoleConfigView"):
+        super().__init__(title="Create Role", timeout=None)
+        self.parent_view = parent_view
+        suggested = f"{parent_view.current_label} Alerts".strip()
+        self.role_name = discord.ui.TextInput(
+            label="Role name",
+            default=suggested[:100],
+            max_length=100,
+        )
+        self.add_item(self.role_name)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await self.parent_view.handle_create_role(
+            interaction,
+            self.role_name.value,
+        )
+
+
+class EventRoleDeleteModal(discord.ui.Modal):
+    """Modal that confirms removal of an event entry."""
+
+    def __init__(self, parent_view: "EventRoleConfigView"):
+        super().__init__(title="Remove Event", timeout=None)
+        self.parent_view = parent_view
+        self.confirmation = discord.ui.TextInput(
+            label=f"Type '{parent_view.current_label}' to confirm",
+            placeholder=parent_view.current_label,
+            max_length=80,
+        )
+        self.add_item(self.confirmation)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await self.parent_view.handle_delete_event(
+            interaction,
+            self.confirmation.value,
+        )
+
+
+class EventRoleSelect(discord.ui.Select):
+    """Dropdown for selecting which event to manage."""
+
+    def __init__(self, parent_view: "EventRoleConfigView"):
+        self.parent_view = parent_view
+        options: List[discord.SelectOption] = []
+        for key, entry in parent_view.events.items():
+            label = entry.get("label") or _default_event_label(key)
+            role = parent_view._role_from_entry(entry)
+            role_id = entry.get("role_id")
+            if role is not None:
+                description = f"Role: {role.name}"
+            elif isinstance(role_id, int):
+                description = f"Role missing (ID {role_id})"
+            else:
+                description = "No role assigned"
+            options.append(
+                discord.SelectOption(
+                    label=label[:100],
+                    value=key,
+                    description=description[:100],
+                    default=(key == parent_view.selected_key),
+                )
+            )
+        super().__init__(
+            placeholder="Select an event to manage",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        self.parent_view.selected_key = self.values[0]
+        self.parent_view.refresh_components()
+        if interaction.message is not None:
+            self.parent_view.message = interaction.message
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
+
+
+class EventRoleRoleSelect(discord.ui.RoleSelect):
+    """Role selector for assigning an existing Discord role."""
+
+    def __init__(self, parent_view: "EventRoleConfigView"):
+        self.parent_view = parent_view
+        default_role = parent_view._role_from_entry(parent_view.current_entry)
+        default_values = [default_role] if default_role is not None else []
+        super().__init__(
+            placeholder="Assign an existing role",
+            min_values=0,
+            max_values=1,
+            default_values=default_values,
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        role = self.values[0] if self.values else None
+        self.parent_view.set_role_for_current(role.id if role else None)
+        self.parent_view.refresh_components()
+        if interaction.message is not None:
+            self.parent_view.message = interaction.message
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
+
+
+class EventRoleAddButton(discord.ui.Button):
+    """Button that opens the modal to add a new event."""
+
+    def __init__(self, parent_view: "EventRoleConfigView"):
+        super().__init__(label="Add Event", style=discord.ButtonStyle.primary, row=2)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        if not self.parent_view.user_is_admin(interaction):
+            await interaction.response.send_message(
+                "⚠️ Only administrators can add events.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_modal(EventRoleCreateModal(self.parent_view))
+
+
+class EventRoleRenameButton(discord.ui.Button):
+    """Button that opens the rename modal for the selected event."""
+
+    def __init__(self, parent_view: "EventRoleConfigView"):
+        super().__init__(label="Rename Event", style=discord.ButtonStyle.secondary, row=2)
+        self.parent_view = parent_view
+        if not parent_view.events:
+            self.disabled = True
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        if not self.parent_view.user_is_admin(interaction):
+            await interaction.response.send_message(
+                "⚠️ Only administrators can rename events.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_modal(EventRoleRenameModal(self.parent_view))
+
+
+class EventRoleCreateRoleButton(discord.ui.Button):
+    """Button that opens a modal to create a Discord role."""
+
+    def __init__(self, parent_view: "EventRoleConfigView"):
+        super().__init__(label="Create Role", style=discord.ButtonStyle.success, row=2)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        if not self.parent_view.user_is_admin(interaction):
+            await interaction.response.send_message(
+                "⚠️ Only administrators can create roles from this view.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_modal(EventRoleCreateRoleModal(self.parent_view))
+
+
+class EventRoleClearRoleButton(discord.ui.Button):
+    """Button that clears the assigned role from the selected event."""
+
+    def __init__(self, parent_view: "EventRoleConfigView"):
+        super().__init__(label="Clear Role", style=discord.ButtonStyle.secondary, row=2)
+        self.parent_view = parent_view
+        if parent_view.current_entry.get("role_id") is None:
+            self.disabled = True
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        if not self.parent_view.user_is_admin(interaction):
+            await interaction.response.send_message(
+                "⚠️ Only administrators can clear roles.",
+                ephemeral=True,
+            )
+            return
+        await self.parent_view.handle_clear_role(interaction)
+
+
+class EventRoleDeleteButton(discord.ui.Button):
+    """Button that opens the delete confirmation modal."""
+
+    def __init__(self, parent_view: "EventRoleConfigView"):
+        super().__init__(label="Remove Event", style=discord.ButtonStyle.danger, row=3)
+        self.parent_view = parent_view
+        if len(parent_view.events) <= 1:
+            self.disabled = True
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        if not self.parent_view.user_is_admin(interaction):
+            await interaction.response.send_message(
+                "⚠️ Only administrators can remove events.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_modal(EventRoleDeleteModal(self.parent_view))
+
+
+class EventRoleSaveButton(discord.ui.Button):
+    """Button that persists the pending configuration."""
+
+    def __init__(self, parent_view: "EventRoleConfigView"):
+        super().__init__(label="Save", style=discord.ButtonStyle.success, row=3)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        if not self.parent_view.user_is_admin(interaction):
+            await interaction.response.send_message(
+                "⚠️ Only administrators can save changes.",
+                ephemeral=True,
+            )
+            return
+        await self.parent_view.handle_save(interaction)
+
+
+class EventRoleCancelButton(discord.ui.Button):
+    """Button that cancels the interaction."""
+
+    def __init__(self, parent_view: "EventRoleConfigView"):
+        super().__init__(label="Cancel", style=discord.ButtonStyle.secondary, row=3)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        await self.parent_view.handle_cancel(interaction)
+
+
+class EventRoleConfigView(discord.ui.View):
+    """Interactive interface for managing event alert roles."""
+
+    def __init__(
+        self,
+        *,
+        guild: discord.Guild,
+        events: "OrderedDict[str, Dict[str, Any]]",
+        selected_key: str,
+        timeout: float = 300,
+    ):
+        super().__init__(timeout=timeout)
+        self.guild = guild
+        self.message: Optional[discord.Message] = None
+        copied_events = copy.deepcopy(events)
+        self.events: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        for key, entry in copied_events.items():
+            if not isinstance(key, str):
+                continue
+            if isinstance(entry, dict):
+                label_value = entry.get("label")
+                role_id_value = entry.get("role_id")
+            else:
+                label_value = None
+                role_id_value = None
+            label = label_value if isinstance(label_value, str) and label_value.strip() else _default_event_label(key)
+            role_id = role_id_value if isinstance(role_id_value, int) else None
+            self.events[key] = {"label": label.strip(), "role_id": role_id}
+        if not self.events:
+            default_key = next(iter(DEFAULT_EVENT_DEFINITIONS.keys()), "event")
+            self.events[default_key] = {"label": _default_event_label(default_key), "role_id": None}
+        self.selected_key = selected_key if selected_key in self.events else next(iter(self.events))
+        self.refresh_components()
+
+    def _ensure_selected(self) -> None:
+        if not self.events:
+            return
+        if self.selected_key not in self.events:
+            self.selected_key = next(iter(self.events))
+
+    @property
+    def current_entry(self) -> Dict[str, Any]:
+        self._ensure_selected()
+        return self.events[self.selected_key]
+
+    @property
+    def current_label(self) -> str:
+        entry = self.current_entry
+        label = entry.get("label")
+        if isinstance(label, str) and label.strip():
+            return label
+        return _default_event_label(self.selected_key)
+
+    def user_is_admin(self, interaction: discord.Interaction) -> bool:
+        member = interaction.user if isinstance(interaction.user, discord.Member) else self.guild.get_member(interaction.user.id)
+        return bool(member and member.guild_permissions.administrator)
+
+    def refresh_components(self) -> None:
+        self.clear_items()
+        self._ensure_selected()
+        self.add_item(EventRoleSelect(self))
+        self.add_item(EventRoleRoleSelect(self))
+        self.add_item(EventRoleAddButton(self))
+        self.add_item(EventRoleRenameButton(self))
+        self.add_item(EventRoleCreateRoleButton(self))
+        self.add_item(EventRoleClearRoleButton(self))
+        self.add_item(EventRoleDeleteButton(self))
+        self.add_item(EventRoleSaveButton(self))
+        self.add_item(EventRoleCancelButton(self))
+
+    def render_message(self) -> str:
+        self._ensure_selected()
+        lines = ["**Event Role Configuration**"]
+        for key, entry in self.events.items():
+            role_desc = self._describe_role(entry)
+            prefix = "▶️" if key == self.selected_key else "•"
+            lines.append(f"{prefix} {entry.get('label', _default_event_label(key))} — {role_desc}")
+        current_entry = self.current_entry
+        lines.extend(
+            [
+                "",
+                f"Managing: **{current_entry.get('label', self.selected_key)}**",
+                f"Assigned role: {self._describe_role(current_entry)}",
+                "",
+                "Use the dropdown to choose an event. Create or assign roles with the controls below, then press **Save** to persist your changes.",
+            ]
+        )
+        return "\n".join(lines)
+
+    def _role_from_entry(self, entry: Dict[str, Any]) -> Optional[discord.Role]:
+        role_id = entry.get("role_id")
+        if isinstance(role_id, int):
+            return self.guild.get_role(role_id)
+        return None
+
+    def _describe_role(self, entry: Dict[str, Any]) -> str:
+        role = self._role_from_entry(entry)
+        if role is not None:
+            return f"{role.mention} ({role.name})"
+        role_id = entry.get("role_id")
+        if isinstance(role_id, int):
+            return f"Missing role (ID {role_id})"
+        return "Not assigned"
+
+    def set_role_for_current(self, role_id: Optional[int]) -> None:
+        self._ensure_selected()
+        self.events[self.selected_key]["role_id"] = role_id
+
+    async def handle_create_event(self, interaction: discord.Interaction, raw_label: str, raw_role_name: str) -> None:
+        if not self.user_is_admin(interaction):
+            await interaction.response.send_message(
+                "⚠️ Only administrators can add events.",
+                ephemeral=True,
+            )
+            return
+        label = (raw_label or "").strip()
+        if not label:
+            await interaction.response.send_message(
+                "⚠️ Provide a name for the new event.",
+                ephemeral=True,
+            )
+            return
+        if any(entry.get("label", "").lower() == label.lower() for entry in self.events.values()):
+            await interaction.response.send_message(
+                f"⚠️ An event named `{label}` already exists.",
+                ephemeral=True,
+            )
+            return
+        new_key = _slugify_event_key(label, self.events.keys())
+        self.events[new_key] = {"label": label, "role_id": None}
+        self.selected_key = new_key
+        role_feedback: Optional[str] = None
+        role_name = (raw_role_name or "").strip()
+        if role_name:
+            role, error = await self._create_role(role_name)
+            if role is not None:
+                self.events[new_key]["role_id"] = role.id
+                role_feedback = f" Created role `{role.name}` and linked it."
+            else:
+                role_feedback = f" {error or 'Unable to create the role.'}"
+        self.refresh_components()
+        await self._commit_message_update()
+        message = f"✅ Added event `{label}`."
+        if role_feedback:
+            message += role_feedback
+        await interaction.response.send_message(message, ephemeral=True)
+
+    async def handle_rename_event(self, interaction: discord.Interaction, raw_label: str) -> None:
+        if not self.user_is_admin(interaction):
+            await interaction.response.send_message(
+                "⚠️ Only administrators can rename events.",
+                ephemeral=True,
+            )
+            return
+        new_label = (raw_label or "").strip()
+        if not new_label:
+            await interaction.response.send_message(
+                "⚠️ Provide a new name for the event.",
+                ephemeral=True,
+            )
+            return
+        if any(key != self.selected_key and entry.get("label", "").lower() == new_label.lower() for key, entry in self.events.items()):
+            await interaction.response.send_message(
+                f"⚠️ Another event is already named `{new_label}`.",
+                ephemeral=True,
+            )
+            return
+        entry = self.current_entry
+        old_label = entry.get("label", self.selected_key)
+        entry["label"] = new_label
+        self.refresh_components()
+        await self._commit_message_update()
+        await interaction.response.send_message(
+            f"✅ Renamed `{old_label}` to `{new_label}`.",
+            ephemeral=True,
+        )
+
+    async def handle_create_role(self, interaction: discord.Interaction, raw_role_name: str) -> None:
+        if not self.user_is_admin(interaction):
+            await interaction.response.send_message(
+                "⚠️ Only administrators can create roles from this view.",
+                ephemeral=True,
+            )
+            return
+        role_name = (raw_role_name or "").strip()
+        if not role_name:
+            await interaction.response.send_message(
+                "⚠️ Provide a name for the new role.",
+                ephemeral=True,
+            )
+            return
+        role, error = await self._create_role(role_name)
+        if role is None:
+            await interaction.response.send_message(error or "⚠️ Unable to create the role.", ephemeral=True)
+            return
+        self.current_entry["role_id"] = role.id
+        self.refresh_components()
+        await self._commit_message_update()
+        await interaction.response.send_message(
+            f"✅ Created role `{role.name}` and linked it to `{self.current_label}`.",
+            ephemeral=True,
+        )
+
+    async def handle_delete_event(self, interaction: discord.Interaction, raw_confirmation: str) -> None:
+        if not self.user_is_admin(interaction):
+            await interaction.response.send_message(
+                "⚠️ Only administrators can remove events.",
+                ephemeral=True,
+            )
+            return
+        if len(self.events) <= 1:
+            await interaction.response.send_message(
+                "⚠️ At least one event must remain configured.",
+                ephemeral=True,
+            )
+            return
+        confirmation = (raw_confirmation or "").strip()
+        expected = self.current_label
+        if confirmation.lower() != expected.lower():
+            await interaction.response.send_message(
+                f"⚠️ Type `{expected}` to confirm removal.",
+                ephemeral=True,
+            )
+            return
+        removed_key = self.selected_key
+        removed_label = expected
+        self.events.pop(removed_key, None)
+        self._ensure_selected()
+        self.refresh_components()
+        await self._commit_message_update()
+        await interaction.response.send_message(
+            f"✅ Removed event `{removed_label}`.",
+            ephemeral=True,
+        )
+
+    async def handle_clear_role(self, interaction: discord.Interaction) -> None:
+        if not self.user_is_admin(interaction):
+            await interaction.response.send_message(
+                "⚠️ Only administrators can clear roles.",
+                ephemeral=True,
+            )
+            return
+        entry = self.current_entry
+        if entry.get("role_id") is None:
+            await interaction.response.send_message(
+                "⚠️ No role is currently assigned.",
+                ephemeral=True,
+            )
+            return
+        entry["role_id"] = None
+        self.refresh_components()
+        if interaction.message is not None:
+            self.message = interaction.message
+        await interaction.response.edit_message(
+            content=self.render_message(),
+            view=self,
+        )
+        await interaction.followup.send(
+            f"✅ Cleared the assigned role for `{self.current_label}`.",
+            ephemeral=True,
+        )
+
+    async def handle_save(self, interaction: discord.Interaction) -> None:
+        payload: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+        for key, entry in self.events.items():
+            payload[key] = {
+                "label": entry.get("label", _default_event_label(key)),
+                "role_id": entry.get("role_id") if isinstance(entry.get("role_id"), int) else None,
+            }
+        guild_config = _ensure_guild_config(self.guild.id)
+        config_events = _ensure_event_role_entries(guild_config)
+        config_events.clear()
+        for key, value in payload.items():
+            config_events[key] = {"label": value["label"], "role_id": value["role_id"]}
+        save_server_config()
+        self.disable_all_items()
+        if interaction.message is not None:
+            self.message = interaction.message
+        await interaction.response.edit_message(
+            content="✅ Event role configuration saved.",
+            view=self,
+        )
+
+    async def handle_cancel(self, interaction: discord.Interaction) -> None:
+        self.disable_all_items()
+        if interaction.message is not None:
+            self.message = interaction.message
+        await interaction.response.edit_message(
+            content="Configuration cancelled.",
+            view=self,
+        )
+
+    def disable_all_items(self) -> None:
+        for child in self.children:
+            child.disabled = True
+
+    async def on_timeout(self) -> None:
+        self.disable_all_items()
+
+    async def _commit_message_update(self) -> None:
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(content=self.render_message(), view=self)
+        except discord.HTTPException as exc:
+            log.warning("Failed to refresh event role configuration view: %s", exc)
+
+    async def _create_role(self, role_name: str) -> Tuple[Optional[discord.Role], Optional[str]]:
+        bot_member = self.guild.me
+        if bot_member is None or not bot_member.guild_permissions.manage_roles:
+            return None, "⚠️ I lack Manage Roles permission to create roles."
+        try:
+            role = await self.guild.create_role(name=role_name, reason="Event role configuration")
+        except discord.Forbidden:
+            return None, "⚠️ I could not create the role due to missing permissions."
+        except discord.HTTPException as exc:
+            return None, f"⚠️ Failed to create role: {exc}"
+        return role, None
+
+
+class DashboardRunClanSelect(discord.ui.Select):
+    '''Select menu for choosing which clan's dashboard to generate.'''
+
+    def __init__(self, parent_view: "DashboardRunView"):
+        options = [
+            discord.SelectOption(label=name, value=name, default=(name == parent_view.selected_clan))
+            for name in sorted(parent_view.clan_map.keys(), key=str.casefold)
+        ]
+        super().__init__(
+            placeholder="Choose a clan",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=0,
+        )
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        new_clan = self.values[0]
+        self.parent_view.set_clan(new_clan)
+        if interaction.message is not None:
+            self.parent_view.message = interaction.message
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
+
+
+class DashboardRunChannelSelect(discord.ui.ChannelSelect):
+    '''Channel selector for dashboard delivery.'''
+
+    def __init__(self, parent_view: "DashboardRunView"):
+        self.parent_view = parent_view
+        default_channel = parent_view.get_explicit_channel()
+        default_values = [default_channel] if default_channel is not None else []
+        super().__init__(
+            placeholder="Pick a channel (leave blank to use the default/current channel)",
+            min_values=0,
+            max_values=1,
+            channel_types=[discord.ChannelType.text],
+            default_values=default_values,
+            row=2,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        channel = self.values[0] if self.values else None
+        self.parent_view.set_channel(channel)
+        if interaction.message is not None:
+            self.parent_view.message = interaction.message
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
+
+
+class DashboardRunPreviewButton(discord.ui.Button):
+    '''Button that generates an ephemeral preview of the dashboard.'''
+
+    def __init__(self, parent_view: "DashboardRunView"):
+        super().__init__(label="Preview", style=discord.ButtonStyle.secondary, row=3)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        clan_entry = _get_clan_entry(self.parent_view.guild.id, self.parent_view.selected_clan)
+        if clan_entry is None:
+            await interaction.followup.send(
+                f"?? `{self.parent_view.selected_clan}` is no longer configured.",
+                ephemeral=True,
+            )
+            return
+        try:
+            sections, csv_sections = await _generate_dashboard_content(
+                self.parent_view.guild,
+                self.parent_view.selected_clan,
+                self.parent_view.selected_modules,
+            )
+        except ValueError as exc:
+            await interaction.followup.send(f"?? {exc}", ephemeral=True)
+            return
+
+        if not sections:
+            await interaction.followup.send("?? No dashboard content was produced.", ephemeral=True)
+            return
+
+        embed = None
+        files = []
+        if self.parent_view.selected_format in {"embed", "both"}:
+            embed = _create_dashboard_embed(self.parent_view.selected_clan, sections)
+        if self.parent_view.selected_format in {"csv", "both"}:
+            csv_payload = _create_csv_file(csv_sections)
+            if csv_payload:
+                files.append(discord.File(BytesIO(csv_payload), filename=f"dashboard_{self.parent_view.selected_clan}.csv"))
+
+        message = "Here is the current dashboard preview."
+        if embed or files:
+            await interaction.followup.send(
+                message,
+                embed=embed,
+                files=files if files else None,
+                ephemeral=True,
+            )
+        else:
+            payload = "\n\n".join(text for _, text in sections)
+            await interaction.followup.send(f"{message}\n{payload}", ephemeral=True)
+
+
+class DashboardRunPostButton(discord.ui.Button):
+    '''Button that posts the dashboard to the selected channel.'''
+
+    def __init__(self, parent_view: "DashboardRunView"):
+        super().__init__(label="Post Dashboard", style=discord.ButtonStyle.success, row=3)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        channel = self.parent_view.get_destination_channel()
+        if channel is None:
+            await interaction.response.send_message(
+                "?? I couldn't determine a channel to post in. Select one or run the command in a text channel.",
+                ephemeral=True,
+            )
+            return
+        if not channel.permissions_for(channel.guild.me).send_messages:
+            await interaction.response.send_message(
+                "?? I don't have permission to post in that channel.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        clan_entry = _get_clan_entry(self.parent_view.guild.id, self.parent_view.selected_clan)
+        if clan_entry is None:
+            await interaction.followup.send(
+                f"?? `{self.parent_view.selected_clan}` is no longer configured.",
+                ephemeral=True,
+            )
+            return
+        try:
+            await _send_dashboard(
+                interaction,
+                guild=self.parent_view.guild,
+                clan_name=self.parent_view.selected_clan,
+                modules=self.parent_view.selected_modules,
+                output_format=self.parent_view.selected_format,
+                destination=channel,
+            )
+        except ValueError as exc:
+            await interaction.followup.send(f"?? {exc}", ephemeral=True)
+        except discord.HTTPException as exc:
+            await interaction.followup.send(
+                f"?? Failed to post the dashboard: {exc}",
+                ephemeral=True,
+            )
+
+
+class DashboardRunCancelButton(discord.ui.Button):
+    '''Button that closes the dashboard view.'''
+
+    def __init__(self, parent_view: "DashboardRunView"):
+        super().__init__(label="Close", style=discord.ButtonStyle.secondary, row=3)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        self.parent_view.disable_all_items()
+        if interaction.message is not None:
+            self.parent_view.message = interaction.message
+        await interaction.response.edit_message(
+            content="Dashboard view closed.",
+            view=self.parent_view,
+        )
+
+
+class DashboardRunView(discord.ui.View):
+    '''Interactive interface for generating dashboards on demand.'''
+
+    def __init__(
+        self,
+        *,
+        guild: discord.Guild,
+        clan_map: Dict[str, str],
+        selected_clan: str,
+        initial_modules: List[str],
+        initial_format: str,
+        initial_channel: Optional[discord.TextChannel],
+        fallback_channel: Optional[discord.TextChannel],
+        timeout: float = 300,
+    ):
+        super().__init__(timeout=timeout)
+        self.guild = guild
+        self.clan_map = clan_map
+        self.message: Optional[discord.Message] = None
+        self.selected_clan = selected_clan
+        self.selected_modules = _sanitise_modules(initial_modules)
+        self.selected_format = initial_format if initial_format in DASHBOARD_FORMATS else "embed"
+        self.selected_channel_id = initial_channel.id if isinstance(initial_channel, discord.TextChannel) else None
+        self.fallback_channel_id = fallback_channel.id if isinstance(fallback_channel, discord.TextChannel) else None
+        self.refresh_components()
+
+    def handle_module_update(self, values: Iterable[str]) -> None:
+        self.selected_modules = _sanitise_modules(values)
+
+    def handle_format_update(self, value: str) -> None:
+        self.selected_format = value if value in DASHBOARD_FORMATS else "embed"
+
+    def set_clan(self, clan_name: str) -> None:
+        if clan_name not in self.clan_map:
+            return
+        self.selected_clan = clan_name
+        modules, fmt, channel_id = self._clan_defaults(clan_name)
+        self.selected_modules = _sanitise_modules(modules)
+        self.selected_format = fmt if fmt in DASHBOARD_FORMATS else "embed"
+        resolved = self._resolve_channel(channel_id)
+        if resolved is not None:
+            self.selected_channel_id = resolved.id
+        else:
+            self.selected_channel_id = self.fallback_channel_id
+        self.refresh_components()
+
+    def set_channel(self, channel: Optional[discord.abc.GuildChannel]) -> None:
+        if isinstance(channel, discord.TextChannel):
+            self.selected_channel_id = channel.id
+        else:
+            self.selected_channel_id = None
+
+    def get_explicit_channel(self) -> Optional[discord.TextChannel]:
+        return self._resolve_channel(self.selected_channel_id)
+
+    def get_destination_channel(self) -> Optional[discord.TextChannel]:
+        explicit = self.get_explicit_channel()
+        if explicit is not None:
+            return explicit
+        return self._resolve_channel(self.fallback_channel_id)
+
+    def _resolve_channel(self, channel_id: Optional[int]) -> Optional[discord.TextChannel]:
+        if isinstance(channel_id, int):
+            channel = self.guild.get_channel(channel_id)
+            if isinstance(channel, discord.TextChannel):
+                return channel
+        return None
+
+    def _clan_defaults(self, clan_name: str) -> Tuple[List[str], str, Optional[int]]:
+        clan_entry = _get_clan_entry(self.guild.id, clan_name)
+        if clan_entry is None:
+            return ["war_overview"], "embed", None
+        modules, fmt, channel_id = _dashboard_defaults(clan_entry)
+        return modules, fmt, channel_id if isinstance(channel_id, int) else None
+
+    def refresh_components(self) -> None:
+        self.clear_items()
+        self.add_item(DashboardRunClanSelect(self))
+        self.add_item(DashboardModuleSelect(self, self.selected_modules))
+        self.add_item(DashboardFormatSelect(self, self.selected_format))
+        self.add_item(DashboardRunChannelSelect(self))
+        self.add_item(DashboardRunPreviewButton(self))
+        self.add_item(DashboardRunPostButton(self))
+        self.add_item(DashboardRunCancelButton(self))
+
+    def render_message(self) -> str:
+        module_labels = [DASHBOARD_MODULES.get(m, m) for m in self.selected_modules]
+        destination = self.get_destination_channel()
+        if destination is not None:
+            channel_text = destination.mention
+        else:
+            channel_text = "Current channel"
+        return (
+            f"Dashboard configuration for `{self.selected_clan}`\n"
+            f"• Modules: {', '.join(module_labels)}\n"
+            f"• Format: {self.selected_format.upper()}\n"
+            f"• Destination: {channel_text}\n\n"
+            "Adjust the dropdowns below, then press **Preview** or **Post Dashboard**."
+        )
+
+    def disable_all_items(self) -> None:
+        for child in self.children:
+            child.disabled = True
+
+    async def on_timeout(self) -> None:
+        self.disable_all_items()
+        if self.message is not None:
+            try:
+                await self.message.edit(content="Dashboard view expired. Run the command again to continue.", view=None)
+            except discord.HTTPException:
+                pass
+
+
+class UpgradeAccountSelect(discord.ui.Select):
+    """Select menu for choosing which linked account to use."""
+
+    def __init__(self, parent_view: "PlanUpgradeView"):
+        self.parent_view = parent_view
+        options: List[discord.SelectOption] = []
+        for account in parent_view.accounts:
+            tag = account["tag"]
+            alias = account.get("alias")
+            label = alias if alias else tag
+            description = tag if alias else None
+            options.append(
+                discord.SelectOption(
+                    label=label[:100],
+                    value=tag,
+                    description=description,
+                    default=(tag == parent_view.selected_account_tag),
+                )
+            )
+        super().__init__(
+            placeholder="Select a linked account",
+            min_values=1,
+            max_values=1,
+            options=options[:25],
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        selected_tag = self.values[0]
+        self.parent_view.set_account(selected_tag)
+        if interaction.message is not None:
+            self.parent_view.message = interaction.message
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
+
+
+class UpgradeClanSelect(discord.ui.Select):
+    """Select menu for optionally associating the upgrade with a clan."""
+
+    def __init__(self, parent_view: "PlanUpgradeView"):
+        self.parent_view = parent_view
+        options: List[discord.SelectOption] = [
+            discord.SelectOption(
+                label="No clan (skip)",
+                value="__none__",
+                default=parent_view.selected_clan is None,
+            )
+        ]
+        for name in sorted(parent_view.clan_map.keys(), key=str.casefold):
+            options.append(
+                discord.SelectOption(
+                    label=name[:100],
+                    value=name,
+                    default=name == parent_view.selected_clan,
+                )
+            )
+        super().__init__(
+            placeholder="Associate a clan (optional)",
+            min_values=1,
+            max_values=1,
+            options=options[:25],
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        value = self.values[0]
+        self.parent_view.set_clan(None if value == "__none__" else value)
+        if interaction.message is not None:
+            self.parent_view.message = interaction.message
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
+
+
+class UpgradeDetailsButton(discord.ui.Button):
+    """Button that opens a modal to collect upgrade details."""
+
+    def __init__(self, parent_view: "PlanUpgradeView"):
+        super().__init__(label="Enter Upgrade Details", style=discord.ButtonStyle.primary, row=2)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        await interaction.response.send_modal(UpgradeDetailsModal(self.parent_view))
+
+
+class PlanUpgradeSubmitButton(discord.ui.Button):
+    """Submit button that finalises the upgrade."""
+
+    def __init__(self, parent_view: "PlanUpgradeView"):
+        super().__init__(label="Submit Upgrade", style=discord.ButtonStyle.success, row=3)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        await self.parent_view.handle_submit(interaction)
+
+
+class PlanUpgradeCancelButton(discord.ui.Button):
+    """Button that cancels the planning session."""
+
+    def __init__(self, parent_view: "PlanUpgradeView"):
+        super().__init__(label="Cancel", style=discord.ButtonStyle.secondary, row=3)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        await self.parent_view.handle_cancel(interaction)
+
+
+class UpgradeDetailsModal(discord.ui.Modal):
+    """Modal dialog for collecting the upgrade specifics."""
+
+    def __init__(self, parent_view: "PlanUpgradeView"):
+        super().__init__(title="Upgrade Details", timeout=None)
+        self.parent_view = parent_view
+
+        self.building = discord.ui.TextInput(
+            label="Building or upgrade name",
+            placeholder="e.g. Archer Tower",
+            default=parent_view.building_name or "",
+            max_length=80,
+        )
+        self.add_item(self.building)
+
+        self.from_level = discord.ui.TextInput(
+            label="Current level",
+            placeholder="e.g. 12",
+            default=str(parent_view.current_level) if parent_view.current_level is not None else "",
+            max_length=6,
+        )
+        self.add_item(self.from_level)
+
+        self.to_level = discord.ui.TextInput(
+            label="Target level",
+            placeholder="e.g. 13",
+            default=str(parent_view.target_level) if parent_view.target_level is not None else "",
+            max_length=6,
+        )
+        self.add_item(self.to_level)
+
+        self.duration = discord.ui.TextInput(
+            label="Upgrade duration",
+            placeholder="Examples: 2d 6h, 20h, 12:30",
+            default=parent_view.duration_text or "",
+            max_length=40,
+        )
+        self.add_item(self.duration)
+
+        self.notes = discord.ui.TextInput(
+            label="Notes (optional)",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=500,
+            default=parent_view.notes or "",
+        )
+        self.add_item(self.notes)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        building_name = self.building.value.strip()
+        if not building_name:
+            await interaction.response.send_message(
+                "Please provide the building or upgrade name.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            current_level = int(self.from_level.value.strip())
+        except (ValueError, AttributeError):
+            await interaction.response.send_message(
+                "Current level must be a whole number.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            target_level = int(self.to_level.value.strip())
+        except (ValueError, AttributeError):
+            await interaction.response.send_message(
+                "Target level must be a whole number.",
+                ephemeral=True,
+            )
+            return
+
+        if target_level < current_level:
+            await interaction.response.send_message(
+                "Target level must be greater than or equal to the current level.",
+                ephemeral=True,
+            )
+            return
+
+        duration_input = self.duration.value.strip()
+        duration_td = _parse_upgrade_duration(duration_input)
+        if duration_td is None:
+            await interaction.response.send_message(
+                "I couldn't understand that duration. Try formats like `2d 6h`, `20h`, or `12:30`.",
+                ephemeral=True,
+            )
+            return
+
+        notes_input = self.notes.value.strip() if self.notes.value else ""
+        notes_value = notes_input if notes_input else None
+
+        self.parent_view.set_details(
+            building=building_name,
+            current_level=current_level,
+            target_level=target_level,
+            duration_text=duration_input,
+            duration=duration_td,
+            notes=notes_value,
+        )
+
+        await interaction.response.send_message("Upgrade details updated.", ephemeral=True)
+        await self.parent_view.refresh_view_message()
+
+
+class PlanUpgradeView(discord.ui.View):
+    """Interactive view that guides the user through logging an upgrade."""
+
+    def __init__(
+        self,
+        *,
+        guild: discord.Guild,
+        member: discord.Member,
+        accounts: List[Dict[str, Optional[str]]],
+        destination_channel: discord.TextChannel,
+        clan_map: Dict[str, str],
+        selected_clan: Optional[str],
+        timeout: float = 300,
+    ):
+        super().__init__(timeout=timeout)
+        self.guild = guild
+        self.member = member
+        self.accounts = accounts
+        self.destination_channel = destination_channel
+        self.clan_map = clan_map
+        self.account_lookup = {entry["tag"]: entry.get("alias") for entry in accounts}
+        first_account = accounts[0]
+        self.selected_account_tag = first_account["tag"]
+        self.selected_account_alias = first_account.get("alias")
+        self.selected_clan = selected_clan if selected_clan in clan_map else None
+        self.building_name: Optional[str] = None
+        self.current_level: Optional[int] = None
+        self.target_level: Optional[int] = None
+        self.duration_text: Optional[str] = None
+        self.duration_timedelta: Optional[timedelta] = None
+        self.notes: Optional[str] = None
+        self.message: Optional[discord.Message] = None
+        self.refresh_components()
+
+    def set_account(self, tag: str) -> None:
+        if tag not in self.account_lookup:
+            return
+        self.selected_account_tag = tag
+        self.selected_account_alias = self.account_lookup.get(tag)
+        self.refresh_components()
+
+    def set_clan(self, clan_name: Optional[str]) -> None:
+        if clan_name is not None and clan_name not in self.clan_map:
+            return
+        self.selected_clan = clan_name
+        self.refresh_components()
+
+    def set_details(
+        self,
+        *,
+        building: str,
+        current_level: int,
+        target_level: int,
+        duration_text: str,
+        duration: timedelta,
+        notes: Optional[str],
+    ) -> None:
+        self.building_name = building
+        self.current_level = current_level
+        self.target_level = target_level
+        self.duration_text = duration_text
+        self.duration_timedelta = duration
+        self.notes = notes
+
+    def refresh_components(self) -> None:
+        self.clear_items()
+        self.add_item(UpgradeAccountSelect(self))
+        if self.clan_map:
+            self.add_item(UpgradeClanSelect(self))
+        self.add_item(UpgradeDetailsButton(self))
+        self.add_item(PlanUpgradeSubmitButton(self))
+        self.add_item(PlanUpgradeCancelButton(self))
+
+    def render_message(self) -> str:
+        account_display = self._format_account_display()
+        clan_display = self.selected_clan or "None selected"
+        clan_line = (
+            "Clan: No clans configured" if not self.clan_map else f"Clan: {clan_display}"
+        )
+
+        if self.building_name and self.current_level is not None and self.target_level is not None:
+            upgrade_line = f"{self.building_name} {self.current_level} -> {self.target_level}"
+        elif self.building_name:
+            upgrade_line = f"{self.building_name} (levels not set)"
+        else:
+            upgrade_line = "Not set"
+
+        if self.duration_timedelta is not None and self.duration_text:
+            preview_eta = datetime.utcnow().replace(tzinfo=timezone.utc) + self.duration_timedelta
+            duration_line = f"{self.duration_text} (completes {_format_eta(preview_eta)})"
+        else:
+            duration_line = "Not set"
+
+        notes_line = self.notes if self.notes else "No additional notes."
+        destination_line = f"Destination: {self.destination_channel.mention}"
+
+        return "\n".join(
+            [
+                "**Planned Upgrade Draft**",
+                f"Account: {account_display}",
+                clan_line,
+                f"Upgrade: {upgrade_line}",
+                f"Duration: {duration_line}",
+                f"Notes: {notes_line}",
+                destination_line,
+                "",
+                "Use the controls below to update the details, then press **Submit Upgrade** when you're ready.",
+            ]
+        )
+
+    async def refresh_view_message(self) -> None:
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(content=self.render_message(), view=self)
+        except discord.HTTPException as exc:
+            log.warning("Failed to refresh plan_upgrade view message: %s", exc)
+
+    async def handle_submit(self, interaction: discord.Interaction) -> None:
+        if self.building_name is None or self.current_level is None or self.target_level is None:
+            await interaction.response.send_message(
+                "Provide the upgrade details before submitting.",
+                ephemeral=True,
+            )
+            return
+        if self.duration_timedelta is None or not self.duration_text:
+            await interaction.response.send_message(
+                "Set the upgrade duration before submitting.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        if self.destination_channel is None:
+            await interaction.followup.send(
+                "The upgrade channel is no longer available. Ask an administrator to reconfigure it.",
+                ephemeral=True,
+            )
+            return
+
+        tag = self.selected_account_tag
+        alias = self.selected_account_alias
+        account_label = f"{alias} ({tag})" if alias else tag
+
+        resolved_clan_name = self.selected_clan
+        resolved_clan_tag = self.clan_map.get(resolved_clan_name) if resolved_clan_name else None
+
+        player_name: Optional[str] = None
+        try:
+            player_payload = await client.get_player(tag)
+        except Exception as exc:  # pylint: disable=broad-except
+            log.debug("plan_upgrade unable to fetch player payload for %s: %s", tag, exc)
+            player_payload = None
+
+        if isinstance(player_payload, dict):
+            profile = player_payload.get("profile", {})
+            player_name = profile.get("name")
+            clan_info = player_payload.get("clan") or {}
+            player_clan_tag = clan_info.get("tag")
+            if player_clan_tag:
+                if resolved_clan_tag is None:
+                    resolved_clan_tag = player_clan_tag
+                if resolved_clan_name is None:
+                    for configured_name, configured_tag in self.clan_map.items():
+                        if configured_tag == player_clan_tag:
+                            resolved_clan_name = configured_name
+                            break
+
+        submission_dt = datetime.utcnow().replace(tzinfo=timezone.utc)
+        submission_time = submission_dt.strftime("%Y-%m-%d %H:%M UTC")
+        completion_dt = submission_dt + self.duration_timedelta
+        completion_text = _format_eta(completion_dt)
+
+        lines = [
+            "**Planned Upgrade Submitted**",
+            f"Member: {self.member.mention}",
+            f"Account: `{account_label}`",
+            f"Upgrade: {self.building_name} {self.current_level} -> {self.target_level}",
+            f"Duration: {self.duration_text}",
+            f"Completes: {completion_text}",
+        ]
+        if player_name:
+            lines.append(f"In-game name: {player_name}")
+        if resolved_clan_name:
+            lines.append(f"Clan: `{resolved_clan_name}`")
+        if self.notes:
+            lines.append(f"Notes: {self.notes}")
+        lines.append(f"Submitted: {submission_time}")
+
+        payload = "\n".join(lines)
+        for chunk in _chunk_content(payload):
+            await self.destination_channel.send(chunk)
+
+        log_entry = {
+            "id": str(uuid4()),
+            "timestamp": submission_dt.isoformat(),
+            "user_id": self.member.id,
+            "user_name": self.member.display_name,
+            "player_tag": tag,
+            "player_name": player_name,
+            "alias": alias,
+            "upgrade": self.building_name,
+            "notes": self.notes,
+            "clan_name": resolved_clan_name,
+            "clan_tag": resolved_clan_tag,
+            "from_level": self.current_level,
+            "to_level": self.target_level,
+            "duration": self.duration_text,
+            "duration_seconds": int(self.duration_timedelta.total_seconds()),
+            "eta": completion_dt.isoformat(),
+        }
+        _append_upgrade_log(self.guild.id, log_entry)
+
+        await interaction.followup.send(
+            f"Logged upgrade for `{account_label}` in {self.destination_channel.mention}.",
+            ephemeral=True,
+        )
+
+        self.disable_all_items()
+        if self.message is not None:
+            try:
+                await self.message.edit(
+                    content=f"Upgrade submitted for `{account_label}` in {self.destination_channel.mention}.",
+                    view=self,
+                )
+            except discord.HTTPException:
+                pass
+
+    async def handle_cancel(self, interaction: discord.Interaction) -> None:
+        self.disable_all_items()
+        await interaction.response.edit_message(
+            content="Upgrade planning cancelled.",
+            view=self,
+        )
+
+    def disable_all_items(self) -> None:
+        for child in self.children:
+            child.disabled = True
+
+    async def on_timeout(self) -> None:
+        self.disable_all_items()
+        if self.message is not None:
+            try:
+                await self.message.edit(
+                    content="Upgrade planning timed out. Run `/plan_upgrade` again to restart.",
+                    view=self,
+                )
+            except discord.HTTPException:
+                pass
+
+    def _format_account_display(self) -> str:
+        alias = self.selected_account_alias
+        tag = self.selected_account_tag
+        return f"{alias} ({tag})" if alias else tag
+
+
+class ScheduleSelect(discord.ui.Select):
+    """Select existing schedules or start a new one."""
+
+    def __init__(self, parent_view: "ScheduleConfigView"):
+        self.parent_view = parent_view
+        options: List[discord.SelectOption] = [
+            discord.SelectOption(
+                label="➕ Create new schedule",
+                value="__new__",
+                description="Start a brand new schedule",
+                default=parent_view.selected_schedule_id is None,
+            )
+        ]
+        for entry in parent_view.schedule_summaries():
+            options.append(entry)
+        super().__init__(
+            placeholder="Select an existing schedule or create a new one",
+            min_values=1,
+            max_values=1,
+            options=options[:25],
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        choice = self.values[0]
+        if choice == "__new__":
+            self.parent_view.start_new_schedule()
+        else:
+            self.parent_view.load_schedule(choice)
+        self.parent_view.refresh_components()
+        if interaction.message is not None:
+            self.parent_view.message = interaction.message
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
+
+
+class ScheduleClanSelect(discord.ui.Select):
+    """Select menu for choosing the clan the schedule belongs to."""
+
+    def __init__(self, parent_view: "ScheduleConfigView"):
+        self.parent_view = parent_view
+        options = [
+            discord.SelectOption(
+                label=name,
+                value=name,
+                default=name == parent_view.selected_clan,
+            )
+            for name in sorted(parent_view.clan_map.keys(), key=str.casefold)
+        ]
+        super().__init__(
+            placeholder="Choose the clan to report on",
+            min_values=1,
+            max_values=1,
+            options=options[:25],
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        clan_name = self.values[0]
+        self.parent_view.set_clan(clan_name)
+        if interaction.message is not None:
+            self.parent_view.message = interaction.message
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
+
+
+class ScheduleReportTypeSelect(discord.ui.Select):
+    """Select menu for choosing the report type."""
+
+    def __init__(self, parent_view: "ScheduleConfigView"):
+        self.parent_view = parent_view
+        options = [
+            discord.SelectOption(
+                label="Dashboard",
+                value="dashboard",
+                description="Post the configured dashboard summary",
+                default=parent_view.report_type == "dashboard",
+            ),
+            discord.SelectOption(
+                label="Donation summary",
+                value="donation_summary",
+                description="Share donation stats",
+                default=parent_view.report_type == "donation_summary",
+            ),
+            discord.SelectOption(
+                label="Season summary",
+                value="season_summary",
+                description="Send season recap with optional sections",
+                default=parent_view.report_type == "season_summary",
+            ),
+        ]
+        super().__init__(
+            placeholder="Select report type",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=2,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        self.parent_view.set_report_type(self.values[0])
+        if interaction.message is not None:
+            self.parent_view.message = interaction.message
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
+
+
+class ScheduleFrequencySelect(discord.ui.Select):
+    """Select menu for choosing schedule cadence."""
+
+    def __init__(self, parent_view: "ScheduleConfigView"):
+        self.parent_view = parent_view
+        options = [
+            discord.SelectOption(
+                label="Daily",
+                value="daily",
+                default=parent_view.frequency == "daily",
+            ),
+            discord.SelectOption(
+                label="Weekly",
+                value="weekly",
+                default=parent_view.frequency == "weekly",
+            ),
+        ]
+        super().__init__(
+            placeholder="Choose how often to run",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=3,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        self.parent_view.set_frequency(self.values[0])
+        if interaction.message is not None:
+            self.parent_view.message = interaction.message
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
+
+
+class ScheduleWeekdaySelect(discord.ui.Select):
+    """Select menu for weekly schedule weekday."""
+
+    def __init__(self, parent_view: "ScheduleConfigView"):
+        self.parent_view = parent_view
+        options = [
+            discord.SelectOption(
+                label=day.title(),
+                value=day,
+                default=day == parent_view.weekday,
+            )
+            for day in WEEKDAY_CHOICES
+        ]
+        super().__init__(
+            placeholder="Pick the weekday",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=4,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        self.parent_view.set_weekday(self.values[0])
+        if interaction.message is not None:
+            self.parent_view.message = interaction.message
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
+
+
+class ScheduleTimeButton(discord.ui.Button):
+    """Button that opens a modal to set the UTC time."""
+
+    def __init__(self, parent_view: "ScheduleConfigView"):
+        super().__init__(
+            label=f"Time (UTC): {parent_view.time_utc}",
+            style=discord.ButtonStyle.primary,
+            row=5,
+        )
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        await interaction.response.send_modal(ScheduleTimeModal(self.parent_view))
+
+
+class ScheduleChannelSelect(discord.ui.ChannelSelect):
+    """Channel selector for optional override."""
+
+    def __init__(self, parent_view: "ScheduleConfigView"):
+        self.parent_view = parent_view
+        default_values = []
+        if parent_view.channel_id is not None:
+            channel = parent_view.guild.get_channel(parent_view.channel_id)
+            if isinstance(channel, discord.TextChannel):
+                default_values = [channel]
+        super().__init__(
+            placeholder="Override destination channel (optional)",
+            min_values=0,
+            max_values=1,
+            channel_types=[discord.ChannelType.text],
+            default_values=default_values,
+            row=6,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        channel = self.values[0] if self.values else None
+        self.parent_view.set_channel(channel)
+        if interaction.message is not None:
+            self.parent_view.message = interaction.message
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
+
+
+class ScheduleDashboardModuleSelect(discord.ui.Select):
+    """Multi-select for dashboard modules."""
+
+    def __init__(self, parent_view: "ScheduleConfigView"):
+        self.parent_view = parent_view
+        options = [
+            discord.SelectOption(
+                label=DASHBOARD_MODULES[module],
+                value=module,
+                default=module in parent_view.dashboard_modules,
+            )
+            for module in DASHBOARD_MODULES
+        ]
+        super().__init__(
+            placeholder="Choose dashboard modules",
+            min_values=1,
+            max_values=len(options),
+            options=options,
+            row=7,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        self.parent_view.set_dashboard_modules(list(self.values))
+        if interaction.message is not None:
+            self.parent_view.message = interaction.message
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
+
+
+class ScheduleDashboardFormatSelect(discord.ui.Select):
+    """Select menu for dashboard format."""
+
+    def __init__(self, parent_view: "ScheduleConfigView"):
+        self.parent_view = parent_view
+        options = [
+            discord.SelectOption(
+                label=fmt.upper(),
+                value=fmt,
+                default=fmt == parent_view.dashboard_format,
+            )
+            for fmt in sorted(DASHBOARD_FORMATS)
+        ]
+        super().__init__(
+            placeholder="Select dashboard format",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=8,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        self.parent_view.set_dashboard_format(self.values[0])
+        if interaction.message is not None:
+            self.parent_view.message = interaction.message
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
+
+
+class ScheduleToggleButton(discord.ui.Button):
+    """Button that toggles a boolean option."""
+
+    def __init__(self, parent_view: "ScheduleConfigView", attr: str, label: str):
+        self.parent_view = parent_view
+        self.attr = attr
+        enabled = getattr(parent_view, attr)
+        style = discord.ButtonStyle.success if enabled else discord.ButtonStyle.secondary
+        text = f"{label}: {'On' if enabled else 'Off'}"
+        super().__init__(label=text, style=style, row=9)
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        current = getattr(self.parent_view, self.attr)
+        setattr(self.parent_view, self.attr, not current)
+        self.parent_view.unsaved_changes = True
+        self.parent_view.refresh_components()
+        if interaction.message is not None:
+            self.parent_view.message = interaction.message
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
+
+
+class SchedulePreviewButton(discord.ui.Button):
+    """Button that displays a summary preview."""
+
+    def __init__(self, parent_view: "ScheduleConfigView"):
+        super().__init__(label="Preview Summary", style=discord.ButtonStyle.secondary, row=10)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await interaction.followup.send(self.parent_view.preview_text(), ephemeral=True)
+
+
+class ScheduleSaveButton(discord.ui.Button):
+    """Button that saves the schedule configuration."""
+
+    def __init__(self, parent_view: "ScheduleConfigView"):
+        super().__init__(label="Save Schedule", style=discord.ButtonStyle.success, row=10)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        await self.parent_view.handle_save(interaction)
+
+
+class ScheduleDeleteButton(discord.ui.Button):
+    """Button that removes the currently selected schedule."""
+
+    def __init__(self, parent_view: "ScheduleConfigView"):
+        super().__init__(label="Delete Schedule", style=discord.ButtonStyle.danger, row=10)
+        self.parent_view = parent_view
+        if not parent_view.can_delete_current_schedule:
+            self.disabled = True
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        await self.parent_view.handle_delete(interaction)
+
+
+class ScheduleCancelButton(discord.ui.Button):
+    """Button that closes the scheduler view."""
+
+    def __init__(self, parent_view: "ScheduleConfigView"):
+        super().__init__(label="Close", style=discord.ButtonStyle.secondary, row=11)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        self.parent_view.disable_all_items()
+        await interaction.response.edit_message(
+            content="Scheduler closed.",
+            view=self.parent_view,
+        )
+
+
+class ScheduleTimeModal(discord.ui.Modal):
+    """Modal used to collect a schedule time."""
+
+    def __init__(self, parent_view: "ScheduleConfigView"):
+        super().__init__(title="Set Report Time (UTC)", timeout=None)
+        self.parent_view = parent_view
+        self.time_input = discord.ui.TextInput(
+            label="Time (HH:MM UTC)",
+            placeholder="e.g. 13:30",
+            default=parent_view.time_utc,
+            max_length=8,
+        )
+        self.add_item(self.time_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        value = self.time_input.value.strip()
+        try:
+            _parse_time_utc(value)
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        self.parent_view.set_time(value)
+        await interaction.response.send_message(f"Time set to {value} UTC.", ephemeral=True)
+        self.parent_view.refresh_components()
+        await self.parent_view.refresh_view_message()
+
+
+class ScheduleConfigView(discord.ui.View):
+    """Interactive view for configuring scheduled reports."""
+
+    def __init__(
+        self,
+        *,
+        guild: discord.Guild,
+        actor: discord.Member,
+        clan_map: Dict[str, str],
+        schedules: List[Dict[str, Any]],
+        selected_schedule_id: Optional[str],
+        selected_clan: Optional[str],
+        timeout: float = 300,
+    ):
+        super().__init__(timeout=timeout)
+        self.guild = guild
+        self.clan_map = clan_map
+        self.message: Optional[discord.Message] = None
+
+        self.schedule_map: Dict[str, Dict[str, Any]] = {
+            entry.get("id"): entry for entry in schedules if isinstance(entry, dict) and entry.get("id")
+        }
+        self.selected_schedule_id = selected_schedule_id if selected_schedule_id in self.schedule_map else None
+
+        self.selected_clan = selected_clan if selected_clan in clan_map else next(iter(clan_map))
+        self.report_type: str = "dashboard"
+        self.frequency: str = "daily"
+        self.weekday: Optional[str] = None
+        self.time_utc: str = "00:00"
+        self.channel_id: Optional[int] = None
+        self.dashboard_modules: List[str] = ["war_overview"]
+        self.dashboard_format: str = "embed"
+        self.include_donations: bool = True
+        self.include_wars: bool = True
+        self.include_members: bool = False
+        self.unsaved_changes: bool = False
+
+        if self.selected_schedule_id:
+            self.load_schedule(self.selected_schedule_id)
+        else:
+            self.start_new_schedule()
+
+        self.refresh_components()
+
+    def schedule_summaries(self) -> List[discord.SelectOption]:
+        summaries: List[discord.SelectOption] = []
+        for schedule_id, entry in self.schedule_map.items():
+            clan = entry.get("clan_name", "unknown")
+            report_type = entry.get("type", "unknown")
+            frequency = entry.get("frequency", "daily")
+            label = f"{clan} - {report_type}"
+            description = f"{frequency.title()} at {entry.get('time_utc', '??:??')} (ID {schedule_id})"
+            summaries.append(
+                discord.SelectOption(
+                    label=label[:100],
+                    value=schedule_id,
+                    description=description[:100],
+                    default=schedule_id == self.selected_schedule_id,
+                )
+            )
+        return summaries
+
+    def set_clan(self, clan_name: str) -> None:
+        if clan_name not in self.clan_map or clan_name == self.selected_clan:
+            return
+        self.selected_clan = clan_name
+        if self.report_type == "dashboard":
+            self.apply_dashboard_defaults()
+        self.unsaved_changes = True
+        self.refresh_components()
+
+    def set_report_type(self, report_type: str) -> None:
+        if report_type not in REPORT_TYPES or report_type == self.report_type:
+            return
+        self.report_type = report_type
+        if report_type == "dashboard":
+            self.apply_dashboard_defaults()
+        if report_type != "season_summary":
+            self.include_donations = True
+            self.include_wars = True
+            self.include_members = False
+        self.unsaved_changes = True
+        self.refresh_components()
+
+    def set_frequency(self, frequency: str) -> None:
+        if frequency not in SCHEDULE_FREQUENCIES or frequency == self.frequency:
+            return
+        self.frequency = frequency
+        if frequency == "weekly" and self.weekday is None:
+            self.weekday = "monday"
+        if frequency == "daily":
+            self.weekday = None
+        self.unsaved_changes = True
+        self.refresh_components()
+
+    def set_weekday(self, weekday: str) -> None:
+        if weekday not in WEEKDAY_CHOICES:
+            return
+        self.weekday = weekday
+        self.unsaved_changes = True
+
+    def set_time(self, time_utc: str) -> None:
+        self.time_utc = time_utc
+        self.unsaved_changes = True
+
+    def set_channel(self, channel: Optional[discord.abc.GuildChannel]) -> None:
+        if isinstance(channel, discord.TextChannel):
+            self.channel_id = channel.id
+        else:
+            self.channel_id = None
+        self.unsaved_changes = True
+
+    def set_dashboard_modules(self, modules: Iterable[str]) -> None:
+        cleaned = _sanitise_modules(modules)
+        if cleaned:
+            self.dashboard_modules = cleaned
+            self.unsaved_changes = True
+
+    def set_dashboard_format(self, fmt: str) -> None:
+        if fmt in DASHBOARD_FORMATS:
+            self.dashboard_format = fmt
+            self.unsaved_changes = True
+
+    def apply_dashboard_defaults(self) -> None:
+        clan_entry = _get_clan_entry(self.guild.id, self.selected_clan)
+        modules, fmt, default_channel_id = _dashboard_defaults(clan_entry if isinstance(clan_entry, dict) else {})
+        self.dashboard_modules = modules
+        self.dashboard_format = fmt
+        if self.channel_id is None and isinstance(default_channel_id, int):
+            self.channel_id = default_channel_id
+
+    def load_schedule(self, schedule_id: str) -> None:
+        entry = self.schedule_map.get(schedule_id)
+        if entry is None:
+            return
+        self.selected_schedule_id = schedule_id
+        self.selected_clan = entry.get("clan_name", self.selected_clan)
+        self.report_type = entry.get("type", "dashboard")
+        self.frequency = entry.get("frequency", "daily")
+        self.time_utc = entry.get("time_utc", "00:00")
+        self.weekday = entry.get("weekday")
+        self.channel_id = entry.get("channel_id")
+        options = entry.get("options", {})
+        if self.report_type == "dashboard":
+            modules = options.get("modules")
+            if isinstance(modules, list):
+                self.dashboard_modules = _sanitise_modules(modules)
+            self.dashboard_format = options.get("format", "embed")
+        else:
+            self.dashboard_modules = ["war_overview"]
+            self.dashboard_format = "embed"
+        if self.report_type == "season_summary":
+            self.include_donations = options.get("include_donations", True)
+            self.include_wars = options.get("include_wars", True)
+            self.include_members = options.get("include_members", False)
+        else:
+            self.include_donations = True
+            self.include_wars = True
+            self.include_members = False
+        self.unsaved_changes = False
+
+    def start_new_schedule(self) -> None:
+        self.selected_schedule_id = None
+        self.report_type = "dashboard"
+        self.frequency = "daily"
+        self.weekday = None
+        self.time_utc = "00:00"
+        self.channel_id = None
+        self.apply_dashboard_defaults()
+        self.include_donations = True
+        self.include_wars = True
+        self.include_members = False
+        self.unsaved_changes = True
+
+    @property
+    def can_delete_current_schedule(self) -> bool:
+        return self.selected_schedule_id in self.schedule_map
+
+    def refresh_components(self) -> None:
+        self.clear_items()
+        self.add_item(ScheduleSelect(self))
+        self.add_item(ScheduleClanSelect(self))
+        self.add_item(ScheduleReportTypeSelect(self))
+        self.add_item(ScheduleFrequencySelect(self))
+        if self.frequency == "weekly":
+            self.add_item(ScheduleWeekdaySelect(self))
+        self.add_item(ScheduleTimeButton(self))
+        self.add_item(ScheduleChannelSelect(self))
+        if self.report_type == "dashboard":
+            self.add_item(ScheduleDashboardModuleSelect(self))
+            self.add_item(ScheduleDashboardFormatSelect(self))
+        elif self.report_type == "season_summary":
+            self.add_item(ScheduleToggleButton(self, "include_donations", "Include donations"))
+            self.add_item(ScheduleToggleButton(self, "include_wars", "Include wars"))
+            self.add_item(ScheduleToggleButton(self, "include_members", "Include members"))
+        self.add_item(SchedulePreviewButton(self))
+        self.add_item(ScheduleSaveButton(self))
+        self.add_item(ScheduleDeleteButton(self))
+        self.add_item(ScheduleCancelButton(self))
+
+    def render_message(self) -> str:
+        channel_display = "Default channel"
+        if self.channel_id is not None:
+            channel_obj = self.guild.get_channel(self.channel_id)
+            if isinstance(channel_obj, discord.TextChannel):
+                channel_display = channel_obj.mention
+        weekday_text = self.weekday.title() if self.weekday else "N/A"
+        status = "Unsaved changes" if self.unsaved_changes else "All changes saved"
+        try:
+            next_run_preview = _calculate_next_run(
+                self.frequency,
+                self.time_utc,
+                weekday=self.weekday if self.frequency == "weekly" else None,
+            )
+        except Exception:
+            next_run_preview = "⚠️ invalid time"
+
+        lines = [
+            "**Schedule Report Editor**",
+            f"Schedule ID: `{self.selected_schedule_id or '(new)'}`",
+            f"Clan: `{self.selected_clan}`",
+            f"Report type: {self.report_type}",
+            f"Frequency: {self.frequency}",
+            f"Weekday: {weekday_text}",
+            f"Time (UTC): {self.time_utc}",
+            f"Channel: {channel_display}",
+            f"Next run preview: {next_run_preview}",
+            f"Status: {status}",
+        ]
+        if self.report_type == "dashboard":
+            lines.append(f"Dashboard modules: {', '.join(self.dashboard_modules)}")
+            lines.append(f"Dashboard format: {self.dashboard_format.upper()}")
+        if self.report_type == "season_summary":
+            lines.append(
+                "Sections: "
+                f"{'Donations' if self.include_donations else ''} "
+                f"{'Wars' if self.include_wars else ''} "
+                f"{'Members' if self.include_members else ''}".strip() or "None"
+            )
+        lines.append("")
+        lines.append("Use the controls below to adjust settings, then press **Save Schedule**.")
+        return "\n".join(lines)
+
+    def preview_text(self) -> str:
+        return self.render_message()
+
+    async def refresh_view_message(self) -> None:
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(content=self.render_message(), view=self)
+        except discord.HTTPException as exc:
+            log.warning("Failed to refresh schedule view message: %s", exc)
+
+    async def handle_save(self, interaction: discord.Interaction) -> None:
+        if self.frequency == "weekly" and not self.weekday:
+            await interaction.response.send_message(
+                "Select a weekday for weekly schedules.",
+                ephemeral=True,
+            )
+            return
+        try:
+            next_run = _calculate_next_run(
+                self.frequency,
+                self.time_utc,
+                weekday=self.weekday if self.frequency == "weekly" else None,
+            )
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+
+        guild_config = _ensure_guild_config(self.guild.id)
+        schedules = guild_config.setdefault("schedules", [])
+
+        options: Dict[str, Any] = {}
+        if self.report_type == "dashboard":
+            options["modules"] = self.dashboard_modules
+            options["format"] = self.dashboard_format
+        elif self.report_type == "season_summary":
+            options["include_donations"] = self.include_donations
+            options["include_wars"] = self.include_wars
+            options["include_members"] = self.include_members
+
+        if self.selected_schedule_id and self.selected_schedule_id in self.schedule_map:
+            entry = self.schedule_map[self.selected_schedule_id]
+            entry.update(
+                {
+                    "type": self.report_type,
+                    "clan_name": self.selected_clan,
+                    "frequency": self.frequency,
+                    "time_utc": self.time_utc,
+                    "weekday": self.weekday if self.frequency == "weekly" else None,
+                    "channel_id": self.channel_id,
+                    "next_run": next_run,
+                    "options": options,
+                }
+            )
+            for idx, schedule in enumerate(schedules):
+                if schedule.get("id") == self.selected_schedule_id:
+                    schedules[idx] = entry
+                    break
+        else:
+            new_id = str(uuid4())
+            entry = {
+                "id": new_id,
+                "type": self.report_type,
+                "clan_name": self.selected_clan,
+                "frequency": self.frequency,
+                "time_utc": self.time_utc,
+                "weekday": self.weekday if self.frequency == "weekly" else None,
+                "channel_id": self.channel_id,
+                "next_run": next_run,
+                "options": options,
+            }
+            schedules.append(entry)
+            self.schedule_map[new_id] = entry
+            self.selected_schedule_id = new_id
+
+        save_server_config()
+        self.unsaved_changes = False
+        self.refresh_components()
+        await interaction.response.send_message(
+            f"Schedule saved. Next run at {next_run}.",
+            ephemeral=True,
+        )
+        await self.refresh_view_message()
+
+    async def handle_delete(self, interaction: discord.Interaction) -> None:
+        if not self.selected_schedule_id or self.selected_schedule_id not in self.schedule_map:
+            await interaction.response.send_message(
+                "Select an existing schedule before deleting.",
+                ephemeral=True,
+            )
+            return
+
+        schedule_id = self.selected_schedule_id
+        guild_config = _ensure_guild_config(self.guild.id)
+        schedules = guild_config.get("schedules", [])
+        guild_config["schedules"] = [
+            entry for entry in schedules if entry.get("id") != schedule_id
+        ]
+        self.schedule_map.pop(schedule_id, None)
+        save_server_config()
+
+        if self.schedule_map:
+            self.selected_schedule_id = next(iter(self.schedule_map.keys()))
+            self.load_schedule(self.selected_schedule_id)
+        else:
+            self.start_new_schedule()
+
+        self.refresh_components()
+        await interaction.response.send_message(
+            f"Deleted schedule `{schedule_id}`.",
+            ephemeral=True,
+        )
+        await self.refresh_view_message()
+
+    def disable_all_items(self) -> None:
+        for child in self.children:
+            child.disabled = True
+
+    async def on_timeout(self) -> None:
+        self.disable_all_items()
+        if self.message is not None:
+            try:
+                await self.message.edit(
+                    content="Scheduler timed out. Run `/schedule_report` again to continue.",
+                    view=self,
+                )
+            except discord.HTTPException:
+                pass
+
+class WarPlanNameModal(discord.ui.Modal):
+    """Modal used to create or rename a war plan."""
+
+    def __init__(self, parent_view: "WarPlanView", *, initial_name: Optional[str], mode: str):
+        title = "Rename War Plan" if mode == "rename" else "Create War Plan"
+        super().__init__(title=title, timeout=None)
+        self.parent_view = parent_view
+        self.mode = mode
+        self.plan_name = discord.ui.TextInput(
+            label="Plan name",
+            placeholder="e.g. TH15 Mass E-Drags",
+            default=initial_name or "",
+            max_length=80,
+        )
+        self.add_item(self.plan_name)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        new_name = self.plan_name.value.strip()
+        if not new_name:
+            await interaction.response.send_message(
+                "Plan name cannot be empty.",
+                ephemeral=True,
+            )
+            return
+
+        if self.parent_view.plan_name_conflicts(new_name):
+            await interaction.response.send_message(
+                f"A plan named `{new_name}` already exists. Choose another name or select it from the dropdown.",
+                ephemeral=True,
+            )
+            return
+
+        self.parent_view.set_plan_name(new_name)
+        await interaction.response.send_message(
+            f"Plan name set to `{new_name}`.",
+            ephemeral=True,
+        )
+        await self.parent_view.refresh_view_message()
+
+
+class WarPlanContentModal(discord.ui.Modal):
+    """Modal used to edit the war plan content."""
+
+    def __init__(self, parent_view: "WarPlanView"):
+        super().__init__(title="Edit War Plan Content", timeout=None)
+        self.parent_view = parent_view
+        current = parent_view.plan_content or ""
+        self.content = discord.ui.TextInput(
+            label="Strategy content",
+            style=discord.TextStyle.paragraph,
+            default=current,
+            placeholder="Describe the strategy, assignments, spell composition, etc.",
+            max_length=3800,
+        )
+        self.add_item(self.content)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        new_content = self.content.value.strip()
+        if not new_content:
+            await interaction.response.send_message(
+                "Plan content cannot be empty.",
+                ephemeral=True,
+            )
+            return
+        self.parent_view.set_plan_content(new_content)
+        await interaction.response.send_message("Plan content updated.", ephemeral=True)
+        await self.parent_view.refresh_view_message()
+
+
+class WarPlanClanSelect(discord.ui.Select):
+    """Select menu for choosing which clan's plans to manage."""
+
+    def __init__(self, parent_view: "WarPlanView"):
+        self.parent_view = parent_view
+        options = [
+            discord.SelectOption(
+                label=name,
+                value=name,
+                default=name == parent_view.selected_clan,
+            )
+            for name in sorted(parent_view.clan_map.keys(), key=str.casefold)
+        ]
+        super().__init__(
+            placeholder="Choose a clan",
+            min_values=1,
+            max_values=1,
+            options=options[:25],
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        selected = self.values[0]
+        self.parent_view.set_clan(selected)
+        if interaction.message is not None:
+            self.parent_view.message = interaction.message
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
+
+
+class WarPlanPlanSelect(discord.ui.Select):
+    """Select menu for choosing an existing plan or creating a new one."""
+
+    def __init__(self, parent_view: "WarPlanView"):
+        self.parent_view = parent_view
+        options: List[discord.SelectOption] = [
+            discord.SelectOption(
+                label="➕ Create new plan",
+                value="__new__",
+                description="Start a brand new war plan",
+                default=parent_view.selected_plan_name is None,
+            )
+        ]
+        for name in sorted(parent_view.available_plan_names, key=str.casefold):
+            options.append(
+                discord.SelectOption(
+                    label=name,
+                    value=name,
+                    default=name == parent_view.selected_plan_name,
+                )
+            )
+        super().__init__(
+            placeholder="Select an existing plan or create a new one",
+            min_values=1,
+            max_values=1,
+            options=options[:25],
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        selection = self.values[0]
+        if selection == "__new__":
+            self.parent_view.start_new_plan()
+            if interaction.message is not None:
+                self.parent_view.message = interaction.message
+            await interaction.response.send_modal(
+                WarPlanNameModal(self.parent_view, initial_name=None, mode="create")
+            )
+            return
+
+        self.parent_view.load_plan(selection)
+        if interaction.message is not None:
+            self.parent_view.message = interaction.message
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
+
+
+class WarPlanSetNameButton(discord.ui.Button):
+    """Button that opens the modal to set or rename the plan."""
+
+    def __init__(self, parent_view: "WarPlanView"):
+        super().__init__(label="Set Plan Name", style=discord.ButtonStyle.secondary, row=2)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        initial = self.parent_view.selected_plan_name
+        mode = "rename" if initial else "create"
+        await interaction.response.send_modal(
+            WarPlanNameModal(self.parent_view, initial_name=initial, mode=mode)
+        )
+
+
+class WarPlanEditContentButton(discord.ui.Button):
+    """Button that opens the modal to edit plan content."""
+
+    def __init__(self, parent_view: "WarPlanView"):
+        super().__init__(label="Edit Content", style=discord.ButtonStyle.primary, row=2)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        await interaction.response.send_modal(WarPlanContentModal(self.parent_view))
+
+
+class WarPlanPreviewButton(discord.ui.Button):
+    """Button that shows a preview of the current plan."""
+
+    def __init__(self, parent_view: "WarPlanView"):
+        super().__init__(label="Preview", style=discord.ButtonStyle.secondary, row=3)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        if not self.parent_view.plan_content:
+            await interaction.response.send_message(
+                "Add plan content before requesting a preview.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await interaction.followup.send(
+            self.parent_view.plan_preview_text(),
+            ephemeral=True,
+        )
+
+
+class WarPlanSaveButton(discord.ui.Button):
+    """Button that persists the current plan."""
+
+    def __init__(self, parent_view: "WarPlanView"):
+        super().__init__(label="Save Plan", style=discord.ButtonStyle.success, row=3)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        await self.parent_view.handle_save(interaction)
+
+
+class WarPlanDeleteButton(discord.ui.Button):
+    """Button that deletes the currently selected plan."""
+
+    def __init__(self, parent_view: "WarPlanView"):
+        super().__init__(label="Delete Plan", style=discord.ButtonStyle.danger, row=3)
+        self.parent_view = parent_view
+        if not parent_view.can_delete_current_plan:
+            self.disabled = True
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        await self.parent_view.handle_delete(interaction)
+
+
+class WarPlanCancelButton(discord.ui.Button):
+    """Button that closes the editor."""
+
+    def __init__(self, parent_view: "WarPlanView"):
+        super().__init__(label="Close", style=discord.ButtonStyle.secondary, row=4)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        self.parent_view.disable_all_items()
+        await interaction.response.edit_message(
+            content="War plan editor closed.",
+            view=self.parent_view,
+        )
+
+
+class WarPlanView(discord.ui.View):
+    """Interactive editor for creating or updating war plan templates."""
+
+    def __init__(
+        self,
+        *,
+        guild: discord.Guild,
+        actor: discord.Member,
+        clan_map: Dict[str, str],
+        selected_clan: str,
+        preselected_plan: Optional[str],
+        timeout: float = 300,
+    ):
+        super().__init__(timeout=timeout)
+        self.guild = guild
+        self.clan_map = clan_map
+        self.message: Optional[discord.Message] = None
+
+        self.selected_clan = selected_clan
+        self.plan_store: Dict[str, Dict[str, Any]] = {}
+        self.available_plan_names: List[str] = []
+
+        self.selected_plan_name: Optional[str] = None
+        self.original_plan_name: Optional[str] = None
+        self.plan_content: Optional[str] = None
+        self.last_updated_at: Optional[str] = None
+        self.last_updated_by: Optional[int] = None
+        self.unsaved_changes = False
+
+        self.load_clan(self.selected_clan)
+        if preselected_plan and preselected_plan in self.plan_store:
+            self.load_plan(preselected_plan)
+        elif self.plan_store:
+            default_plan = preselected_plan if preselected_plan in self.plan_store else next(iter(self.available_plan_names))
+            self.load_plan(default_plan)
+        else:
+            if preselected_plan:
+                self.set_plan_name(preselected_plan)
+            else:
+                self.start_new_plan()
+
+        self.refresh_components()
+
+    def load_clan(self, clan_name: str) -> None:
+        clan_entry = _get_clan_entry(self.guild.id, clan_name)
+        if clan_entry is None:
+            clan_entry = _ensure_guild_config(self.guild.id)["clans"].setdefault(clan_name, {})
+        self.plan_store = clan_entry.setdefault("war_plans", {})
+        self.available_plan_names = list(self.plan_store.keys())
+
+    def set_clan(self, clan_name: str) -> None:
+        if clan_name not in self.clan_map or clan_name == self.selected_clan:
+            return
+        self.selected_clan = clan_name
+        self.load_clan(clan_name)
+        if self.available_plan_names:
+            self.load_plan(self.available_plan_names[0])
+        else:
+            self.start_new_plan()
+        self.refresh_components()
+
+    def load_plan(self, plan_name: str) -> None:
+        plan = self.plan_store.get(plan_name)
+        if plan is None:
+            return
+        self.selected_plan_name = plan_name
+        self.original_plan_name = plan_name
+        self.plan_content = plan.get("content", "")
+        self.last_updated_at = plan.get("updated_at")
+        self.last_updated_by = plan.get("updated_by")
+        self.unsaved_changes = False
+        self.refresh_components()
+
+    def start_new_plan(self) -> None:
+        self.selected_plan_name = None
+        self.original_plan_name = None
+        self.plan_content = ""
+        self.last_updated_at = None
+        self.last_updated_by = None
+        self.unsaved_changes = True
+        self.refresh_components()
+
+    def set_plan_name(self, name: str) -> None:
+        self.selected_plan_name = name
+        self.unsaved_changes = True
+        self.refresh_components()
+
+    def plan_name_conflicts(self, candidate: str) -> bool:
+        candidate_lower = candidate.casefold()
+        for existing in self.available_plan_names:
+            if existing.casefold() == candidate_lower and existing != self.original_plan_name:
+                return True
+        return False
+
+    def set_plan_content(self, content: str) -> None:
+        self.plan_content = content
+        self.unsaved_changes = True
+
+    @property
+    def can_delete_current_plan(self) -> bool:
+        return self.selected_plan_name in self.plan_store
+
+    def refresh_components(self) -> None:
+        self.clear_items()
+        self.add_item(WarPlanClanSelect(self))
+        self.add_item(WarPlanPlanSelect(self))
+        self.add_item(WarPlanSetNameButton(self))
+        self.add_item(WarPlanEditContentButton(self))
+        self.add_item(WarPlanPreviewButton(self))
+        self.add_item(WarPlanSaveButton(self))
+        self.add_item(WarPlanDeleteButton(self))
+        self.add_item(WarPlanCancelButton(self))
+
+    def render_message(self) -> str:
+        plan_name = self.selected_plan_name or "(unsaved plan)"
+        content_status = (
+            f"{len(self.plan_content or ''):,} characters"
+            if self.plan_content
+            else "No content yet"
+        )
+        updated_line = "Not saved yet"
+        if self.original_plan_name and self.original_plan_name in self.plan_store:
+            timestamps = self.plan_store[self.original_plan_name].get("updated_at")
+            if timestamps:
+                updated_line = timestamps
+
+        status = "Unsaved changes" if self.unsaved_changes else "All changes saved"
+        return "\n".join(
+            [
+                "**War Plan Editor**",
+                f"Clan: `{self.selected_clan}`",
+                f"Plan: `{plan_name}`",
+                f"Content: {content_status}",
+                f"Last saved: {updated_line}",
+                f"Status: {status}",
+                "",
+                "Use the dropdowns and buttons below to manage war plans. Remember to press **Save Plan** after editing.",
+            ]
+        )
+
+    def plan_preview_text(self) -> str:
+        plan_name = self.selected_plan_name or "(unsaved plan)"
+        lines = [
+            f"**{plan_name}**",
+            "",
+            self.plan_content or "(no content provided)",
+        ]
+        return "\n".join(lines)
+
+    async def refresh_view_message(self) -> None:
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(content=self.render_message(), view=self)
+        except discord.HTTPException as exc:
+            log.warning("Failed to refresh war plan view message: %s", exc)
+
+    async def handle_save(self, interaction: discord.Interaction) -> None:
+        if not self.selected_plan_name:
+            await interaction.response.send_message(
+                "Set a plan name before saving.",
+                ephemeral=True,
+            )
+            return
+        if not self.plan_content:
+            await interaction.response.send_message(
+                "Add plan content before saving.",
+                ephemeral=True,
+            )
+            return
+
+        plan_name = self.selected_plan_name
+        if (
+            self.original_plan_name
+            and self.original_plan_name != plan_name
+            and self.original_plan_name in self.plan_store
+        ):
+            del self.plan_store[self.original_plan_name]
+
+        self.plan_store[plan_name] = {
+            "content": self.plan_content,
+            "updated_at": datetime.utcnow().isoformat(),
+            "updated_by": self.actor.id,
+        }
+        save_server_config()
+
+        self.available_plan_names = list(self.plan_store.keys())
+        self.original_plan_name = plan_name
+        self.unsaved_changes = False
+
+        self.refresh_components()
+        await interaction.response.send_message(
+            f"Saved war plan `{plan_name}` for `{self.selected_clan}`.",
+            ephemeral=True,
+        )
+        await self.refresh_view_message()
+
+    async def handle_delete(self, interaction: discord.Interaction) -> None:
+        if not self.selected_plan_name or self.selected_plan_name not in self.plan_store:
+            await interaction.response.send_message(
+                "Select an existing plan before attempting to delete.",
+                ephemeral=True,
+            )
+            return
+
+        deleted_name = self.selected_plan_name
+        del self.plan_store[deleted_name]
+        save_server_config()
+        self.available_plan_names = list(self.plan_store.keys())
+
+        if self.available_plan_names:
+            self.load_plan(self.available_plan_names[0])
+        else:
+            self.start_new_plan()
+
+        await interaction.response.send_message(
+            f"Deleted war plan `{deleted_name}`.",
+            ephemeral=True,
+        )
+        await self.refresh_view_message()
+
+    def disable_all_items(self) -> None:
+        for child in self.children:
+            child.disabled = True
+
+    async def on_timeout(self) -> None:
+        self.disable_all_items()
+        if self.message is not None:
+            try:
+                await self.message.edit(
+                    content="War plan editor timed out. Run `/save_war_plan` again to continue.",
+                    view=self,
+                )
+            except discord.HTTPException:
+                pass
+
+
+
+
+
+class WarPlanPostClanSelect(discord.ui.Select):
+    """Select menu for choosing which clan's plans to post."""
+
+    def __init__(self, parent_view: "WarPlanPostView"):
+        options = [
+            discord.SelectOption(
+                label=name[:100],
+                value=name,
+                default=name == parent_view.selected_clan,
+            )
+            for name in sorted(parent_view.clan_map.keys(), key=str.casefold)
+        ]
+        super().__init__(
+            placeholder="Choose a clan",
+            min_values=1,
+            max_values=1,
+            options=options[:25],
+            row=0,
+        )
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        new_clan = self.values[0]
+        self.parent_view.set_clan(new_clan)
+        if interaction.message is not None:
+            self.parent_view.message = interaction.message
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
+
+
+class WarPlanPostPlanSelect(discord.ui.Select):
+    """Select menu for picking a saved war plan."""
+
+    def __init__(self, parent_view: "WarPlanPostView"):
+        self.parent_view = parent_view
+        options: List[discord.SelectOption] = []
+        for name in parent_view.available_plan_names:
+            plan = parent_view.plan_store.get(name, {})
+            updated_at = plan.get("updated_at") if isinstance(plan, dict) else None
+            description = None
+            if isinstance(updated_at, str) and updated_at:
+                description = f"Updated {updated_at}"[:100]
+            options.append(
+                discord.SelectOption(
+                    label=name[:100],
+                    value=name,
+                    description=description,
+                    default=name == parent_view.selected_plan,
+                )
+            )
+            if len(options) >= 25:
+                break
+        if not options:
+            options = [
+                discord.SelectOption(
+                    label="No war plans found",
+                    value="__none__",
+                    description="Use /save_war_plan to create one.",
+                    default=True,
+                )
+            ]
+        super().__init__(
+            placeholder="Choose a war plan",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=1,
+        )
+        if not parent_view.available_plan_names:
+            self.disabled = True
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        choice = self.values[0]
+        self.parent_view.set_plan(choice)
+        if interaction.message is not None:
+            self.parent_view.message = interaction.message
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
+
+
+class WarPlanPostChannelSelect(discord.ui.ChannelSelect):
+    """Channel selector for delivering the war plan."""
+
+    def __init__(self, parent_view: "WarPlanPostView"):
+        self.parent_view = parent_view
+        default_channel = parent_view.explicit_channel or parent_view.default_channel
+        default_values = [default_channel] if isinstance(default_channel, discord.TextChannel) else []
+        super().__init__(
+            placeholder="Pick a channel (leave blank to use the current one)",
+            min_values=0,
+            max_values=1,
+            channel_types=[discord.ChannelType.text],
+            default_values=default_values,
+            row=2,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        channel = self.values[0] if self.values else None
+        self.parent_view.set_channel(channel)
+        if interaction.message is not None:
+            self.parent_view.message = interaction.message
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
+
+
+class WarPlanPostPreviewButton(discord.ui.Button):
+    """Button that produces an ephemeral preview of the plan."""
+
+    def __init__(self, parent_view: "WarPlanPostView"):
+        super().__init__(label="Preview", style=discord.ButtonStyle.secondary, row=3)
+        self.parent_view = parent_view
+        if not parent_view.can_preview:
+            self.disabled = True
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        await self.parent_view.handle_preview(interaction)
+
+
+class WarPlanPostSendButton(discord.ui.Button):
+    """Button that posts the plan to the chosen channel."""
+
+    def __init__(self, parent_view: "WarPlanPostView"):
+        super().__init__(label="Post Plan", style=discord.ButtonStyle.success, row=3)
+        self.parent_view = parent_view
+        if not parent_view.can_post:
+            self.disabled = True
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        await self.parent_view.handle_post(interaction)
+
+
+class WarPlanPostCloseButton(discord.ui.Button):
+    """Button that closes the posting view."""
+
+    def __init__(self, parent_view: "WarPlanPostView"):
+        super().__init__(label="Close", style=discord.ButtonStyle.secondary, row=4)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        self.parent_view.disable_all_items()
+        await interaction.response.edit_message(
+            content="War plan poster closed.",
+            view=self.parent_view,
+        )
+
+
+class WarPlanPostView(discord.ui.View):
+    """Interactive view used to select and post stored war plans."""
+
+    def __init__(
+        self,
+        *,
+        guild: discord.Guild,
+        clan_map: Dict[str, str],
+        selected_clan: str,
+        preselected_plan: Optional[str],
+        explicit_channel: Optional[discord.TextChannel],
+        fallback_channel: Optional[discord.TextChannel],
+        timeout: float = 300,
+    ):
+        super().__init__(timeout=timeout)
+        self.guild = guild
+        self.clan_map = clan_map
+        self.message: Optional[discord.Message] = None
+
+        self.selected_clan = selected_clan
+        self.plan_store: Dict[str, Dict[str, Any]] = {}
+        self.available_plan_names: List[str] = []
+        self.selected_plan: Optional[str] = None
+        self.explicit_channel = explicit_channel
+        self.default_channel = fallback_channel
+        self.last_post_summary: Optional[str] = None
+
+        self.load_clan(selected_clan)
+        if preselected_plan and preselected_plan in self.available_plan_names:
+            self.selected_plan = preselected_plan
+        elif self.available_plan_names:
+            self.selected_plan = self.available_plan_names[0]
+
+        self.refresh_components()
+
+    def load_clan(self, clan_name: str) -> None:
+        clan_entry = _get_clan_entry(self.guild.id, clan_name)
+        war_plans: Dict[str, Dict[str, Any]] = {}
+        if isinstance(clan_entry, dict):
+            stored = clan_entry.get("war_plans")
+            if isinstance(stored, dict):
+                war_plans = stored
+        self.plan_store = war_plans
+        self.available_plan_names = sorted(self.plan_store.keys(), key=str.casefold)
+
+    def set_clan(self, clan_name: str) -> None:
+        if clan_name == self.selected_clan or clan_name not in self.clan_map:
+            return
+        self.selected_clan = clan_name
+        self.load_clan(clan_name)
+        self.selected_plan = self.available_plan_names[0] if self.available_plan_names else None
+        self.last_post_summary = None
+        self.refresh_components()
+
+    def set_plan(self, plan_name: str) -> None:
+        if plan_name not in self.plan_store:
+            return
+        self.selected_plan = plan_name
+        self.refresh_components()
+
+    def set_channel(self, channel: Optional[discord.abc.GuildChannel]) -> None:
+        self.explicit_channel = channel if isinstance(channel, discord.TextChannel) else None
+        self.refresh_components()
+
+    def get_plan_payload(self) -> Optional[Dict[str, Any]]:
+        if self.selected_plan is None:
+            return None
+        payload = self.plan_store.get(self.selected_plan)
+        return payload if isinstance(payload, dict) else None
+
+    def get_destination(self) -> Optional[discord.TextChannel]:
+        candidate = self.explicit_channel or self.default_channel
+        if not isinstance(candidate, discord.TextChannel):
+            return None
+        me = self.guild.me
+        if me is None:
+            return None
+        if not candidate.permissions_for(me).send_messages:
+            return None
+        return candidate
+
+    def get_destination_label(self) -> str:
+        candidate = self.explicit_channel or self.default_channel
+        if isinstance(candidate, discord.TextChannel):
+            me = self.guild.me
+            if me is not None and candidate.permissions_for(me).send_messages:
+                return candidate.mention
+            return f"{candidate.mention} (missing permission)"
+        if self.default_channel is not None:
+            return "Current channel"
+        return "Not selected"
+
+    @property
+    def can_preview(self) -> bool:
+        return self.get_plan_payload() is not None
+
+    @property
+    def can_post(self) -> bool:
+        return self.get_plan_payload() is not None and self.get_destination() is not None
+
+    def compose_plan_message(self) -> Optional[str]:
+        plan = self.get_plan_payload()
+        if plan is None:
+            return None
+        content = plan.get("content", "") if isinstance(plan, dict) else ""
+        header = f"📋 **War Plan — {self.selected_plan}** (Clan: `{self.selected_clan}`)"
+        return f"{header}\n\n{content}".rstrip()
+
+    def render_message(self) -> str:
+        lines = [
+            "**War Plan Poster**",
+            f"Clan: `{self.selected_clan}`",
+        ]
+        if self.selected_plan:
+            lines.append(f"Plan: `{self.selected_plan}`")
+            plan = self.get_plan_payload() or {}
+            updated = plan.get("updated_at") if isinstance(plan, dict) else None
+            if isinstance(updated, str) and updated:
+                lines.append(f"Last updated: {updated}")
+        else:
+            lines.append("Plan: None selected")
+            lines.append("Use `/save_war_plan` to create templates before posting.")
+        lines.append(f"Destination: {self.get_destination_label()}")
+        if self.last_post_summary:
+            lines.append(f"Last post: {self.last_post_summary}")
+        lines.append("")
+        lines.append("Adjust the menus below, then choose **Preview** or **Post Plan**.")
+        return "\n".join(lines)
+
+    def refresh_components(self) -> None:
+        self.clear_items()
+        self.add_item(WarPlanPostClanSelect(self))
+        self.add_item(WarPlanPostPlanSelect(self))
+        self.add_item(WarPlanPostChannelSelect(self))
+        self.add_item(WarPlanPostPreviewButton(self))
+        self.add_item(WarPlanPostSendButton(self))
+        self.add_item(WarPlanPostCloseButton(self))
+
+    async def refresh_view_message(self) -> None:
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(content=self.render_message(), view=self)
+        except discord.HTTPException as exc:
+            log.warning("Failed to refresh war plan view message: %s", exc)
+
+    async def handle_preview(self, interaction: discord.Interaction) -> None:
+        plan_message = self.compose_plan_message()
+        if plan_message is None:
+            await interaction.response.send_message(
+                "⚠️ Select a saved plan to preview first.",
+                ephemeral=True,
+            )
+            return
+        chunks = _chunk_content(plan_message)
+        if not chunks:
+            await interaction.response.send_message(
+                "⚠️ The selected plan is empty.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        for chunk in chunks:
+            await interaction.followup.send(chunk, ephemeral=True)
+
+    async def handle_post(self, interaction: discord.Interaction) -> None:
+        destination = self.get_destination()
+        if destination is None:
+            await interaction.response.send_message(
+                "⚠️ Choose a channel where I can post war plans.",
+                ephemeral=True,
+            )
+            return
+        plan_message = self.compose_plan_message()
+        if plan_message is None:
+            await interaction.response.send_message(
+                "⚠️ Select a saved plan before posting.",
+                ephemeral=True,
+            )
+            return
+        chunks = _chunk_content(plan_message)
+        if not chunks:
+            await interaction.response.send_message(
+                "⚠️ The selected plan is empty.",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            for chunk in chunks:
+                await destination.send(chunk)
+        except discord.HTTPException as exc:
+            log.warning(
+                "Failed to post war plan: guild=%s channel=%s plan=%s",
+                self.guild.id,
+                getattr(destination, "id", "?"),
+                self.selected_plan,
+                exc,
+            )
+            await interaction.followup.send(
+                f"⚠️ I couldn't post the plan: {exc}",
+                ephemeral=True,
+            )
+            return
+        timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        self.last_post_summary = f"{destination.mention} at {timestamp}"
+        await self.refresh_view_message()
+        await interaction.followup.send(
+            f"✅ Posted war plan `{self.selected_plan}` to {destination.mention}.",
+            ephemeral=True,
+        )
+
+    def disable_all_items(self) -> None:
+        for child in self.children:
+            child.disabled = True
+
+    async def on_timeout(self) -> None:
+        self.disable_all_items()
+        if self.message is not None:
+            try:
+                await self.message.edit(
+                    content="War plan poster timed out. Run `/war_plan` again to continue.",
+                    view=self,
+                )
+            except discord.HTTPException:
+                pass
+class SetClanSelect(discord.ui.Select):
+    """Select menu for choosing an existing clan or creating a new one."""
+
+    def __init__(self, parent_view: "SetClanView"):
+        self.parent_view = parent_view
+        options: List[discord.SelectOption] = [
+            discord.SelectOption(
+                label="? Create new clan",
+                value="__new__",
+                description="Add a brand new clan configuration",
+                default=parent_view.selected_name is None,
+            )
+        ]
+        for name in sorted(parent_view.clan_map.keys(), key=str.casefold):
+            options.append(
+                discord.SelectOption(
+                    label=name[:100],
+                    value=name,
+                    description=f"Tag {parent_view.clan_map[name]}",
+                    default=name == parent_view.selected_name,
+                )
+            )
+        super().__init__(
+            placeholder="Choose a clan to edit",
+            min_values=1,
+            max_values=1,
+            options=options[:25],
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        choice = self.values[0]
+        if choice == "__new__":
+            self.parent_view.start_new_clan()
+        else:
+            self.parent_view.load_clan(choice)
+        if interaction.message is not None:
+            self.parent_view.message = interaction.message
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
+
+
+class SetClanNameModal(discord.ui.Modal):
+    """Modal used to create or rename a clan entry."""
+
+    def __init__(self, parent_view: "SetClanView"):
+        super().__init__(title="Set Clan Name", timeout=None)
+        self.parent_view = parent_view
+        self.name_input = discord.ui.TextInput(
+            label="Clan name",
+            placeholder="e.g. Phoenix Reborn",
+            default=parent_view.selected_name or "",
+            max_length=80,
+        )
+        self.add_item(self.name_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        new_name = self.name_input.value.strip()
+        if not new_name:
+            await interaction.response.send_message("Clan name cannot be empty.", ephemeral=True)
+            return
+        if (
+            new_name in self.parent_view.clan_map
+            and new_name != self.parent_view.original_name
+        ):
+            await interaction.response.send_message(
+                f"`{new_name}` is already configured. Choose another name or select it from the dropdown.",
+                ephemeral=True,
+            )
+            return
+        self.parent_view.set_name(new_name)
+        await interaction.response.send_message(
+            f"Clan name set to `{new_name}`.",
+            ephemeral=True,
+        )
+        await self.parent_view.refresh_view_message()
+
+
+class SetClanTagModal(discord.ui.Modal):
+    """Modal used to validate and store the clan tag."""
+
+    def __init__(self, parent_view: "SetClanView"):
+        super().__init__(title="Set Clan Tag", timeout=None)
+        self.parent_view = parent_view
+        self.tag_input = discord.ui.TextInput(
+            label="Clan tag",
+            placeholder="#ABC123",
+            default=parent_view.tag or "",
+            max_length=20,
+        )
+        self.add_item(self.tag_input)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        raw_tag = self.tag_input.value
+        normalized = _normalise_clan_tag(raw_tag)
+        if normalized is None:
+            await interaction.response.send_message(
+                "Please provide a valid clan tag like `#ABC123`.",
+                ephemeral=True,
+            )
+            return
+        try:
+            clan_payload = await client.get_clan(normalized)
+        except coc.errors.NotFound:
+            await interaction.response.send_message(
+                f"I couldn't find a clan with tag `{normalized}`.",
+                ephemeral=True,
+            )
+            return
+        except Exception as exc:
+            await interaction.response.send_message(
+                f"Unable to verify that tag right now: {exc}",
+                ephemeral=True,
+            )
+            return
+
+        self.parent_view.set_tag(normalized, api_name=clan_payload.get("name"))
+        await interaction.response.send_message(
+            f"Clan tag set to `{normalized}`.",
+            ephemeral=True,
+        )
+        await self.parent_view.refresh_view_message()
+
+
+class SetClanToggleAlertsButton(discord.ui.Button):
+    """Toggle war alert automation for the clan."""
+
+    def __init__(self, parent_view: "SetClanView"):
+        self.parent_view = parent_view
+        label = "Alerts: On" if parent_view.enable_alerts else "Alerts: Off"
+        style = discord.ButtonStyle.success if parent_view.enable_alerts else discord.ButtonStyle.secondary
+        super().__init__(label=label, style=style, row=2)
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        self.parent_view.enable_alerts = not self.parent_view.enable_alerts
+        self.parent_view.unsaved_changes = True
+        self.parent_view.refresh_components()
+        if interaction.message is not None:
+            self.parent_view.message = interaction.message
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
+
+
+class SetClanSaveButton(discord.ui.Button):
+    """Persist the current clan settings."""
+
+    def __init__(self, parent_view: "SetClanView"):
+        super().__init__(label="Save Clan", style=discord.ButtonStyle.success, row=3)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        await self.parent_view.handle_save(interaction)
+
+
+class SetClanDeleteButton(discord.ui.Button):
+    """Delete the currently selected clan configuration."""
+
+    def __init__(self, parent_view: "SetClanView"):
+        super().__init__(label="Delete Clan", style=discord.ButtonStyle.danger, row=3)
+        self.parent_view = parent_view
+        if not parent_view.can_delete_current_clan:
+            self.disabled = True
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        await self.parent_view.handle_delete(interaction)
+
+
+class SetClanCancelButton(discord.ui.Button):
+    """Close the clan editor without making further changes."""
+
+    def __init__(self, parent_view: "SetClanView"):
+        super().__init__(label="Close", style=discord.ButtonStyle.secondary, row=4)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        self.parent_view.disable_all_items()
+        await interaction.response.edit_message(
+            content="Clan management closed.",
+            view=self.parent_view,
+        )
+
+
+class SetClanView(discord.ui.View):
+    """Interactive interface for creating or updating clan mappings."""
+
+    def __init__(
+        self,
+        *,
+        guild: discord.Guild,
+        actor: discord.Member,
+        selected_clan: Optional[str],
+        timeout: float = 300,
+    ):
+        super().__init__(timeout=timeout)
+        self.guild = guild
+        self.message: Optional[discord.Message] = None
+        self.guild_config = _ensure_guild_config(guild.id)
+        self.clans: Dict[str, Any] = self.guild_config.setdefault("clans", {})
+        self.clan_map = _clan_names_for_guild(guild.id)
+
+        self.original_name: Optional[str] = None
+        self.selected_name: Optional[str] = None
+        self.tag: Optional[str] = None
+        self.enable_alerts: bool = True
+        self.alert_channel_id: Optional[int] = None
+        self.unsaved_changes: bool = False
+
+        if selected_clan and selected_clan in self.clans:
+            self.load_clan(selected_clan)
+        else:
+            self.start_new_clan()
+
+        self.refresh_components()
+
+    @property
+    def can_delete_current_clan(self) -> bool:
+        return self.original_name is not None
+
+    def load_clan(self, clan_name: str) -> None:
+        entry = self.clans.get(clan_name)
+        if not isinstance(entry, dict):
+            self.start_new_clan()
+            return
+        alerts = entry.get("alerts", {}) if isinstance(entry.get("alerts"), dict) else {}
+        self.original_name = clan_name
+        self.selected_name = clan_name
+        tag = entry.get("tag")
+        self.tag = _normalise_clan_tag(tag) if isinstance(tag, str) else None
+        self.enable_alerts = bool(alerts.get("enabled", False))
+        channel_id = alerts.get("channel_id")
+        self.alert_channel_id = channel_id if isinstance(channel_id, int) else None
+        self.unsaved_changes = False
+        self.clan_map = _clan_names_for_guild(self.guild.id)
+        self.refresh_components()
+
+    def start_new_clan(self) -> None:
+        self.original_name = None
+        self.selected_name = None
+        self.tag = None
+        self.enable_alerts = True
+        self.alert_channel_id = None
+        self.unsaved_changes = False
+        self.refresh_components()
+
+    def set_name(self, name: str) -> None:
+        self.selected_name = name
+        if self.original_name is None:
+            self.original_name = None
+        self.unsaved_changes = True
+        self.refresh_components()
+
+    def set_tag(self, tag: str, *, api_name: Optional[str]) -> None:
+        self.tag = tag
+        if api_name and (self.original_name is None or self.selected_name is None):
+            inferred = api_name.strip()
+            if inferred and inferred not in self.clan_map:
+                self.selected_name = inferred
+        self.unsaved_changes = True
+        self.refresh_components()
+
+    def refresh_components(self) -> None:
+        self.clear_items()
+        self.clan_map = _clan_names_for_guild(self.guild.id)
+        self.add_item(SetClanSelect(self))
+        self.add_item(SetClanToggleAlertsButton(self))
+        self.add_item(SetClanSaveButton(self))
+        self.add_item(SetClanDeleteButton(self))
+        self.add_item(SetClanCancelButton(self))
+
+    def render_message(self) -> str:
+        name_display = self.selected_name or "(unsaved clan)"
+        tag_display = self.tag or "(not set)"
+        alerts_text = "Enabled" if self.enable_alerts else "Disabled"
+        channel_text = "None"
+        if isinstance(self.alert_channel_id, int):
+            channel_obj = self.guild.get_channel(self.alert_channel_id)
+            if isinstance(channel_obj, discord.TextChannel):
+                channel_text = channel_obj.mention
+            else:
+                channel_text = f"<#{self.alert_channel_id}>"
+        return "\n".join(
+            [
+                "**Clan Manager**",
+                f"Clan name: `{name_display}`",
+                f"Clan tag: {tag_display}",
+                f"War alerts: {alerts_text}",
+                f"Alert channel: {channel_text}",
+                "",
+                "Use the buttons below to set the clan name, verify the tag, toggle alerts, and save your changes.",
+            ]
+        )
+
+    def disable_all_items(self) -> None:
+        for item in self.children:
+            item.disabled = True
+
+    async def on_timeout(self) -> None:
+        self.disable_all_items()
+        if self.message is not None:
+            try:
+                await self.message.edit(
+                    content="Clan management timed out. Run `/set_clan` again to continue.",
+                    view=self,
+                )
+            except discord.HTTPException:
+                pass
+
+    async def handle_save(self, interaction: discord.Interaction) -> None:
+        if not self.selected_name:
+            await interaction.response.send_message(
+                "Set a clan name before saving.",
+                ephemeral=True,
+            )
+            return
+        if not self.tag:
+            await interaction.response.send_message(
+                "Set a clan tag before saving.",
+                ephemeral=True,
+            )
+            return
+
+        normalized_tag = _normalise_clan_tag(self.tag)
+        if normalized_tag is None:
+            await interaction.response.send_message(
+                "The stored tag is invalid. Please set it again.",
+                ephemeral=True,
+            )
+            return
+
+        clans = self.guild_config.setdefault("clans", {})
+        conflicting = next(
+            (
+                name
+                for name, data in clans.items()
+                if name not in {self.original_name, self.selected_name}
+                and isinstance(data, dict)
+                and _normalise_clan_tag(str(data.get("tag", ""))) == normalized_tag
+            ),
+            None,
+        )
+        if conflicting:
+            await interaction.response.send_message(
+                f"That tag is already linked to `{conflicting}`. Remove it first or choose another tag.",
+                ephemeral=True,
+            )
+            return
+
+        response, followup = _apply_clan_update(
+            self.guild,
+            self.selected_name,
+            normalized_tag,
+            self.enable_alerts,
+            preserve_channel=self.alert_channel_id,
+        )
+
+        if self.original_name and self.original_name != self.selected_name:
+            clans.pop(self.original_name, None)
+            save_server_config()
+
+        self.clan_map = _clan_names_for_guild(self.guild.id)
+        self.load_clan(self.selected_name)
+
+        if not interaction.response.is_done():
+            await interaction.response.send_message(response, ephemeral=True)
+            if followup:
+                await interaction.followup.send(followup, ephemeral=True)
+        else:
+            await interaction.followup.send(response, ephemeral=True)
+            if followup:
+                await interaction.followup.send(followup, ephemeral=True)
+        await self.refresh_view_message()
+
+    async def handle_delete(self, interaction: discord.Interaction) -> None:
+        if not self.original_name:
+            await interaction.response.send_message(
+                "Select an existing clan before deleting.",
+                ephemeral=True,
+            )
+            return
+        clans = self.guild_config.setdefault("clans", {})
+        if self.original_name in clans:
+            clans.pop(self.original_name, None)
+            save_server_config()
+        self.clan_map = _clan_names_for_guild(self.guild.id)
+        if self.clan_map:
+            first = next(iter(self.clan_map.keys()))
+            self.load_clan(first)
+        else:
+            self.start_new_clan()
+        await interaction.response.send_message(
+            f"Deleted clan `{self.original_name}`.",
+            ephemeral=True,
+        )
+        await self.refresh_view_message()
+
+    def set_tag_value(self, tag: Optional[str]) -> None:
+        self.tag = tag
+
+    def set_name_value(self, name: Optional[str]) -> None:
+        self.selected_name = name
+
+class SeasonSummaryClanSelect(discord.ui.Select):
+    """Select menu for choosing which clan to summarise."""
+
+    def __init__(self, parent_view: "SeasonSummaryView"):
+        self.parent_view = parent_view
+        options = [
+            discord.SelectOption(
+                label=name,
+                value=name,
+                default=name == parent_view.selected_clan,
+            )
+            for name in sorted(parent_view.clan_map.keys(), key=str.casefold)
+        ]
+        super().__init__(
+            placeholder="Choose a clan",
+            min_values=1,
+            max_values=1,
+            options=options[:25],
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        self.parent_view.set_clan(self.values[0])
+        if interaction.message is not None:
+            self.parent_view.message = interaction.message
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
+
+
+class SeasonSummaryChannelSelect(discord.ui.ChannelSelect):
+    """Channel selector to override the posting destination."""
+
+    def __init__(self, parent_view: "SeasonSummaryView"):
+        self.parent_view = parent_view
+        default_values = []
+        if parent_view.channel_id is not None:
+            channel = parent_view.guild.get_channel(parent_view.channel_id)
+            if isinstance(channel, discord.TextChannel):
+                default_values = [channel]
+        super().__init__(
+            placeholder="Override destination channel (optional)",
+            min_values=0,
+            max_values=1,
+            channel_types=[discord.ChannelType.text],
+            default_values=default_values,
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        channel = self.values[0] if self.values else None
+        self.parent_view.set_channel(channel)
+        if interaction.message is not None:
+            self.parent_view.message = interaction.message
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
+
+
+class SeasonSummaryToggleButton(discord.ui.Button):
+    """Toggle button for enabling sections."""
+
+    def __init__(self, parent_view: "SeasonSummaryView", attr: str, label: str, *, row: int):
+        self.parent_view = parent_view
+        self.attr = attr
+        enabled = getattr(parent_view, attr)
+        style = discord.ButtonStyle.success if enabled else discord.ButtonStyle.secondary
+        text = f"{label}: {'On' if enabled else 'Off'}"
+        super().__init__(label=text, style=style, row=row)
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        current = getattr(self.parent_view, self.attr)
+        setattr(self.parent_view, self.attr, not current)
+        self.parent_view.refresh_components()
+        if interaction.message is not None:
+            self.parent_view.message = interaction.message
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
+
+
+class SeasonSummaryPreviewButton(discord.ui.Button):
+    """Button that provides an ephemeral preview."""
+
+    def __init__(self, parent_view: "SeasonSummaryView"):
+        super().__init__(label="Preview Summary", style=discord.ButtonStyle.secondary, row=3)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        try:
+            payload, _ = await self.parent_view.compose_summary()
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        await interaction.response.send_message(payload, ephemeral=True)
+
+
+class SeasonSummaryPostButton(discord.ui.Button):
+    """Button that posts the summary to the selected channel."""
+
+    def __init__(self, parent_view: "SeasonSummaryView"):
+        super().__init__(label="Post Summary", style=discord.ButtonStyle.success, row=3)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        await self.parent_view.handle_post(interaction)
+
+
+class SeasonSummaryCancelButton(discord.ui.Button):
+    """Button that closes the summary view."""
+
+    def __init__(self, parent_view: "SeasonSummaryView"):
+        super().__init__(label="Close", style=discord.ButtonStyle.secondary, row=4)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        self.parent_view.disable_all_items()
+        await interaction.response.edit_message(
+            content="Season summary cancelled.",
+            view=self.parent_view,
+        )
+
+
+class SeasonSummaryView(discord.ui.View):
+    """Interactive view that guides administrators through posting a season summary."""
+
+    def __init__(
+        self,
+        *,
+        guild: discord.Guild,
+        actor: discord.Member,
+        clan_map: Dict[str, str],
+        selected_clan: str,
+        include_donations: bool,
+        include_wars: bool,
+        include_members: bool,
+        channel_id: Optional[int],
+        fallback_channel_id: Optional[int],
+        timeout: float = 300,
+    ):
+        super().__init__(timeout=timeout)
+        self.guild = guild
+        self.clan_map = clan_map
+        self.message: Optional[discord.Message] = None
+
+        self.selected_clan = selected_clan
+        self.include_donations = include_donations
+        self.include_wars = include_wars
+        self.include_members = include_members
+        self.channel_id = channel_id
+        self.fallback_channel_id = fallback_channel_id
+
+        self.refresh_components()
+
+    def refresh_components(self) -> None:
+        self.clear_items()
+        self.add_item(SeasonSummaryClanSelect(self))
+        self.add_item(SeasonSummaryChannelSelect(self))
+        self.add_item(SeasonSummaryToggleButton(self, "include_donations", "Donations", row=2))
+        self.add_item(SeasonSummaryToggleButton(self, "include_wars", "Wars", row=2))
+        self.add_item(SeasonSummaryToggleButton(self, "include_members", "Members", row=2))
+        self.add_item(SeasonSummaryPreviewButton(self))
+        self.add_item(SeasonSummaryPostButton(self))
+        self.add_item(SeasonSummaryCancelButton(self))
+
+    def render_message(self) -> str:
+        sections = []
+        if self.include_donations:
+            sections.append("Donations")
+        if self.include_wars:
+            sections.append("Wars")
+        if self.include_members:
+            sections.append("Members")
+        sections_text = ", ".join(sections) if sections else "None selected"
+
+        channel_display = "Default channel"
+        destination = self.resolve_destination()
+        if destination is not None:
+            channel_display = destination.mention
+        elif self.channel_id is not None:
+            channel_display = f"<#{self.channel_id}>"
+
+        return "\n".join(
+            [
+                "**Season Summary Composer**",
+                f"Clan: `{self.selected_clan}`",
+                f"Sections: {sections_text}",
+                f"Destination: {channel_display}",
+                "",
+                "Adjust the options below, preview if needed, then press **Post Summary**.",
+            ]
+        )
+
+    def set_clan(self, clan_name: str) -> None:
+        if clan_name not in self.clan_map or clan_name == self.selected_clan:
+            return
+        self.selected_clan = clan_name
+        if self.channel_id is None:
+            default_id = self.default_channel_id(clan_name)
+            if default_id is not None:
+                self.channel_id = default_id
+        self.refresh_components()
+
+    def set_channel(self, channel: Optional[discord.abc.GuildChannel]) -> None:
+        if isinstance(channel, discord.TextChannel):
+            self.channel_id = channel.id
+        else:
+            self.channel_id = None
+
+    def default_channel_id(self, clan_name: str) -> Optional[int]:
+        clan_entry = _get_clan_entry(self.guild.id, clan_name)
+        if isinstance(clan_entry, dict):
+            channel_id = clan_entry.get("season_summary", {}).get("channel_id")
+            if isinstance(channel_id, int):
+                return channel_id
+        return None
+
+    def resolve_destination(self) -> Optional[discord.TextChannel]:
+        if self.channel_id is not None:
+            channel = self.guild.get_channel(self.channel_id)
+            if isinstance(channel, discord.TextChannel):
+                return channel
+        default_id = self.default_channel_id(self.selected_clan)
+        if isinstance(default_id, int):
+            channel = self.guild.get_channel(default_id)
+            if isinstance(channel, discord.TextChannel):
+                return channel
+        if isinstance(self.fallback_channel_id, int):
+            channel = self.guild.get_channel(self.fallback_channel_id)
+            if isinstance(channel, discord.TextChannel):
+                return channel
+        return None
+
+    async def compose_summary(self) -> Tuple[str, Optional[int]]:
+        clan_entry = _get_clan_entry(self.guild.id, self.selected_clan)
+        if clan_entry is None:
+            raise ValueError(f"`{self.selected_clan}` is not configured.")
+        return await _compose_season_summary(
+            self.guild,
+            self.selected_clan,
+            clan_entry,
+            include_donations=self.include_donations,
+            include_wars=self.include_wars,
+            include_members=self.include_members,
+        )
+
+    async def handle_post(self, interaction: discord.Interaction) -> None:
+        try:
+            payload, default_channel_id = await self.compose_summary()
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+
+        destination = self.resolve_destination()
+        if destination is None:
+            if isinstance(default_channel_id, int):
+                destination = self.guild.get_channel(default_channel_id)  # type: ignore[assignment]
+        if destination is None and isinstance(self.fallback_channel_id, int):
+            destination = self.guild.get_channel(self.fallback_channel_id)  # type: ignore[assignment]
+        if destination is None and isinstance(interaction.channel, discord.TextChannel):
+            destination = interaction.channel
+
+        if destination is None:
+            await interaction.response.send_message(
+                "I couldn't find a suitable channel to post the summary.",
+                ephemeral=True,
+            )
+            return
+        if not destination.permissions_for(destination.guild.me).send_messages:
+            await interaction.response.send_message(
+                "I don't have permission to post in the selected channel.",
+                ephemeral=True,
+            )
+            return
+
+        for chunk in _chunk_content(payload):
+            await destination.send(chunk)
+
+        await interaction.response.send_message(
+            f"Season summary posted to {destination.mention}.",
+            ephemeral=True,
+        )
+        self.disable_all_items()
+        if self.message is not None:
+            try:
+                await self.message.edit(
+                    content=f"Season summary posted to {destination.mention}.",
+                    view=self,
+                )
+            except discord.HTTPException:
+                pass
+
+    def disable_all_items(self) -> None:
+        for child in self.children:
+            child.disabled = True
+
+    async def on_timeout(self) -> None:
+        self.disable_all_items()
+        if self.message is not None:
+            try:
+                await self.message.edit(
+                    content="Season summary session timed out. Run `/season_summary` again to restart.",
+                    view=self,
+                )
+            except discord.HTTPException:
+                pass
+
+class LinkPlayerModal(discord.ui.Modal):
+    """Modal dialog to link or unlink player tags during onboarding."""
+
+    def __init__(self, parent_view: "RegisterMeView", *, action: Literal["link", "unlink"]):
+        title = "Link Clash Account" if action == "link" else "Unlink Clash Account"
+        super().__init__(title=title, timeout=None)
+        self.parent_view = parent_view
+        self.action = action
+        self.player_tag = discord.ui.TextInput(
+            label="Player tag",
+            placeholder="#ABC123",
+            max_length=20,
+        )
+        self.add_item(self.player_tag)
+        self.alias: Optional[discord.ui.TextInput]
+        if action == "link":
+            alias_input = discord.ui.TextInput(
+                label="Alias (optional)",
+                placeholder="In-game name or nickname",
+                required=False,
+                max_length=50,
+            )
+            self.add_item(alias_input)
+            self.alias = alias_input
+        else:
+            self.alias = None
+
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        member = self.parent_view.member
+        guild = self.parent_view.guild
+        actor = (
+            interaction.user
+            if isinstance(interaction.user, discord.Member)
+            else guild.get_member(interaction.user.id)  # type: ignore[arg-type]
+        )
+
+        if actor is None:
+            await interaction.response.send_message(
+                "⚠️ I couldn't resolve your guild membership. Please try again.",
+                ephemeral=True,
+            )
+            return
+
+        if actor.id != member.id and not actor.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "⚠️ Only the member themselves or an administrator can manage linked tags from this view.",
+                ephemeral=True,
+            )
+            return
+
+        alias_value: Optional[str] = None
+        if self.alias is not None:
+            raw_alias = self.alias.value.strip()
+            alias_value = raw_alias or None
+
+        try:
+            message = await _link_player_account(
+                guild=guild,
+                actor=actor,
+                target=member,
+                action=self.action,
+                player_tag=self.player_tag.value,
+                alias=alias_value,
+            )
+        except PlayerLinkError as exc:
+            await interaction.response.send_message(exc.message, ephemeral=True)
+            return
+
+        self.parent_view.refresh_components()
+        updated_intro = self.parent_view.build_intro_message()
+        parent_message = getattr(self.parent_view, "message", None)
+        if parent_message is not None:
+            try:
+                await parent_message.edit(content=updated_intro, view=self.parent_view)
+            except discord.HTTPException as exc:
+                log.warning("Failed to refresh register_me message after linking: %s", exc)
+        else:
+            log.debug("RegisterMeView message handle missing; skipping intro refresh")
+
+        await interaction.response.send_message(message, ephemeral=True)
+
+class LinkPlayerSelect(discord.ui.Select):
+    """Select menu that manages link/unlink actions for Clash accounts."""
+
+    def __init__(self, parent_view: "RegisterMeView", existing_accounts: List[Dict[str, Optional[str]]]):
+        options: List[discord.SelectOption] = [
+            discord.SelectOption(
+                label="Link new Clash account",
+                description="Add a new player tag",
+                value="link-new",
+                emoji="➕",
+            )
+        ]
+        for record in existing_accounts:
+            tag = record.get("tag")
+            if not isinstance(tag, str) or not tag.strip():
+                continue
+            alias = record.get("alias")
+            display = f"{alias} ({tag})" if isinstance(alias, str) and alias else tag
+            options.append(
+                discord.SelectOption(
+                    label=f"Remove {display}",
+                    description="Unlink this account",
+                    value=f"unlink|{tag}",
+                    emoji="🗑️",
+                )
+            )
+        super().__init__(
+            placeholder="Manage linked Clash accounts",
+            min_values=1,
+            max_values=1,
+            options=options[:25],
+            row=0,
+        )
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message(
+                "⚠️ I couldn't resolve your guild membership. Please try again.",
+                ephemeral=True,
+            )
+            return
+
+        member = self.parent_view.member
+        actor = interaction.user
+        if actor.id != member.id and not actor.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "⚠️ Only the member themselves or an administrator can manage linked tags from this view.",
+                ephemeral=True,
+            )
+            return
+
+        selection = self.values[0]
+        if selection == "link-new":
+            if interaction.message is not None:
+                self.parent_view.message = interaction.message
+            await interaction.response.send_modal(LinkPlayerModal(self.parent_view, action="link"))
+            return
+
+        if not selection.startswith("unlink|"):
+            await interaction.response.send_message(
+                "⚠️ Unknown selection received. Please try again.",
+                ephemeral=True,
+            )
+            return
+
+        tag = selection.split("|", 1)[1]
+        try:
+            message = await _link_player_account(
+                guild=self.parent_view.guild,
+                actor=actor,
+                target=member,
+                action="unlink",
+                player_tag=tag,
+                alias=None,
+            )
+        except PlayerLinkError as exc:
+            await interaction.response.send_message(exc.message, ephemeral=True)
+            return
+
+        self.parent_view.refresh_components()
+        updated_intro = self.parent_view.build_intro_message()
+        parent_message = getattr(self.parent_view, "message", None)
+        if interaction.message is not None:
+            self.parent_view.message = interaction.message
+            parent_message = interaction.message
+        if parent_message is not None:
+            try:
+                await parent_message.edit(content=updated_intro, view=self.parent_view)
+            except discord.HTTPException as exc:
+                log.warning("Failed to refresh register_me message after unlinking: %s", exc)
+        else:
+            log.debug("RegisterMeView message handle missing; skipping intro refresh")
+
+        await interaction.response.send_message(
+            message + " You can relink it anytime with `/link_player action:link`.",
+            ephemeral=True,
+        )
+
+class WarNudgeReasonModal(discord.ui.Modal):
+    """Modal used to capture reason metadata when saving."""
+
+    def __init__(self, parent_view: "WarNudgeConfigView"):
+        super().__init__(title="Save War Nudge Reason", timeout=None)
+        self.parent_view = parent_view
+
+        self.reason_name = discord.ui.TextInput(
+            label="Reason name",
+            placeholder="e.g. Missed First Attack",
+            max_length=80,
+            default=parent_view.pending_reason_name or "",
+        )
+        self.add_item(self.reason_name)
+
+        self.description = discord.ui.TextInput(
+            label="Description (optional)",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=500,
+            default=parent_view.pending_reason_description or "",
+        )
+        self.add_item(self.description)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await self.parent_view.handle_reason_modal_submit(
+            interaction,
+            name=self.reason_name.value.strip(),
+            description=self.description.value.strip(),
+        )
+
+
+class WarNudgeClanSelect(discord.ui.Select):
+    """Select menu for choosing which clan to configure."""
+
+    def __init__(self, parent_view: "WarNudgeConfigView", clan_map: Dict[str, str]):
+        self.parent_view = parent_view
+        options = [
+            discord.SelectOption(
+                label=name,
+                value=name,
+                default=name == parent_view.clan_name,
+            )
+            for name in sorted(clan_map.keys(), key=str.casefold)
+        ]
+        super().__init__(
+            placeholder="Select a clan to configure",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        new_clan = self.values[0]
+        self.parent_view.set_clan(new_clan)
+        self.parent_view.refresh_components()
+        self.parent_view.message = interaction.message
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
+
+
+class WarNudgeReasonSelect(discord.ui.Select):
+    """Select menu for picking an existing reason or creating a new one."""
+
+    def __init__(self, parent_view: "WarNudgeConfigView", reasons: List[Dict[str, Any]]):
+        self.parent_view = parent_view
+        options: List[discord.SelectOption] = [
+            discord.SelectOption(
+                label="➕ Create new reason",
+                value="__new__",
+                description="Define a brand new war nudge reason",
+                default=parent_view.selected_reason_name == "__new__",
+            )
+        ]
+        for reason in reasons:
+            name = reason.get("name", "Unnamed")
+            options.append(
+                discord.SelectOption(
+                    label=name,
+                    value=name,
+                    description=f"Type: {reason.get('type', 'unknown')}",
+                    default=name == parent_view.selected_reason_name,
+                )
+            )
+        super().__init__(
+            placeholder="Select a reason to edit or create a new one",
+            min_values=1,
+            max_values=1,
+            options=options[:25],
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        choice = self.values[0]
+        self.parent_view.set_reason(choice)
+        self.parent_view.refresh_components()
+        self.parent_view.message = interaction.message
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
+
+
+class WarNudgeTypeSelect(discord.ui.Select):
+    """Select menu for adjusting the reason type."""
+
+    def __init__(self, parent_view: "WarNudgeConfigView"):
+        self.parent_view = parent_view
+        options = [
+            discord.SelectOption(
+                label=reason_type.replace("_", " ").title(),
+                value=reason_type,
+                default=reason_type == parent_view.selected_reason_type,
+            )
+            for reason_type in WAR_NUDGE_REASONS
+        ]
+        super().__init__(
+            placeholder="Select the reason type",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=2,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        self.parent_view.selected_reason_type = self.values[0]
+        self.parent_view.message = interaction.message
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
+
+
+class WarNudgeRoleSelect(discord.ui.RoleSelect):
+    """Role selector for specifying who to mention."""
+
+    def __init__(self, parent_view: "WarNudgeConfigView"):
+        self.parent_view = parent_view
+        default_role = None
+        if parent_view.selected_role_id is not None:
+            default_role = parent_view.guild.get_role(parent_view.selected_role_id)
+        default_values = [default_role] if default_role is not None else []
+        super().__init__(
+            placeholder="Mention role (optional)",
+            min_values=0,
+            max_values=1,
+            default_values=default_values,
+            row=3,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        role = self.values[0] if self.values else None
+        self.parent_view.selected_role_id = role.id if role else None
+        self.parent_view.message = interaction.message
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
+
+
+class WarNudgeMemberSelect(discord.ui.UserSelect):
+    """Member selector for specifying a direct mention."""
+
+    def __init__(self, parent_view: "WarNudgeConfigView"):
+        self.parent_view = parent_view
+        default_member = None
+        if parent_view.selected_user_id is not None:
+            default_member = parent_view.guild.get_member(parent_view.selected_user_id)
+        default_values = [default_member] if default_member is not None else []
+        super().__init__(
+            placeholder="Mention member (optional)",
+            min_values=0,
+            max_values=1,
+            default_values=default_values,
+            row=3,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        member = self.values[0] if self.values else None
+        self.parent_view.selected_user_id = member.id if member else None
+        self.parent_view.message = interaction.message
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
+
+
+class SaveWarNudgeButton(discord.ui.Button):
+    """Button that triggers saving (adding/updating) a reason."""
+
+    def __init__(self, parent_view: "WarNudgeConfigView"):
+        super().__init__(label="Save Reason", style=discord.ButtonStyle.success, row=4)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        if not self.parent_view.selected_reason_type:
+            await interaction.response.send_message(
+                "⚠️ Choose a reason type before saving.",
+                ephemeral=True,
+            )
+            return
+        if not (self.parent_view.selected_role_id or self.parent_view.selected_user_id):
+            await interaction.response.send_message(
+                "⚠️ Please choose at least one role or member to mention.",
+                ephemeral=True,
+            )
+            return
+        self.parent_view.message = interaction.message
+        self.parent_view.pending_reason_name = (
+            None if self.parent_view.selected_reason_name == "__new__" else self.parent_view.selected_reason_name
+        )
+        self.parent_view.pending_reason_description = self.parent_view.selected_description or ""
+        await interaction.response.send_modal(WarNudgeReasonModal(self.parent_view))
+
+
+class RemoveWarNudgeButton(discord.ui.Button):
+    """Button for removing the currently selected reason."""
+
+    def __init__(self, parent_view: "WarNudgeConfigView"):
+        super().__init__(label="Remove Reason", style=discord.ButtonStyle.danger, row=4)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        if self.parent_view.selected_reason_name == "__new__":
+            await interaction.response.send_message(
+                "⚠️ Select an existing reason before removing.",
+                ephemeral=True,
+            )
+            return
+        self.parent_view.message = interaction.message
+        await self.parent_view.remove_selected_reason(interaction)
+
+
+class ListWarNudgeButton(discord.ui.Button):
+    """Button that displays all configured reasons for the current clan."""
+
+    def __init__(self, parent_view: "WarNudgeConfigView"):
+        super().__init__(label="List Reasons", style=discord.ButtonStyle.primary, row=4)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        await self.parent_view.send_reason_list(interaction)
+
+
+class WarNudgeConfigView(discord.ui.View):
+    """Interactive interface for managing war nudge reasons."""
+
+    def __init__(self, guild: discord.Guild, clan_name: str, *, timeout: float = 300):
+        super().__init__(timeout=timeout)
+        self.guild = guild
+        self.message: Optional[discord.Message] = None
+        self.clan_map = _clan_names_for_guild(guild.id)
+        self.clan_name = clan_name if clan_name in self.clan_map else next(iter(self.clan_map), None)
+        self.selected_reason_name = "__new__"
+        self.selected_reason_type = WAR_NUDGE_REASONS[0]
+        self.selected_role_id: Optional[int] = None
+        self.selected_user_id: Optional[int] = None
+        self.selected_description: str = ""
+        self.pending_reason_name: Optional[str] = None
+        self.pending_reason_description: Optional[str] = None
+        self.refresh_state()
+        self.refresh_components()
+
+    def refresh_state(self) -> None:
+        clan_entry = _get_clan_entry(self.guild.id, self.clan_name) if self.clan_name else None
+        war_nudge = clan_entry.get("war_nudge", {}) if isinstance(clan_entry, dict) else {}
+        self.reasons: List[Dict[str, Any]] = war_nudge.get("reasons", [])
+
+        if self.selected_reason_name != "__new__":
+            matched = next(
+                (reason for reason in self.reasons if reason.get("name", "").lower() == self.selected_reason_name.lower()),
+                None,
+            )
+            if matched is None:
+                self.selected_reason_name = "__new__"
+                self.selected_reason_type = WAR_NUDGE_REASONS[0]
+                self.selected_role_id = None
+                self.selected_user_id = None
+                self.selected_description = ""
+            else:
+                self.selected_reason_type = matched.get("type", WAR_NUDGE_REASONS[0])
+                self.selected_role_id = matched.get("mention_role_id")
+                self.selected_user_id = matched.get("mention_user_id")
+                self.selected_description = matched.get("description", "")
+
+    def refresh_components(self) -> None:
+        self.clear_items()
+        clan_map = _clan_names_for_guild(self.guild.id)
+        if not clan_map:
+            return
+        clan_entry = _get_clan_entry(self.guild.id, self.clan_name) if self.clan_name else None
+        if isinstance(clan_entry, dict):
+            reasons = list(clan_entry.get("war_nudge", {}).get("reasons", []))
+        else:
+            reasons = []
+
+        self.add_item(WarNudgeClanSelect(self, clan_map))
+        self.add_item(WarNudgeReasonSelect(self, reasons))
+        self.add_item(WarNudgeTypeSelect(self))
+        self.add_item(WarNudgeRoleSelect(self))
+        self.add_item(WarNudgeMemberSelect(self))
+        self.add_item(SaveWarNudgeButton(self))
+        self.add_item(RemoveWarNudgeButton(self))
+        self.add_item(ListWarNudgeButton(self))
+
+    def set_clan(self, clan_name: str) -> None:
+        self.clan_name = clan_name
+        self.selected_reason_name = "__new__"
+        self.selected_reason_type = WAR_NUDGE_REASONS[0]
+        self.selected_role_id = None
+        self.selected_user_id = None
+        self.selected_description = ""
+        self.refresh_state()
+
+    def set_reason(self, value: str) -> None:
+        self.selected_reason_name = value
+        if value == "__new__":
+            self.selected_reason_type = WAR_NUDGE_REASONS[0]
+            self.selected_role_id = None
+            self.selected_user_id = None
+            self.selected_description = ""
+        self.refresh_state()
+
+    def render_message(self) -> str:
+        if not self.clan_name:
+            return (
+                "⚠️ No clans are configured yet. Use `/set_clan` to add one before managing war nudges."
+            )
+        description_line = self.selected_description or "No description set."
+        target_summary = []
+        if self.selected_role_id:
+            role = self.guild.get_role(self.selected_role_id)
+            if role:
+                target_summary.append(role.mention)
+        if self.selected_user_id:
+            member = self.guild.get_member(self.selected_user_id)
+            if member:
+                target_summary.append(member.mention)
+        if not target_summary:
+            target_summary.append("_No mention target selected_")
+        reason_label = "New reason" if self.selected_reason_name == "__new__" else f"`{self.selected_reason_name}`"
+        return (
+            f"**Clan:** `{self.clan_name}`\n"
+            f"**Reason:** {reason_label}\n"
+            f"**Type:** `{self.selected_reason_type}`\n"
+            f"**Targets:** {' '.join(target_summary)}\n"
+            f"**Description:** {description_line}\n\n"
+            "Use the controls below to add, update, or remove war nudge reasons."
+        )
+
+    async def handle_reason_modal_submit(self, interaction: discord.Interaction, *, name: str, description: str) -> None:
+        if not name:
+            await interaction.response.send_message(
+                "⚠️ Reason name cannot be empty.",
+                ephemeral=True,
+            )
+            return
+        if not (self.selected_role_id or self.selected_user_id):
+            await interaction.response.send_message(
+                "⚠️ Please choose at least one role or member to mention.",
+                ephemeral=True,
+            )
+            return
+
+        clan_entry = _get_clan_entry(self.guild.id, self.clan_name)
+        war_nudge = clan_entry.setdefault("war_nudge", {})
+        reasons: List[Dict[str, Any]] = war_nudge.setdefault("reasons", [])
+
+        payload = {
+            "name": name,
+            "type": self.selected_reason_type,
+            "mention_role_id": self.selected_role_id,
+            "mention_user_id": self.selected_user_id,
+            "description": description,
+        }
+
+        updated = False
+        for idx, reason in enumerate(reasons):
+            if reason.get("name", "").lower() == name.lower():
+                reasons[idx] = payload
+                updated = True
+                break
+        if not updated:
+            reasons.append(payload)
+
+        save_server_config()
+        self.selected_reason_name = name
+        self.selected_description = description
+        self.pending_reason_name = None
+        self.pending_reason_description = None
+        self.refresh_state()
+        self.refresh_components()
+
+        if self.message is not None:
+            try:
+                await self.message.edit(content=self.render_message(), view=self)
+            except discord.HTTPException as exc:
+                log.warning("Failed to refresh configure_war_nudge message: %s", exc)
+
+        await interaction.response.send_message(
+            f"{'✅ Updated' if updated else '✅ Added'} war nudge reason `{name}` for `{self.clan_name}`.",
+            ephemeral=True,
+        )
+
+    async def remove_selected_reason(self, interaction: discord.Interaction) -> None:
+        if interaction.message is not None:
+            self.message = interaction.message
+        clan_entry = _get_clan_entry(self.guild.id, self.clan_name)
+        war_nudge = clan_entry.setdefault("war_nudge", {})
+        reasons: List[Dict[str, Any]] = war_nudge.setdefault("reasons", [])
+        original_len = len(reasons)
+        reasons[:] = [
+            reason
+            for reason in reasons
+            if reason.get("name", "").lower() != self.selected_reason_name.lower()
+        ]
+        if len(reasons) == original_len:
+            await interaction.response.send_message(
+                f"⚠️ No reason named `{self.selected_reason_name}` found for `{self.clan_name}`.",
+                ephemeral=True,
+            )
+            return
+
+        save_server_config()
+        self.selected_reason_name = "__new__"
+        self.selected_reason_type = WAR_NUDGE_REASONS[0]
+        self.selected_role_id = None
+        self.selected_user_id = None
+        self.selected_description = ""
+        self.refresh_state()
+        self.refresh_components()
+
+        if self.message is not None:
+            try:
+                await self.message.edit(content=self.render_message(), view=self)
+            except discord.HTTPException as exc:
+                log.warning("Failed to refresh configure_war_nudge message after removal: %s", exc)
+
+        await interaction.response.send_message(
+            f"✅ Removed war nudge reason for `{self.clan_name}`.",
+            ephemeral=True,
+        )
+
+    async def send_reason_list(self, interaction: discord.Interaction) -> None:
+        reasons = self.reasons
+        if not reasons:
+            await interaction.response.send_message(
+                f"ℹ️ No war nudge reasons are configured for `{self.clan_name}`.",
+                ephemeral=True,
+            )
+            return
+        lines = [
+            f"- **{reason.get('name', 'Unnamed')}** — type: `{reason.get('type', 'unknown')}`"
+            for reason in reasons
+        ]
+        await interaction.response.send_message(
+            f"Configured reasons for `{self.clan_name}`:\n" + "\n".join(lines),
+            ephemeral=True,
+        )
+
+    async def handle_timeout(self) -> None:
+        if self.message is not None:
+            try:
+                await self.message.edit(content="Session expired. Re-run the command to continue.", view=None)
+            except discord.HTTPException:
+                pass
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True  # type: ignore[attr-defined]
+        await self.handle_timeout()
+
+
 class ToggleRoleButton(discord.ui.Button):
     """Reusable button that toggles a specific role for the onboarding workflow."""
 
@@ -4814,8 +9205,9 @@ class ToggleRoleButton(discord.ui.Button):
         role_name: str,
         parent_view: "RegisterMeView",
         style: discord.ButtonStyle = discord.ButtonStyle.primary,
+        row: Optional[int] = None,
     ):
-        super().__init__(label=label, style=style)
+        super().__init__(label=label, style=style, row=row)
         self.role_id = role_id
         self.role_name = role_name
         self.parent_view = parent_view
@@ -4832,49 +9224,112 @@ class RegisterMeView(discord.ui.View):
         *,
         member: discord.Member,
         war_alert_role: Optional[discord.Role],
-        clan_games_role: Optional[discord.Role],
-        raid_weekend_role: Optional[discord.Role],
+        event_roles: List[Dict[str, Any]],
         timeout: float = 180,
     ):
         super().__init__(timeout=timeout)
         self.member = member
         self.guild = member.guild
+        self.message: Optional[discord.Message] = None
         self.war_alert_role = war_alert_role
-        self.clan_games_role = clan_games_role
-        self.raid_weekend_role = raid_weekend_role
+        self.event_roles_seed = [
+            {
+                "key": entry.get("key"),
+                "label": entry.get("label"),
+                "role": entry.get("role"),
+            }
+            for entry in event_roles
+            if isinstance(entry, dict)
+        ]
+        self.event_roles: List[Dict[str, Any]] = []
+        self.linked_account_records: List[Dict[str, Optional[str]]] = []
+        self.refresh_components()
 
-        if war_alert_role is not None:
+    def refresh_components(self) -> None:
+        """Rebuild the interactive controls with up-to-date account data."""
+        self.clear_items()
+        guild_config = _ensure_guild_config(self.guild.id)
+        raw_accounts = guild_config.get("player_accounts", {}).get(str(self.member.id), [])
+        self.linked_account_records = raw_accounts if isinstance(raw_accounts, list) else []
+
+        ordered_keys: List[str] = []
+        for entry in self.event_roles_seed:
+            key = entry.get("key")
+            if isinstance(key, str) and key not in ordered_keys:
+                ordered_keys.append(key)
+        event_map = _get_event_roles_for_guild(self.guild.id)
+        for key in event_map.keys():
+            if key not in ordered_keys:
+                ordered_keys.append(key)
+        self.event_roles = []
+        for key in ordered_keys:
+            entry = event_map.get(key)
+            if not isinstance(entry, dict):
+                continue
+            label = entry.get("label", _default_event_label(key))
+            role = _get_event_role(self.guild, key)
+            self.event_roles.append({"key": key, "label": label, "role": role})
+
+        self.add_item(LinkPlayerSelect(self, self.linked_account_records))
+
+        button_row = 1
+        if self.war_alert_role is not None:
             self.add_item(
                 ToggleRoleButton(
-                    label="Toggle War Alerts",
-                    role_id=war_alert_role.id,
-                    role_name=war_alert_role.name,
+                    label="Sign Up for War Alerts",
+                    role_id=self.war_alert_role.id,
+                    role_name=self.war_alert_role.name,
                     parent_view=self,
                     style=discord.ButtonStyle.green,
+                    row=button_row,
                 )
             )
-        if clan_games_role is not None:
+            button_row = 2 if button_row < 4 else 1
+        for entry in self.event_roles:
+            role = entry.get("role")
+            label = entry.get("label")
+            if not isinstance(role, discord.Role):
+                continue
+            button_label = f"Sign Up for {label} Alerts"
             self.add_item(
                 ToggleRoleButton(
-                    label="Toggle Clan Games Alerts",
-                    role_id=clan_games_role.id,
-                    role_name=clan_games_role.name,
+                    label=button_label,
+                    role_id=role.id,
+                    role_name=role.name,
                     parent_view=self,
+                    row=button_row,
                 )
             )
-        if raid_weekend_role is not None:
-            self.add_item(
-                ToggleRoleButton(
-                    label="Toggle Raid Weekend Alerts",
-                    role_id=raid_weekend_role.id,
-                    role_name=raid_weekend_role.name,
-                    parent_view=self,
-                )
-            )
+            button_row = button_row + 1 if button_row < 4 else 1
 
-        # Always include a link back to the README for deeper guidance.
         self.add_item(
-            discord.ui.Button(label="Open README", style=discord.ButtonStyle.link, url=README_URL)
+            discord.ui.Button(
+                label="For further help click here",
+                style=discord.ButtonStyle.link,
+                url=README_URL,
+                row=2,
+            )
+        )
+
+    def build_intro_message(self) -> str:
+        linked_accounts = _summarise_linked_accounts(self.guild, self.member.id)
+        event_labels = [
+            entry.get("label")
+            for entry in self.event_roles
+            if isinstance(entry.get("label"), str) and isinstance(entry.get("role"), discord.Role)
+        ]
+        if event_labels:
+            events_line = f"Available event alerts: {', '.join(event_labels)}."
+        else:
+            events_line = "Event alerts will appear here once configured by an administrator."
+        return "\n".join(
+            [
+                "Welcome! Here's how to get set up:",
+                "1️⃣ Use the controls below to opt into the alert roles you want.",
+                f"2️⃣ Link your Clash accounts right here (current links: {linked_accounts}).",
+                f"3️⃣ {events_line}",
+                "4️⃣ Explore `/plan_upgrade` and the other slash commands to stay organised.",
+            ]
         )
 
     async def toggle_role(
@@ -4885,7 +9340,7 @@ class RegisterMeView(discord.ui.View):
     ) -> None:
         if not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message(
-                "⚠️ I can only toggle roles for members inside this server.",
+                "?? I can only manage roles for members inside this server.",
                 ephemeral=True,
             )
             return
@@ -4893,7 +9348,7 @@ class RegisterMeView(discord.ui.View):
         is_owner = interaction.user.id == self.member.id
         if not is_owner and not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message(
-                "⚠️ Only the member themselves or an administrator can toggle these roles.",
+                "?? Only the member themselves or an administrator can manage these roles here.",
                 ephemeral=True,
             )
             return
@@ -4901,41 +9356,216 @@ class RegisterMeView(discord.ui.View):
         role = self.guild.get_role(role_id)
         if role is None:
             await interaction.response.send_message(
-                "⚠️ That role no longer exists. Ask an admin to reconfigure it.",
+                "?? That role no longer exists. Ask an admin to reconfigure it.",
                 ephemeral=True,
             )
             return
 
-        target_member = self.guild.get_member(self.member.id)
+        target_member: Optional[discord.Member]
+        if isinstance(self.member, discord.Member):
+            target_member = self.member
+        else:
+            target_member = self.guild.get_member(self.member.id)
+
         if target_member is None:
             await interaction.response.send_message(
-                "⚠️ I couldn't resolve the target member.",
+                "?? I couldn't resolve your member details right now. Please try again shortly.",
                 ephemeral=True,
             )
             return
 
         try:
-            if role in target_member.roles:
-                await target_member.remove_roles(role, reason="RegisterMe toggle")
-                message = f"Removed `{role_name}`."
-            else:
-                await target_member.add_roles(role, reason="RegisterMe toggle")
-                message = f"Assigned `{role_name}`."
+            if role in getattr(target_member, "roles", []):
+                await interaction.response.send_message(
+                    f"?? You have already signed up for {role_name} alert(s).",
+                    ephemeral=True,
+                )
+                return
+
+            await target_member.add_roles(role, reason="RegisterMe subscription")
+            message = f"? {target_member.mention} is now subscribed to {role_name} alert(s)."
         except discord.Forbidden:
             await interaction.response.send_message(
-                "⚠️ I don't have permission to modify that role.",
+                "?? I don't have permission to modify that role.",
                 ephemeral=True,
             )
             return
         except discord.HTTPException as exc:
             await interaction.response.send_message(
-                f"⚠️ Failed to update roles: {exc}",
+                f"?? Failed to update roles: {exc}",
                 ephemeral=True,
             )
             return
 
-        await interaction.response.send_message(f"✅ {message}", ephemeral=True)
+        await interaction.response.send_message(message, ephemeral=True)
 
+
+class DonationClanSelect(discord.ui.Select):
+    """Select menu for choosing which clan's donation metrics to manage."""
+
+    def __init__(self, parent_view: "DonationConfigView", clan_map: Dict[str, str]):
+        self.parent_view = parent_view
+        options = [
+            discord.SelectOption(
+                label=name,
+                value=name,
+                default=name == parent_view.clan_name,
+            )
+            for name in sorted(clan_map.keys(), key=str.casefold)
+        ]
+        super().__init__(
+            placeholder="Select a clan",
+            min_values=1,
+            max_values=1,
+            options=options[:25],
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        self.parent_view.set_clan(self.values[0])
+        self.parent_view.refresh_components()
+        if interaction.message is not None:
+            self.parent_view.message = interaction.message
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
+
+
+class DonationMetricSelect(discord.ui.Select):
+    """Multi-select for toggling donation metrics."""
+
+    def __init__(self, parent_view: "DonationConfigView", selected: Set[str]):
+        self.parent_view = parent_view
+        options = [
+            discord.SelectOption(
+                label=metric.replace("_", " ").title(),
+                value=metric,
+                description=DONATION_METRIC_INFO.get(metric, ""),
+                default=metric in selected,
+            )
+            for metric in DONATION_METRICS
+        ]
+        super().__init__(
+            placeholder="Choose which metrics to highlight",
+            min_values=0,
+            max_values=len(options),
+            options=options,
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        self.parent_view.selected_metrics = set(self.values)
+        if interaction.message is not None:
+            self.parent_view.message = interaction.message
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
+
+
+class SaveDonationMetricsButton(discord.ui.Button):
+    """Persist the currently selected donation metrics."""
+
+    def __init__(self, parent_view: "DonationConfigView"):
+        super().__init__(label="Save Metrics", style=discord.ButtonStyle.success, row=2)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        await self.parent_view.save_metrics(interaction)
+
+
+class DonationConfigView(discord.ui.View):
+    """Interactive configuration for donation metrics."""
+
+    def __init__(self, guild: discord.Guild, clan_name: str, *, timeout: float = 300):
+        super().__init__(timeout=timeout)
+        self.guild = guild
+        self.message: Optional[discord.Message] = None
+        self.clan_map = _clan_names_for_guild(guild.id)
+        self.clan_name = clan_name if clan_name in self.clan_map else next(iter(self.clan_map), None)
+        self.selected_metrics: Set[str] = set()
+        self.refresh_state()
+        self.refresh_components()
+
+    def refresh_state(self) -> None:
+        clan_entry = _get_clan_entry(self.guild.id, self.clan_name) if self.clan_name else None
+        donation_tracking = clan_entry.get("donation_tracking", {}) if isinstance(clan_entry, dict) else {}
+        metrics = donation_tracking.get("metrics", {}) if isinstance(donation_tracking, dict) else {}
+        self.selected_metrics = {metric for metric in DONATION_METRICS if metrics.get(metric, False)}
+
+    def refresh_components(self) -> None:
+        self.clear_items()
+        if not self.clan_map:
+            return
+        self.add_item(DonationClanSelect(self, self.clan_map))
+        self.add_item(DonationMetricSelect(self, self.selected_metrics))
+        self.add_item(SaveDonationMetricsButton(self))
+
+    def set_clan(self, clan_name: str) -> None:
+        self.clan_name = clan_name
+        self.refresh_state()
+
+    def render_message(self) -> str:
+        if not self.clan_name:
+            return "⚠️ No clans are configured yet. Use `/set_clan` first."
+        clan_entry = _get_clan_entry(self.guild.id, self.clan_name)
+        donation_tracking = clan_entry.get("donation_tracking", {}) if isinstance(clan_entry, dict) else {}
+        channel_id = donation_tracking.get("channel_id")
+        channel_ref = f"<#{channel_id}>" if isinstance(channel_id, int) else "_Not configured_"
+        if self.selected_metrics:
+            metrics_lines = "\n".join(
+                f"- {metric.replace('_', ' ').title()}" for metric in sorted(self.selected_metrics)
+            )
+        else:
+            metrics_lines = "_None selected_"
+        return (
+            f"**Clan:** `{self.clan_name}`\n"
+            f"**Donation channel:** {channel_ref}\n"
+            f"**Highlighted metrics:**\n{metrics_lines}\n\n"
+            "Use the controls below to toggle donation metrics for this clan."
+        )
+
+    async def save_metrics(self, interaction: discord.Interaction) -> None:
+        if not self.clan_name:
+            await interaction.response.send_message(
+                "⚠️ No clan selected. Choose a clan first.",
+                ephemeral=True,
+            )
+            return
+
+        clan_entry = _get_clan_entry(self.guild.id, self.clan_name)
+        donation_tracking = clan_entry.setdefault("donation_tracking", {})
+        metrics = donation_tracking.setdefault("metrics", {})
+        for metric in DONATION_METRICS:
+            metrics[metric] = metric in self.selected_metrics
+        save_server_config()
+
+        self.refresh_state()
+        self.refresh_components()
+
+        if self.message is not None:
+            try:
+                await self.message.edit(content=self.render_message(), view=self)
+            except discord.HTTPException as exc:
+                log.warning("Failed to refresh configure_donation_metrics message: %s", exc)
+
+        await interaction.response.send_message(
+            f"✅ Donation metrics updated for `{self.clan_name}`.",
+            ephemeral=True,
+        )
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True  # type: ignore[attr-defined]
+        if self.message is not None:
+            try:
+                await self.message.edit(
+                    content="Session expired. Re-run the command to continue.",
+                    view=None,
+                )
+            except discord.HTTPException:
+                pass
 
 class RoleAssignmentView(discord.ui.View):
     """Allow users to assign themselves a clan role with visibility controls."""
@@ -5058,6 +9688,9 @@ class RoleSelect(discord.ui.Select):
         await send_text_response(interaction, message, ephemeral=True)
 
 
+# ---------------------------------------------------------------------------
+# Slash command: /toggle_war_alerts
+# ---------------------------------------------------------------------------
 @bot.tree.command(name="toggle_war_alerts", description="Opt in or out of war alert pings.")
 @app_commands.describe(enable="Choose True to receive alerts or False to opt out")
 async def toggle_war_alerts(interaction: discord.Interaction, enable: bool):
@@ -5141,7 +9774,6 @@ async def toggle_war_alerts(interaction: discord.Interaction, enable: bool):
 # ---------------------------------------------------------------------------
 # Slash command: /assign_bases
 # ---------------------------------------------------------------------------
-
 @bot.tree.command(
     name="assign_bases",
     description="Assign war targets with an interactive menu or broadcast a general rule.",
@@ -5238,6 +9870,10 @@ async def assign_bases(interaction: discord.Interaction, clan_name: str):
 
 # ---------------------------------------------------------------------------
 # Autocomplete
+
+# ---------------------------------------------------------------------------
+# Slash command: /assign_clan_role
+# ---------------------------------------------------------------------------
 @bot.tree.command(name="assign_clan_role", description="Self-assign your clan role via select menu.")
 async def assign_clan_role(interaction: discord.Interaction):
     """Allow members to pick a clan role matching configured clans."""
@@ -5279,6 +9915,12 @@ async def assign_clan_role(interaction: discord.Interaction):
 @clan_war_info_menu.autocomplete("clan_name")
 @assign_bases.autocomplete("clan_name")
 @choose_war_alert_channel.autocomplete("clan_name")
+@configure_dashboard.autocomplete("clan_name")
+@configure_donation_metrics.autocomplete("clan_name")
+@dashboard.autocomplete("clan_name")
+@save_war_plan.autocomplete("clan_name")
+@set_clan.autocomplete("clan_name")
+@war_plan.autocomplete("clan_name")
 async def clan_name_autocomplete(interaction: discord.Interaction, current: str):
     """Provide clan name suggestions from the server configuration."""
     if interaction.guild is None:

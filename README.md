@@ -42,6 +42,7 @@ Each command behaves the same way: fill in any required options, press **Enter**
 ### `/set_clan`
 - **Purpose:** Register or update a clan name and tag for the server and choose whether war alerts should be enabled.
 - **After sending:** If a conflicting tag already exists, the bot prompts you with a replace/keep choice. Success messages recap the tag, whether alerts are enabled, and suggest linking an alert channel.
+- **Pro tip:** Start typing the optional `clan_name` field when invoking the command to auto-complete existing entries.
 - **Permissions:** Administrators only.
 
 ### `/choose_war_alert_channel`
@@ -89,8 +90,8 @@ Each command behaves the same way: fill in any required options, press **Enter**
 - **After sending:** Configure reasons with mentions and an optional description via `/configure_war_nudge`, then run `/war_nudge` with that reason to post the reminder—no automated nudges, only when you call it.
 
 ### War plan commands (`/save_war_plan`, `/list_war_plans`, `/war_plan`)
-- **Purpose:** Store reusable war plans per clan, review what’s available, and broadcast the chosen plan with a single command.
-- **After sending:** Saving stores the plan in the config; listing shows what’s available; `/war_plan` posts the template to the selected channel.
+- **Purpose:** Store reusable war plans per clan, review what’s available, and broadcast the chosen plan with an interactive picker.
+- **After sending:** `/save_war_plan` opens the editor for creating or updating templates, `/list_war_plans` lists what’s stored, and `/war_plan` now launches a poster view where you choose the clan, plan, and destination channel before previewing or posting the result.
 
 ### `/plan_upgrade` & `/set_upgrade_channel`
 - **Purpose:** Members log upcoming upgrades for their linked accounts while admins decide where those notices are posted.

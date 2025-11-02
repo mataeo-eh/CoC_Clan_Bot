@@ -65,7 +65,6 @@ class CoCAPI:
                     "level": troop.level,
                     "max_level": troop.max_level,
                     "village": troop.village,
-                    "category": troop.category,
                 }
                 for troop in getattr(player, "troops", [])
             ],
