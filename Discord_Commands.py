@@ -20,7 +20,7 @@ from bot_core import bot, client
 from logger import get_logger, log_command_call, get_usage_summary
 
 log = get_logger()
-from COC_API import ClanNotConfiguredError, GuildNotConfiguredError
+from COC_API import ClanNotConfiguredError, GuildNotConfiguredError, notinWar
 from ENV.Clan_Configs import save_server_config, server_config
 
 
@@ -954,7 +954,7 @@ async def configure_war_nudge(
     if interaction.guild is None:
         await send_text_response(
             interaction,
-            "⚠️ This command must be used inside a Discord server.",
+            "This command must be used inside a Discord server.",
             ephemeral=True,
         )
         return
@@ -1270,19 +1270,19 @@ async def dashboard(
     description="Link or unlink Clash of Clans player tags to Discord members.",
 )
 @app_commands.describe(
-    action="Choose 'link' to add a tag or 'unlink' to remove one.",
-    player_tag="Player tag (e.g. #ABC123). The tag will be validated before saving.",
-    alias="Optional nickname that appears in autocomplete. Defaults to the in-game name.",
+    action="Optional action to preselect (link or unlink).",
+    player_tag="Optional player tag (e.g. #ABC123) to pre-fill when opening the view.",
+    alias="Optional nickname to pre-fill (defaults to the in-game name when linking).",
     target_member="Only admins may manage tags for someone else.",
 )
 async def link_player(
     interaction: discord.Interaction,
-    action: Literal["link", "unlink"],
-    player_tag: str,
+    action: Optional[Literal["link", "unlink"]] = None,
+    player_tag: Optional[str] = None,
     alias: Optional[str] = None,
     target_member: Optional[discord.Member] = None,
-):
-    """Allow members to map their Discord identity to one or more Clash of Clans accounts."""
+) -> None:
+    """Launch an interactive view for linking or unlinking Clash of Clans accounts."""
     _record_command_usage(interaction, "link_player")
     log.debug(
         "link_player invoked action=%s tag=%s target=%s",
@@ -1294,7 +1294,7 @@ async def link_player(
     if interaction.guild is None:
         await send_text_response(
             interaction,
-            "❓ This command must be used inside a Discord server.",
+            "⚠️ This command must be used inside a Discord server.",
             ephemeral=True,
         )
         return
@@ -1307,33 +1307,46 @@ async def link_player(
     if actor is None:
         await send_text_response(
             interaction,
-            "⚠️ I could not resolve your guild membership. Please try again.",
+            "I could not resolve your guild membership. Please try again.",
             ephemeral=True,
         )
         return
 
-    target = target_member or actor
-    action_lower = action.lower()
+    initial_action = action if action in {"link", "unlink"} else "link"
+    cleaned_tag = player_tag.strip() if isinstance(player_tag, str) else ""
+    cleaned_alias = alias.strip() if isinstance(alias, str) and alias.strip() else None
 
+    target: discord.Member = actor
+    if isinstance(target_member, discord.Member) and target_member.id != actor.id:
+        if actor.guild_permissions.administrator:
+            target = target_member
+        else:
+            await send_text_response(
+                interaction,
+                "Only administrators can manage linked tags for other members.",
+                ephemeral=True,
+            )
+            return
+
+    view = LinkPlayerView(
+        guild=interaction.guild,
+        actor=actor,
+        selected_action=initial_action,
+        initial_tag=cleaned_tag,
+        initial_alias=cleaned_alias,
+        initial_target=target,
+    )
+
+    await interaction.response.send_message(
+        view.render_message(),
+        ephemeral=True,
+        view=view,
+    )
     try:
-        message = await _link_player_account(
-            guild=interaction.guild,
-            actor=actor,
-            target=target,
-            action=action_lower,
-            player_tag=player_tag,
-            alias=alias,
-        )
-    except PlayerLinkError as exc:
-        await send_text_response(interaction, exc.message, ephemeral=True)
-        return
+        view.message = await interaction.original_response()
+    except discord.HTTPException as exc:
+        log.warning("Failed to capture link_player view message: %s", exc)
 
-    if action_lower == "link":
-        message += " You can now reference it quickly with `/player_info`."
-    elif action_lower == "unlink":
-        message += " You can relink it anytime with `/link_player action:link`."
-
-    await send_text_response(interaction, message, ephemeral=True)
 
 
 # ---------------------------------------------------------------------------
@@ -8537,6 +8550,342 @@ class SeasonSummaryView(discord.ui.View):
             except discord.HTTPException:
                 pass
 
+
+class LinkPlayerDetailsModal(discord.ui.Modal):
+    """Modal used to capture the player tag and optional alias."""
+
+    def __init__(self, parent_view: "LinkPlayerView"):
+        title = "Link Clash Account" if parent_view.selected_action == "link" else "Unlink Clash Account"
+        super().__init__(title=title, timeout=None)
+        self.parent_view = parent_view
+        self.player_tag = discord.ui.TextInput(
+            label="Player tag",
+            placeholder="#ABC123",
+            default=parent_view.selected_tag or "",
+            max_length=20,
+        )
+        self.add_item(self.player_tag)
+        self.alias_input: Optional[discord.ui.TextInput]
+        if parent_view.selected_action == "link":
+            alias_input = discord.ui.TextInput(
+                label="Alias (optional)",
+                placeholder="In-game name or nickname",
+                default=parent_view.selected_alias or "",
+                required=False,
+                max_length=50,
+            )
+            self.alias_input = alias_input
+            self.add_item(alias_input)
+        else:
+            self.alias_input = None
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        tag_value = self.player_tag.value.strip()
+        alias_value: Optional[str] = None
+        if self.alias_input is not None:
+            alias_raw = self.alias_input.value.strip()
+            alias_value = alias_raw or None
+        self.parent_view.set_details(tag_value, alias_value)
+        await interaction.response.send_message("Player details updated.", ephemeral=True)
+        await self.parent_view.refresh_view_message()
+
+
+class LinkPlayerActionSelect(discord.ui.Select):
+    """Dropdown for toggling between link and unlink actions."""
+
+    def __init__(self, parent_view: "LinkPlayerView"):
+        options = [
+            discord.SelectOption(label="Link", value="link", default=parent_view.selected_action == "link"),
+            discord.SelectOption(label="Unlink", value="unlink", default=parent_view.selected_action == "unlink"),
+        ]
+        super().__init__(
+            placeholder="Choose an action",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=0,
+        )
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        choice = self.values[0]
+        self.parent_view.selected_action = choice
+        if choice == "unlink":
+            self.parent_view.selected_alias = None
+        if interaction.message is not None:
+            self.parent_view.message = interaction.message
+        self.parent_view.refresh_components()
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
+
+
+class LinkPlayerTargetSelect(discord.ui.UserSelect):
+    """User selector that lets administrators manage other members."""
+
+    def __init__(self, parent_view: "LinkPlayerView"):
+        self.parent_view = parent_view
+        default_values = [parent_view.selected_target] if parent_view.selected_target is not None else []
+        super().__init__(
+            placeholder="Choose the member to manage",
+            min_values=1,
+            max_values=1,
+            default_values=default_values,
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message(
+                "⚠️ I couldn't resolve your guild membership. Please try again.",
+                ephemeral=True,
+            )
+            return
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "⚠️ Only administrators can change the target member.",
+                ephemeral=True,
+            )
+            return
+        selected = self.values[0]
+        if not isinstance(selected, discord.Member):
+            await interaction.response.send_message(
+                "⚠️ Please choose a member from this server.",
+                ephemeral=True,
+            )
+            return
+        self.parent_view.set_target(selected)
+        if interaction.message is not None:
+            self.parent_view.message = interaction.message
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
+
+
+class LinkPlayerDetailsButton(discord.ui.Button):
+    """Button to open the modal for editing tag and alias."""
+
+    def __init__(self, parent_view: "LinkPlayerView"):
+        super().__init__(label="Set player details", style=discord.ButtonStyle.primary, row=2)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        if interaction.message is not None:
+            self.parent_view.message = interaction.message
+        await interaction.response.send_modal(LinkPlayerDetailsModal(self.parent_view))
+
+
+class LinkPlayerConfirmPrivateButton(discord.ui.Button):
+    """Button that applies the change and keeps the confirmation private."""
+
+    def __init__(self, parent_view: "LinkPlayerView"):
+        super().__init__(label="Confirm (private)", style=discord.ButtonStyle.success, row=3)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        await self.parent_view.handle_submit(interaction, broadcast=False)
+
+
+class LinkPlayerConfirmBroadcastButton(discord.ui.Button):
+    """Button that applies the change and broadcasts it to the channel."""
+
+    def __init__(self, parent_view: "LinkPlayerView"):
+        super().__init__(label="Confirm & broadcast", style=discord.ButtonStyle.secondary, row=3)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        await self.parent_view.handle_submit(interaction, broadcast=True)
+
+
+class LinkPlayerCancelButton(discord.ui.Button):
+    """Button that closes the link player view."""
+
+    def __init__(self, parent_view: "LinkPlayerView"):
+        super().__init__(label="Close", style=discord.ButtonStyle.secondary, row=4)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        self.parent_view.disable_all_items()
+        await interaction.response.edit_message(
+            content="Link player view closed.",
+            view=self.parent_view,
+        )
+
+
+class LinkPlayerView(discord.ui.View):
+    """Interactive view for linking or unlinking Clash of Clans accounts."""
+
+    def __init__(
+        self,
+        *,
+        guild: discord.Guild,
+        actor: discord.Member,
+        selected_action: str,
+        initial_tag: str,
+        initial_alias: Optional[str],
+        initial_target: discord.Member,
+        timeout: float = 300,
+    ):
+        super().__init__(timeout=timeout)
+        self.guild = guild
+        self.actor = actor
+        self.selected_action = selected_action if selected_action in {"link", "unlink"} else "link"
+        self.selected_tag = initial_tag or ""
+        self.selected_alias = initial_alias if self.selected_action == "link" else None
+        self.selected_target = initial_target or actor
+        self.message: Optional[discord.Message] = None
+        self.last_result: Optional[str] = None
+        self._linked_summary = ""
+
+        self.refresh_state()
+        self.refresh_components()
+
+    def refresh_state(self) -> None:
+        target_id = self.selected_target.id if isinstance(self.selected_target, discord.Member) else self.actor.id
+        self._linked_summary = _summarise_linked_accounts(self.guild, target_id)
+
+    def set_target(self, member: discord.Member) -> None:
+        self.selected_target = member
+        self.refresh_state()
+        self.refresh_components()
+
+    def set_details(self, tag: str, alias: Optional[str]) -> None:
+        self.selected_tag = tag.strip()
+        if self.selected_action == "link":
+            self.selected_alias = alias
+        else:
+            self.selected_alias = None
+        self.refresh_components()
+
+    @property
+    def can_submit(self) -> bool:
+        return bool(self.selected_tag)
+
+    def render_message(self) -> str:
+        target = self.selected_target if isinstance(self.selected_target, discord.Member) else self.actor
+        tag_display = self.selected_tag or "(not set)"
+        lines = [
+            "**Link Clash Accounts**" if self.selected_action == "link" else "**Unlink Clash Accounts**",
+            f"Action: {self.selected_action.title()}",
+            f"Target member: {target.mention}",
+            f"Player tag: `{tag_display}`" if self.selected_tag else "Player tag: (use *Set player details*)",
+        ]
+        if self.selected_action == "link":
+            alias_display = self.selected_alias or "(auto-detect from profile)"
+            lines.append(f"Alias: {alias_display}")
+        lines.append(f"Currently linked: {self._linked_summary}")
+        if self.last_result:
+            lines.append("")
+            lines.append(f"Last result: {self.last_result}")
+        lines.append("")
+        lines.append("Use the controls below to set the account details, then choose whether to broadcast the update or keep it private.")
+        return "\n".join(lines)
+
+    def refresh_components(self) -> None:
+        self.clear_items()
+        self.add_item(LinkPlayerActionSelect(self))
+        if self.actor.guild_permissions.administrator:
+            self.add_item(LinkPlayerTargetSelect(self))
+        self.add_item(LinkPlayerDetailsButton(self))
+        private_button = LinkPlayerConfirmPrivateButton(self)
+        broadcast_button = LinkPlayerConfirmBroadcastButton(self)
+        if not self.can_submit:
+            private_button.disabled = True
+            broadcast_button.disabled = True
+        self.add_item(private_button)
+        self.add_item(broadcast_button)
+        self.add_item(LinkPlayerCancelButton(self))
+
+    async def refresh_view_message(self) -> None:
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(content=self.render_message(), view=self)
+        except discord.HTTPException as exc:
+            log.warning("Failed to refresh link_player view message: %s", exc)
+
+    async def handle_submit(self, interaction: discord.Interaction, *, broadcast: bool) -> None:
+        target = self.selected_target if isinstance(self.selected_target, discord.Member) else self.actor
+        if not self.can_submit:
+            await interaction.response.send_message("⚠️ Set a player tag before confirming.", ephemeral=True)
+            return
+        try:
+            message = await _link_player_account(
+                guild=self.guild,
+                actor=self.actor,
+                target=target,
+                action=self.selected_action,
+                player_tag=self.selected_tag,
+                alias=self.selected_alias if self.selected_action == "link" else None,
+            )
+        except PlayerLinkError as exc:
+            await interaction.response.send_message(exc.message, ephemeral=True)
+            return
+
+        if self.selected_action == "link":
+            message += " You can now reference it quickly with `/player_info`."
+        else:
+            message += " You can relink it anytime with `/link_player action:link`."
+
+        self.last_result = message
+        self.selected_tag = ""
+        if self.selected_action == "link":
+            self.selected_alias = None
+        self.refresh_state()
+        self.refresh_components()
+        await self.refresh_view_message()
+
+        if broadcast:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            channel = interaction.channel
+            destination = None
+            if isinstance(channel, discord.TextChannel):
+                me = channel.guild.me
+                if me and channel.permissions_for(me).send_messages:
+                    destination = channel
+            if destination is None:
+                await interaction.followup.send(
+                    "⚠️ I couldn't broadcast the update because I don't have permission to post here.",
+                    ephemeral=True,
+                )
+                return
+            try:
+                await destination.send(message)
+            except discord.HTTPException as exc:
+                log.warning(
+                    "Failed to broadcast link_player result: guild=%s channel=%s",
+                    self.guild.id,
+                    getattr(destination, "id", "?"),
+                )
+                await interaction.followup.send(
+                    f"⚠️ I couldn't broadcast the update: {exc}",
+                    ephemeral=True,
+                )
+                return
+            await interaction.followup.send(
+                f"✅ Broadcast posted in {destination.mention}.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+
+    def disable_all_items(self) -> None:
+        for child in self.children:
+            child.disabled = True
+
+    async def on_timeout(self) -> None:
+        self.disable_all_items()
+        if self.message is not None:
+            try:
+                await self.message.edit(
+                    content="Link player view timed out. Run `/link_player` to start again.",
+                    view=self,
+                )
+            except discord.HTTPException:
+                pass
+
 class LinkPlayerModal(discord.ui.Modal):
     """Modal dialog to link or unlink player tags during onboarding."""
 
@@ -9809,9 +10158,20 @@ async def assign_bases(interaction: discord.Interaction, clan_name: str):
             ephemeral=True,
         )
         return
-
+    reason = None
     try:
         war = await client.get_clan_war_raw(tag)
+        if getattr(war, "state", "").lower() in {"notinwar", "warended"}:
+            reason = getattr(war, "reason", "")
+            if not isinstance(reason, str) or "clan war league" not in reason.lower():  
+                raise notinWar(war.state)
+        if isinstance(reason, str) and "clan war league" in reason.lower():
+            war = await client.get_active_war_raw(tag)
+            if not war:
+                raise coc.errors.NotFound
+            home_roster, max_enemy, alert_role = await build_war_roster(member, war, interaction)
+        else:
+            home_roster, max_enemy, alert_role = await build_war_roster(member, war, interaction)
     except coc.errors.PrivateWarLog:
         await send_text_response(
             interaction,
@@ -9826,6 +10186,13 @@ async def assign_bases(interaction: discord.Interaction, clan_name: str):
             ephemeral=True,
         )
         return
+    except notinWar as exc:
+        await send_text_response(
+            interaction,
+            f"⚠️ That clan isn't in an active war right now—per-player assignments aren't available.",
+            ephemeral=True,
+        )
+        return
     except Exception as exc:
         await send_text_response(
             interaction,
@@ -9833,7 +10200,22 @@ async def assign_bases(interaction: discord.Interaction, clan_name: str):
             ephemeral=True,
         )
         return
+    
+    view = AssignBasesModeView(
+        interaction=interaction,
+        clan_name=clan_name,
+        home_roster=home_roster,
+        max_enemy=max_enemy,
+        alert_role=alert_role,
+    )
+    intro = (
+        "After submitting the command with the clan name, choose how you want to share assignments:\n"
+        "• Use **Per Player Assignments** to build the familiar per-base list without memorising the syntax.\n"
+        "• Use **General Assignment Rule** for a quick broadcast such as “everyone attack your mirror.”"
+    )
+    await send_text_response(interaction, intro, ephemeral=True, view=view)
 
+async def build_war_roster(member, war, interaction):
     sorted_home = [
         member
         for member in sorted(war.clan.members, key=lambda m: getattr(m, "map_position", 0))
@@ -9852,22 +10234,7 @@ async def assign_bases(interaction: discord.Interaction, clan_name: str):
     max_enemy = len(sorted_enemy)
 
     alert_role = discord.utils.get(interaction.guild.roles, name=ALERT_ROLE_NAME)
-
-    view = AssignBasesModeView(
-        interaction=interaction,
-        clan_name=clan_name,
-        home_roster=home_roster,
-        max_enemy=max_enemy,
-        alert_role=alert_role,
-    )
-    intro = (
-        "After submitting the command with the clan name, choose how you want to share assignments:\n"
-        "• Use **Per Player Assignments** to build the familiar per-base list without memorising the syntax.\n"
-        "• Use **General Assignment Rule** for a quick broadcast such as “everyone attack your mirror.”"
-    )
-    await send_text_response(interaction, intro, ephemeral=True, view=view)
-
-
+    return home_roster, max_enemy, alert_role
 # ---------------------------------------------------------------------------
 # Autocomplete
 

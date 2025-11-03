@@ -57,9 +57,10 @@ Each command behaves the same way: fill in any required options, press **Enter**
 
 ### `/link_player`
 - **Purpose:** Link or unlink Clash of Clans player tags to Discord members so `/player_info` autocomplete stays fast.
-- **Options:** `action` (`link` or `unlink`), `player_tag`, optional `alias`, optional `target_member`.
+- **After sending:** Pick the action (link/unlink), optionally select another member (admins only), set the player tag and alias in the modal, then choose whether to keep the confirmation private or broadcast it to the channel with dedicated buttons.
+- **Pro tip:** The optional slash command arguments still work; use them to pre-fill the view when you already know the action, tag, or alias.
 - **Rules:** Non-admins can only manage their own links; admins can manage anyone. Tags are validated against the Clash API, aliases fall back to the in-game name, and multiple tags per Discord user are supported.
-- **After sending:** You get a confirmation showing who the tag belongs to; use `/player_info` right away to see the linked data.
+- **Result:** After you confirm, the outcome is logged in the view and (if you broadcast it) announced to the channel, so `/player_info` can be used immediately.
 
 ### `/clan_war_info_menu`
 - **Purpose:** Pull the current (or most recent) war data for a configured clan and explore it interactively.

@@ -12,6 +12,8 @@ class GuildNotConfiguredError(Exception):
 class ClanNotConfiguredError(Exception):
     """Raised when a requested clan name is not configured for a guild."""
 
+class notinWar(Exception):
+    "Raised when war.state is notinWar/warEnded"
 
 class CoCAPI:
     def __init__(self, token):
@@ -114,6 +116,13 @@ class CoCAPI:
         log.debug("CoCAPI.get_clan_war_raw invoked")
         result = await self.client.get_clan_war(tag)
         log.debug("CoCAPI.get_clan_war_raw fetched data")
+        return result
+
+    async def get_active_war_raw(self, tag: str):
+        #Fetch the rich war data for the specified clan in a clan war league
+        log.debug("CoCAPI.get_league_war_raw invoked")
+        result = await self.client.get_current_war(tag)
+        log.debug("CoCAPI.get_league_war_raw fetched data")
         return result
 
     async def get_clan_war_info(self, clan_name, guild_id):
