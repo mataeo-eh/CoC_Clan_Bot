@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import copy
 import csv
@@ -4434,7 +4434,7 @@ class AssignBasesModeView(discord.ui.View):
         interaction: discord.Interaction,
         clan_name: str,
         home_roster: Dict[int, str],
-        max_enemy: int,
+        enemy_positions: Iterable[int],
         alert_role: Optional[discord.Role],
     ):
         super().__init__(timeout=180)
@@ -4442,7 +4442,7 @@ class AssignBasesModeView(discord.ui.View):
         self.guild = interaction.guild
         self.clan_name = clan_name
         self.home_roster = home_roster
-        self.max_enemy = max_enemy
+        self.enemy_positions = sorted(int(pos) for pos in enemy_positions)
         self.alert_role = alert_role
         self.channel: Optional[discord.TextChannel] = (
             interaction.channel if isinstance(interaction.channel, discord.TextChannel) else None
@@ -4471,12 +4471,18 @@ class AssignBasesModeView(discord.ui.View):
         per_player_view = PerPlayerAssignmentView(
             parent=self,
             home_roster=self.home_roster,
-            max_enemy=self.max_enemy,
+            enemy_positions=self.enemy_positions,
             alert_role=self.alert_role,
         )
         await interaction.response.edit_message(
             content=per_player_view.render_message(),
             view=per_player_view,
+        )
+        if interaction.message is not None:
+            per_player_view.message = interaction.message
+        log.debug(
+            "PerPlayerAssignmentView launched message_id=%s",
+            getattr(per_player_view.message, "id", None),
         )
 
     @discord.ui.button(label="General Assignment Rule", style=discord.ButtonStyle.secondary, emoji="📝")
@@ -4499,7 +4505,7 @@ class PerPlayerAssignmentView(discord.ui.View):
         *,
         parent: AssignBasesModeView,
         home_roster: Dict[int, str],
-        max_enemy: int,
+        enemy_positions: Iterable[int],
         alert_role: Optional[discord.Role],
         timeout: float = 300,
     ):
@@ -4508,10 +4514,67 @@ class PerPlayerAssignmentView(discord.ui.View):
         self.guild = parent.guild
         self.clan_name = parent.clan_name
         self.home_roster = home_roster
-        self.max_enemy = max_enemy
+        self.enemy_positions = sorted(int(pos) for pos in enemy_positions)
+        self._valid_enemy_positions: Set[int] = set(self.enemy_positions)
         self.alert_role = alert_role
         self.assignments: Dict[int, List[int]] = {}
-        self.add_item(HomeBaseSelect(self))
+        self.message: Optional[discord.Message] = None
+        self._add_home_base_selects()
+        log.debug("PerPlayerAssignmentView initialised children=%s", [
+            (child.__class__.__name__, getattr(child, 'custom_id', None), getattr(child, 'row', None))
+            for child in self.children
+        ])
+
+    def _add_home_base_selects(self) -> None:
+        """Add one or more selects so every base can be chosen."""
+        sorted_bases = sorted(self.home_roster.keys())
+        if not sorted_bases:
+            return
+
+        chunks: List[List[int]] = [
+            sorted_bases[i : i + 25] for i in range(0, len(sorted_bases), 25)
+        ]
+        buttons = [child for child in self.children if isinstance(child, discord.ui.Button)]
+        for button in buttons:
+            self.remove_item(button)
+        for index, chunk in enumerate(chunks):
+            if index >= 5:
+                log.warning(
+                    "PerPlayerAssignmentView has more than 5 select groups; truncating display after row %s",
+                    index - 1,
+                )
+                break
+            start = chunk[0]
+            end = chunk[-1]
+            if len(chunks) == 1:
+                placeholder = "Pick a home base to assign targets."
+            else:
+                placeholder = f"Bases {start} - {end}"
+            self.add_item(
+                HomeBaseSelect(
+                    parent_view=self,
+                    base_numbers=chunk,
+                    placeholder=placeholder,
+                    row=index,
+                    custom_id=f"home_base_select_{self.clan_name.replace(' ', '_')}_{start}_{end}",
+                )
+            )
+
+        button_start_row = min(4, len(chunks))
+        for idx, button in enumerate(buttons):
+            button.row = min(4, button_start_row + idx)
+            self.add_item(button)
+
+    def _layout_action_buttons(self) -> None:
+        """Ensure action buttons are placed on rows after the selects."""
+        select_rows = sum(
+            isinstance(child, HomeBaseSelect) for child in self.children
+        )
+        next_row = select_rows
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.row = next_row
+                next_row += 1
 
     def render_message(self) -> str:
         if not self.assignments:
@@ -4536,6 +4599,22 @@ class PerPlayerAssignmentView(discord.ui.View):
     def clear_assignments(self) -> None:
         self.assignments.clear()
 
+    async def _refresh_message(self) -> None:
+        """Update the interactive message with the latest assignment summary."""
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(content=self.render_message(), view=self)
+        except discord.HTTPException as exc:
+            log.warning(
+                "PerPlayerAssignmentView failed to refresh message: %s",
+                exc,
+            )
+
+    def _set_children_disabled(self, disabled: bool) -> None:
+        for child in self.children:
+            child.disabled = disabled
+
     def build_broadcast_content(self) -> Optional[str]:
         if not self.assignments:
             return None
@@ -4546,6 +4625,29 @@ class PerPlayerAssignmentView(discord.ui.View):
             lines.append(f"[{base}] {member_name}: {target_text}")
         mention = f"{self.alert_role.mention} " if self.alert_role else ""
         return f"{mention}Assignments for `{self.clan_name}`\n" + "\n".join(lines)
+
+    async def on_error(
+        self,
+        interaction: discord.Interaction,
+        error: Exception,
+        item: discord.ui.Item[Any],
+    ) -> None:
+        log.exception(
+            "PerPlayerAssignmentView error item=%s values=%s",
+            item,
+            getattr(item, "values", None),
+            exc_info=error,
+        )
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                "⚠️ Something went wrong while updating assignments. Please try again.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(
+                "⚠️ Something went wrong while updating assignments. Please try again.",
+                ephemeral=True,
+            )
 
     @discord.ui.button(label="Post Assignments", style=discord.ButtonStyle.success, emoji="📣")
     async def post_assignments(  # type: ignore[override]
@@ -4566,6 +4668,8 @@ class PerPlayerAssignmentView(discord.ui.View):
             self.clan_name,
             self.assignments,
         )
+        if self.message is None and interaction.message is not None:
+            self.message = interaction.message
         channel = self.parent.channel
         if channel is None or not channel.permissions_for(self.guild.me).send_messages:
             await interaction.response.send_message(
@@ -4574,14 +4678,40 @@ class PerPlayerAssignmentView(discord.ui.View):
             )
             return
 
-        for chunk in _chunk_content(content):
-            await channel.send(chunk)
-        await interaction.response.edit_message(
-            content="✅ Assignments posted to the channel.",
-            view=None,
-        )
-        self.stop()
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
 
+        self._set_children_disabled(True)
+        await self._refresh_message()
+
+        try:
+            for chunk in _chunk_content(content):
+                await channel.send(chunk)
+        except discord.HTTPException as exc:
+            log.exception(
+                "PerPlayerAssignmentView failed to post assignments for clan %s: %s",
+                self.clan_name,
+                exc,
+            )
+            self._set_children_disabled(False)
+            await self._refresh_message()
+            await interaction.followup.send(
+                f"⚠️ Couldn't post assignments because Discord returned: {exc}.",
+                ephemeral=True,
+            )
+            return
+
+        success_text = "✅ Assignments posted to the channel."
+        if self.message is not None:
+            try:
+                await self.message.edit(content=success_text, view=None)
+            except discord.HTTPException as exc:
+                log.warning(
+                    "PerPlayerAssignmentView couldn't finalise the view after posting: %s",
+                    exc,
+                )
+        await interaction.followup.send(success_text, ephemeral=True)
+        self.stop()
     @discord.ui.button(label="Clear selections", style=discord.ButtonStyle.danger, emoji="🧹")
     async def clear_all(  # type: ignore[override]
         self,
@@ -4590,6 +4720,8 @@ class PerPlayerAssignmentView(discord.ui.View):
     ) -> None:
         log.debug("PerPlayerAssignmentView clearing assignments for clan %s", self.clan_name)
         self.clear_assignments()
+        if interaction.message is not None:
+            self.message = interaction.message
         await interaction.response.edit_message(
             content=self.render_message(),
             view=self,
@@ -4599,25 +4731,46 @@ class PerPlayerAssignmentView(discord.ui.View):
 class HomeBaseSelect(discord.ui.Select):
     """Select component that lets admins choose the home base to configure."""
 
-    def __init__(self, parent_view: PerPlayerAssignmentView):
+    def __init__(
+        self,
+        *,
+        parent_view: PerPlayerAssignmentView,
+        base_numbers: List[int],
+        placeholder: str,
+        row: int,
+        custom_id: str,
+    ):
         options = [
             discord.SelectOption(
-                label=f"{position}. {name}",
+                label=f"{position}. {parent_view.home_roster.get(position, f'Base {position}')}",
                 value=str(position),
                 description="Select to assign enemy targets.",
             )
-            for position, name in sorted(parent_view.home_roster.items())
+            for position in base_numbers
         ]
         super().__init__(
-            placeholder="Pick a home base to assign targets.",
+            placeholder=placeholder,
             min_values=1,
             max_values=1,
-            options=options[:25],
+            options=options,
+            row=row,
+            custom_id=custom_id,
         )
         self.parent_view = parent_view
 
     async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
-        base = int(self.values[0])
+        log.debug("HomeBaseSelect callback triggered values=%s", self.values)
+        try:
+            base = int(self.values[0])
+        except (ValueError, TypeError) as exc:
+            log.warning("HomeBaseSelect received invalid base value %s: %s", self.values, exc)
+            await interaction.response.send_message(
+                "⚠️ Something went wrong reading that base selection. Please try again.",
+                ephemeral=True,
+            )
+            return
+        if interaction.message is not None:
+            self.parent_view.message = interaction.message
         modal = AssignmentModal(parent_view=self.parent_view, base=base)
         await interaction.response.send_modal(modal)
 
@@ -4656,25 +4809,43 @@ class AssignmentModal(discord.ui.Modal):
             )
             return
 
-        for num in numbers:
-            if num < 1 or num > self.parent_view.max_enemy:
-                await interaction.response.send_message(
-                    f"⚠️ Enemy base {num} is not present in the current war.",
-                    ephemeral=True,
-                )
-                return
+        invalid_targets = [
+            num for num in numbers if num not in self.parent_view._valid_enemy_positions
+        ]
+        if invalid_targets:
+            guidance = ""
+            if self.parent_view.enemy_positions:
+                visible = ", ".join(str(num) for num in self.parent_view.enemy_positions[:10])
+                if len(self.parent_view.enemy_positions) > 10:
+                    visible += ", ..."
+                guidance = f" Valid bases include: {visible}."
+            await interaction.response.send_message(
+                f"⚠️ Enemy base {invalid_targets[0]} is not present in the current war.{guidance}",
+                ephemeral=True,
+            )
+            return
 
         self.parent_view.update_assignment(self.base, numbers)
+        await self.parent_view._refresh_message()
         log.debug(
             "AssignmentModal stored targets %s for base %s in clan %s",
             numbers,
             self.base,
             self.parent_view.clan_name,
         )
-        await interaction.response.edit_message(
-            content=self.parent_view.render_message(),
-            view=self.parent_view,
-        )
+        confirmation = f"✅ Stored assignment for base {self.base}."
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                confirmation,
+                ephemeral=True,
+                delete_after=5,
+            )
+        else:
+            await interaction.followup.send(
+                confirmation,
+                ephemeral=True,
+                delete_after=5,
+            )
 
 
 class GeneralAssignmentModal(discord.ui.Modal):
@@ -10158,20 +10329,15 @@ async def assign_bases(interaction: discord.Interaction, clan_name: str):
             ephemeral=True,
         )
         return
-    reason = None
     try:
-        war = await client.get_clan_war_raw(tag)
-        if getattr(war, "state", "").lower() in {"notinwar", "warended"}:
-            reason = getattr(war, "reason", "")
-            if not isinstance(reason, str) or "clan war league" not in reason.lower():  
-                raise notinWar(war.state)
-        if isinstance(reason, str) and "clan war league" in reason.lower():
-            war = await client.get_active_war_raw(tag)
-            if not war:
-                raise coc.errors.NotFound
-            home_roster, max_enemy, alert_role = await build_war_roster(member, war, interaction)
-        else:
-            home_roster, max_enemy, alert_role = await build_war_roster(member, war, interaction)
+        war = await client.get_active_war_raw(tag)
+        log.debug(
+            "assign_bases war fetched: is_cwl=%s state=%s clan=%s enemy=%s",
+            getattr(war, "is_cwl", None) if war else None,
+            getattr(war, "state", None) if war else None,
+            getattr(getattr(war, "clan", None), "name", None) if war else None,
+            getattr(getattr(war, "opponent", None), "name", None) if war else None,
+        )
     except coc.errors.PrivateWarLog:
         await send_text_response(
             interaction,
@@ -10186,17 +10352,33 @@ async def assign_bases(interaction: discord.Interaction, clan_name: str):
             ephemeral=True,
         )
         return
-    except notinWar as exc:
-        await send_text_response(
-            interaction,
-            f"⚠️ That clan isn't in an active war right now—per-player assignments aren't available.",
-            ephemeral=True,
-        )
-        return
     except Exception as exc:
         await send_text_response(
             interaction,
             f"⚠️ Unable to fetch war information: {exc}.",
+            ephemeral=True,
+        )
+        return
+
+    if war is None:
+        await send_text_response(
+            interaction,
+            "⚠️ That clan isn't in an active war right now—per-player assignments aren't available.",
+            ephemeral=True,
+        )
+        return
+
+    home_roster, enemy_positions, alert_role = await build_war_roster(member, war, interaction)
+    log.debug(
+        "assign_bases roster sizes: home=%d enemy=%d",
+        len(home_roster),
+        len(enemy_positions),
+    )
+
+    if not home_roster or not enemy_positions:
+        await send_text_response(
+            interaction,
+            "⚠️ I couldn't find a populated war roster for that clan yet. Try again once the war line-up is available.",
             ephemeral=True,
         )
         return
@@ -10205,36 +10387,78 @@ async def assign_bases(interaction: discord.Interaction, clan_name: str):
         interaction=interaction,
         clan_name=clan_name,
         home_roster=home_roster,
-        max_enemy=max_enemy,
+        enemy_positions=enemy_positions,
         alert_role=alert_role,
     )
-    intro = (
-        "After submitting the command with the clan name, choose how you want to share assignments:\n"
-        "• Use **Per Player Assignments** to build the familiar per-base list without memorising the syntax.\n"
-        "• Use **General Assignment Rule** for a quick broadcast such as “everyone attack your mirror.”"
-    )
+    log.debug("assign_bases view components=%s", [
+        (child.__class__.__name__, getattr(child, 'custom_id', None), getattr(child, 'row', None))
+        for child in view.children
+    ])
+    intro_lines = [
+        "After submitting the command with the clan name, choose how you want to share assignments.",
+        "• Use **Per Player Assignments** to build the familiar per-base list without memorising the syntax.",
+        "• Use **General Assignment Rule** for a quick broadcast such as \"everyone attack your mirror.\"",
+    ]
+    intro = "\n".join(intro_lines)
     await send_text_response(interaction, intro, ephemeral=True, view=view)
 
 async def build_war_roster(member, war, interaction):
-    sorted_home = [
-        member
-        for member in sorted(war.clan.members, key=lambda m: getattr(m, "map_position", 0))
-        if getattr(member, "map_position", None) is not None
-    ]
-    sorted_enemy = [
-        member
-        for member in sorted(war.opponent.members, key=lambda m: getattr(m, "map_position", 0))
-        if getattr(member, "map_position", None) is not None
-    ]
+    def _normalise_roster(members: List[Any], label: str) -> Dict[int, str]:
+        """Return a sequential mapping of base numbers to member names."""
+        roster_by_position: Dict[int, str] = {}
+        overflow: List[str] = []
+        raw_positions: List[Tuple[Optional[int], str]] = []
+        for entry in members:
+            position = getattr(entry, "map_position", None)
+            name = getattr(entry, "name", None) or "Unknown"
+            raw_positions.append((position, name))
+            if isinstance(position, int) and position > 0:
+                roster_by_position[position] = name
+            else:
+                overflow.append(name)
 
-    home_roster = {
-        member.map_position: getattr(member, "name", f"Base {member.map_position}")
-        for member in sorted_home
-    }
-    max_enemy = len(sorted_enemy)
+        if overflow:
+            next_slot = max(roster_by_position.keys(), default=0) + 1
+            for name in overflow:
+                while next_slot in roster_by_position:
+                    next_slot += 1
+                roster_by_position[next_slot] = name
+                next_slot += 1
+
+        ordered = dict(sorted(roster_by_position.items()))
+        expected_positions = list(range(1, len(ordered) + 1))
+        if list(ordered.keys()) != expected_positions:
+            remapped = {
+                index: name for index, (_, name) in enumerate(ordered.items(), start=1)
+            }
+            log.debug(
+                "build_war_roster %s remapping positions raw=%s original_keys=%s remapped_keys=%s",
+                label,
+                raw_positions,
+                list(ordered.keys()),
+                list(remapped.keys()),
+            )
+            return remapped
+
+        log.debug(
+            "build_war_roster %s positions raw=%s normalised=%s",
+            label,
+            raw_positions,
+            list(ordered.keys()),
+        )
+        return ordered
+
+    home_roster = _normalise_roster(list(getattr(war.clan, "members", [])), "home")
+    enemy_roster = _normalise_roster(list(getattr(war.opponent, "members", [])), "enemy")
+    enemy_positions = sorted(enemy_roster.keys())
 
     alert_role = discord.utils.get(interaction.guild.roles, name=ALERT_ROLE_NAME)
-    return home_roster, max_enemy, alert_role
+    log.debug(
+        "build_war_roster totals home=%d enemy=%d",
+        len(home_roster),
+        len(enemy_positions),
+    )
+    return home_roster, enemy_positions, alert_role
 # ---------------------------------------------------------------------------
 # Autocomplete
 
@@ -10357,3 +10581,5 @@ async def player_reference_autocomplete(interaction: discord.Interaction, curren
             break
 
     return suggestions[:25]
+
+

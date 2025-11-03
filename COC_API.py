@@ -1,4 +1,8 @@
+import asyncio
+from typing import Optional
+
 import coc
+from coc.enums import WarRound
 from ENV.Clan_Configs import server_config, save_server_config
 from logger import get_logger
 
@@ -18,17 +22,26 @@ class notinWar(Exception):
 class CoCAPI:
     def __init__(self, token):
         log.debug("CoCAPI initialised")
-        self.client = coc.Client()
+        self.client: Optional[coc.Client] = None
         self.token = token
+
+    def _require_client(self) -> coc.Client:
+        if self.client is None:
+            raise RuntimeError("Clash of Clans client not initialised. Call login() first.")
+        return self.client
 
     async def login(self):
         log.debug("CoCAPI.login invoked")
+        loop = asyncio.get_running_loop()
+        if self.client is not None:
+            await self.client.close()
+        self.client = coc.Client(loop=loop)
         await self.client.login_with_tokens(self.token)
         log.debug("CoCAPI.login completed")
 
     async def get_player(self, tag):
         log.debug("CoCAPI.get_player invoked")
-        player = await self.client.get_player(tag)
+        player = await self._require_client().get_player(tag)
         log.debug("CoCAPI.get_player fetched data")
         data = {
             "profile": {
@@ -114,16 +127,33 @@ class CoCAPI:
     async def get_clan_war_raw(self, tag: str):
         """Fetch the live war object for a clan tag."""
         log.debug("CoCAPI.get_clan_war_raw invoked")
-        result = await self.client.get_clan_war(tag)
+        result = await self._require_client().get_clan_war(tag)
         log.debug("CoCAPI.get_clan_war_raw fetched data")
         return result
 
     async def get_active_war_raw(self, tag: str):
-        #Fetch the rich war data for the specified clan in a clan war league
-        log.debug("CoCAPI.get_league_war_raw invoked")
-        result = await self.client.get_current_war(tag)
-        log.debug("CoCAPI.get_league_war_raw fetched data")
-        return result
+        """Fetch the current active war (regular or CWL) for a clan tag."""
+        log.debug("CoCAPI.get_active_war_raw invoked")
+        client = self._require_client()
+        war = await client.get_current_war(tag)
+        if war is None:
+            log.debug("CoCAPI.get_active_war_raw: no current war, checking current preparation round")
+            war = await client.get_current_war(
+                tag,
+                cwl_round=WarRound.current_preparation,
+            )
+        if war is None:
+            log.debug("CoCAPI.get_active_war_raw: no preparation war, checking previous round")
+            war = await client.get_current_war(
+                tag,
+                cwl_round=WarRound.previous_war,
+            )
+        log.debug(
+            "CoCAPI.get_active_war_raw fetched war: is_cwl=%s state=%s",
+            getattr(war, "is_cwl", None),
+            getattr(war, "state", None) if war else None,
+        )
+        return war
 
     async def get_clan_war_info(self, clan_name, guild_id):
         log.debug("CoCAPI.get_clan_war_info invoked")
@@ -142,7 +172,7 @@ class CoCAPI:
         tag = clans[clan_name].get("tag")
         if not tag:
             raise ClanNotConfiguredError(f"Clan '{clan_name}' has no tag configured.")
-        clan = await self.client.get_clan_war(tag)
+        clan = await self._require_client().get_clan_war(tag)
         log.debug("CoCAPI.get_clan_war_info fetched war data")
         data = {
             "home clan": clan.clan,
