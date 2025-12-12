@@ -54,7 +54,7 @@ class CoCAPI:
             "clan": {
                 "name": player.clan.name if player.clan else None,
                 "tag": player.clan.tag if player.clan else None,
-                "role": player.role,
+                "role": getattr(player, "role", None),
             },
             "league": player.league.name if player.league else None,
             "trophies": player.trophies,
@@ -104,6 +104,13 @@ class CoCAPI:
         }
         log.debug("CoCAPI.get_player returning payload")
         return data
+
+    async def get_clan(self, tag: str):
+        """Fetch a clan profile object for a clan tag."""
+        log.debug("CoCAPI.get_clan invoked")
+        clan = await self._require_client().get_clan(tag)
+        log.debug("CoCAPI.get_clan fetched data")
+        return clan
 
     def set_server_clan(self, guild_id: int, clan_name: str, tag: str, alerts_enabled: bool = True):
         log.debug("CoCAPI.set_server_clan invoked")

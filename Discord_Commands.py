@@ -62,6 +62,8 @@ DONATION_METRIC_INFO: Dict[str, str] = {
 
 # Cache of alert milestones sent per (guild, clan, war) tuple to avoid duplicates.
 alert_state: Dict[Tuple[int, str, str], Set[str]] = {}
+_dirty_war_alert_state_guilds: Set[int] = set()
+_war_alert_state_loaded = False
 
 
 def _record_command_usage(interaction: discord.Interaction, command_name: str) -> None:
@@ -216,12 +218,79 @@ def _alert_key(guild_id: int, clan_name: str, war_tag: str) -> Tuple[int, str, s
     return guild_id, clan_name, war_tag
 
 
+def _load_war_alert_state_from_config() -> None:
+    """Hydrate in-memory alert de-duplication state from persisted config."""
+    global _war_alert_state_loaded
+    if _war_alert_state_loaded:
+        return
+
+    for guild_id, guild_config in server_config.items():
+        stored = guild_config.get("war_alert_state")
+        if not isinstance(stored, dict):
+            continue
+
+        for clan_name, wars in stored.items():
+            if not isinstance(clan_name, str) or not isinstance(wars, dict):
+                continue
+            for war_tag, sent_ids in wars.items():
+                if not isinstance(war_tag, str) or not isinstance(sent_ids, list):
+                    continue
+                cleaned = {value for value in sent_ids if isinstance(value, str) and value}
+                if cleaned:
+                    alert_state[_alert_key(guild_id, clan_name, war_tag)] = cleaned
+
+    _war_alert_state_loaded = True
+
+
+def _serialise_war_alert_state_for_guild(guild_id: int) -> Dict[str, Dict[str, List[str]]]:
+    payload: Dict[str, Dict[str, List[str]]] = {}
+    for (key_guild_id, clan_name, war_tag), sent in alert_state.items():
+        if key_guild_id != guild_id:
+            continue
+        payload.setdefault(clan_name, {})[war_tag] = sorted(sent)
+    return payload
+
+
+def _persist_war_alert_state_for_guild(guild_id: int) -> bool:
+    """Persist alert de-duplication state for a guild; returns True if updated."""
+    guild_config = _ensure_guild_config(guild_id)
+    current = guild_config.get("war_alert_state")
+    if not isinstance(current, dict):
+        current = {}
+
+    payload = _serialise_war_alert_state_for_guild(guild_id)
+    if payload == current:
+        return False
+
+    guild_config["war_alert_state"] = payload
+    return True
+
+
+def _clear_war_alert_state_for_clan(guild_id: int, clan_name: str) -> None:
+    removed = False
+    for key in [k for k in alert_state.keys() if k[0] == guild_id and k[1] == clan_name]:
+        alert_state.pop(key, None)
+        removed = True
+    if removed:
+        _dirty_war_alert_state_guilds.add(guild_id)
+
+
+def _prune_war_alert_state_for_clan(guild_id: int, clan_name: str, keep_war_tag: str) -> None:
+    removed = False
+    for key in [k for k in alert_state.keys() if k[0] == guild_id and k[1] == clan_name and k[2] != keep_war_tag]:
+        alert_state.pop(key, None)
+        removed = True
+    if removed:
+        _dirty_war_alert_state_guilds.add(guild_id)
+
+
 def _mark_alert_sent(guild_id: int, clan_name: str, war_tag: str, alert_id: str) -> bool:
     """Record an alert and return True if it has not been sent before."""
     sent = alert_state.setdefault(_alert_key(guild_id, clan_name, war_tag), set())
     if alert_id in sent:
         return False
     sent.add(alert_id)
+    _dirty_war_alert_state_guilds.add(guild_id)
     return True
 
 
@@ -2859,6 +2928,24 @@ def _ensure_guild_config(guild_id: int) -> Dict[str, Any]:
                 }
             )
     guild_config["upgrade_log"] = normalised_log
+    war_alert_state = guild_config.get("war_alert_state")
+    if not isinstance(war_alert_state, dict):
+        war_alert_state = {}
+    # Ensure the nested shape is stable: clan_name -> war_tag -> list[str].
+    normalised_state: Dict[str, Dict[str, List[str]]] = {}
+    for clan_name, wars in war_alert_state.items():
+        if not isinstance(clan_name, str) or not isinstance(wars, dict):
+            continue
+        clan_payload: Dict[str, List[str]] = {}
+        for war_tag, sent_ids in wars.items():
+            if not isinstance(war_tag, str) or not isinstance(sent_ids, list):
+                continue
+            cleaned = [value for value in sent_ids if isinstance(value, str) and value]
+            if cleaned:
+                clan_payload[war_tag] = cleaned
+        if clan_payload:
+            normalised_state[clan_name] = clan_payload
+    guild_config["war_alert_state"] = normalised_state
     return guild_config
 
 
@@ -3878,12 +3965,13 @@ async def war_alert_loop() -> None:
     """Poll tracked clans and emit time-based war reminders."""
     log.debug("war_alert_loop tick")
     now = datetime.now(timezone.utc)
-    for guild_id, config in server_config.items():
+    for guild_id in list(server_config.keys()):
+        guild_config = _ensure_guild_config(guild_id)
         guild = bot.get_guild(guild_id)
         if guild is None:
             continue  # Skip guilds the bot is not currently connected to
 
-        clans: Dict[str, Dict[str, Any]] = config.get("clans", {})  # type: ignore[assignment]
+        clans: Dict[str, Dict[str, Any]] = guild_config.get("clans", {})  # type: ignore[assignment]
         if not clans:
             continue  # Nothing configured for this guild
 
@@ -3933,13 +4021,22 @@ async def war_alert_loop() -> None:
 
             try:
                 war = await client.get_clan_war_raw(tag)
-            except (coc.errors.PrivateWarLog, coc.errors.NotFound, coc.errors.GatewayError):
+            except coc.errors.NotFound:
+                _clear_war_alert_state_for_clan(guild.id, clan_name)
+                continue  # Skip clans without accessible war data
+            except (coc.errors.PrivateWarLog, coc.errors.GatewayError):
                 continue  # Skip clans without accessible war data
             except Exception:
                 continue  # Fail-safe for unexpected library errors
 
+            _prune_war_alert_state_for_clan(guild.id, clan_name, getattr(war, "war_tag", None) or tag)
             for alert in _collect_war_alerts(guild, clan_name, tag, war, alert_role, now):
                 await send_channel_message(target_channel, alert)
+
+        if guild_id in _dirty_war_alert_state_guilds:
+            if _persist_war_alert_state_for_guild(guild_id):
+                save_server_config()
+            _dirty_war_alert_state_guilds.discard(guild_id)
 
 
 @war_alert_loop.before_loop
@@ -3952,6 +4049,7 @@ async def _war_alert_loop_ready() -> None:
 def ensure_war_alert_loop_running() -> None:
     """Start the alert loop once the bot is ready."""
     log.debug("ensure_war_alert_loop_running called")
+    _load_war_alert_state_from_config()
     if not war_alert_loop.is_running():
         war_alert_loop.start()
 
@@ -10581,5 +10679,3 @@ async def player_reference_autocomplete(interaction: discord.Interaction, curren
             break
 
     return suggestions[:25]
-
-
