@@ -21,7 +21,7 @@ from logger import get_logger, log_command_call, get_usage_summary
 
 log = get_logger()
 from COC_API import ClanNotConfiguredError, GuildNotConfiguredError, notinWar
-from ENV.Clan_Configs import save_server_config, server_config
+from Clan_Configs import save_server_config, server_config
 
 
 MAX_MESSAGE_LENGTH = 1900

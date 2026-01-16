@@ -3,7 +3,7 @@ from typing import Optional
 
 import coc
 from coc.enums import WarRound
-from ENV.Clan_Configs import server_config, save_server_config
+from Clan_Configs import server_config, save_server_config
 from logger import get_logger
 
 log = get_logger()
