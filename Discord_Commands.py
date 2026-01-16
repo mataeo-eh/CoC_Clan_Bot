@@ -651,6 +651,24 @@ async def _link_player_account(
     target_label = target.display_name if isinstance(target, discord.Member) else str(target.id)
     return f"✅ Removed `{normalised_tag}` from {target_label}."
 
+# ---------------------------------------------------------------------------
+# Command for Logging Silent Slash Command Failures
+# ---------------------------------------------------------------------------
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    """Catch and log all slash command errors."""
+    command_name = interaction.command.name if interaction.command else "unknown"
+    log.error(f"Slash command '{command_name}' failed: {error}", exc_info=True)
+    
+    # Optionally notify the user something went wrong
+    try:
+        await interaction.response.send_message(
+            "An error occurred while processing this command. The error has been logged. If you wish to tell the developer more about what happened, you can join the support server linked through this invite code \n \
+                https://discord.gg/QSAkgVhzDp",
+            ephemeral=True
+        )
+    except:
+        pass  # Interaction might already be responded to
 
 # ---------------------------------------------------------------------------
 # Slash command: /set_clan
