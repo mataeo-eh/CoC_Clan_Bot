@@ -689,6 +689,7 @@ async def set_clan(
     view = SetClanView(
         guild=interaction.guild,
         selected_clan=selected_clan,
+        actor=interaction.user,
     )
 
     await interaction.response.send_message(
