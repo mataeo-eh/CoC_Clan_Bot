@@ -1286,7 +1286,7 @@ async def dashboard(
     if not clan_map:
         await send_text_response(
             interaction,
-            "?? No clans are configured yet. Use `/set_clan` before running the dashboard.",
+            "No clans are configured yet. Use `/set_clan` before running the dashboard.",
             ephemeral=True,
         )
         return
@@ -1296,7 +1296,7 @@ async def dashboard(
     if clan_entry is None:
         await send_text_response(
             interaction,
-            f"?? `{selected_clan}` is not configured.",
+            f"{selected_clan} is not configured.",
             ephemeral=True,
         )
         return
@@ -1557,7 +1557,7 @@ async def war_plan(
     if interaction.guild is None:
         await send_text_response(
             interaction,
-            "?? This command must be used inside a Discord server.",
+            "This command must be used inside a Discord server.",
             ephemeral=True,
         )
         return
@@ -1569,7 +1569,7 @@ async def war_plan(
     if not clan_map:
         await send_text_response(
             interaction,
-            "?? No clans are configured yet. Use `/set_clan` before posting war plans.",
+            "No clans are configured yet. Use `/set_clan` before posting war plans.",
             ephemeral=True,
         )
         return
@@ -2048,7 +2048,7 @@ async def configure_event_role(
     if interaction.guild is None:
         await send_text_response(
             interaction,
-            '? This command must be used inside a Discord server.',
+            'This command must be used inside a Discord server.',
             ephemeral=True,
         )
         return
@@ -2056,7 +2056,7 @@ async def configure_event_role(
     if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
         await send_text_response(
             interaction,
-            '? Only administrators can configure event roles.',
+            'Only administrators can configure event roles.',
             ephemeral=True,
         )
         return
@@ -2065,7 +2065,7 @@ async def configure_event_role(
     if not events:
         await send_text_response(
             interaction,
-            '?? Event role settings are unavailable. Try again later.',
+            'Event role settings are unavailable. Try again later.',
             ephemeral=True,
         )
         return
@@ -2122,7 +2122,7 @@ async def event_alert_opt(
     if actor is None:
         await send_text_response(
             interaction,
-            "?? I couldn't resolve your member account.",
+            "I couldn't resolve your member account.",
             ephemeral=True,
         )
         return
@@ -2137,7 +2137,7 @@ async def event_alert_opt(
         details = f" Available events: {available}." if available else ""
         await send_text_response(
             interaction,
-            f"?? I couldn't find an event named `{event_type}`.{details}",
+            f"I couldn't find an event named `{event_type}`.{details}",
             ephemeral=True,
         )
         return
@@ -2146,7 +2146,7 @@ async def event_alert_opt(
     if target != actor and not actor.guild_permissions.administrator:
         await send_text_response(
             interaction,
-            "? Only administrators can toggle event roles for other members.",
+            "Only administrators can toggle event roles for other members.",
             ephemeral=True,
         )
         return
@@ -2156,7 +2156,7 @@ async def event_alert_opt(
     if role is None:
         await send_text_response(
             interaction,
-            f"?? `{label}` does not have a role configured yet. Ask an administrator to run `/configure_event_role` first.",
+            f"{label} does not have a role configured yet. Ask an administrator to run `/configure_event_role` first.",
             ephemeral=True,
         )
         return
@@ -2169,14 +2169,14 @@ async def event_alert_opt(
     except discord.Forbidden:
         await send_text_response(
             interaction,
-            "?? I don't have permission to modify that role for the target member.",
+            "You don't have permission to modify that role for the target member.",
             ephemeral=True,
         )
         return
     except discord.HTTPException as exc:
         await send_text_response(
             interaction,
-            f"?? Failed to update roles: {exc}",
+            f"Failed to update roles: {exc}",
             ephemeral=True,
         )
         return
@@ -2184,7 +2184,7 @@ async def event_alert_opt(
     action = "now receiving" if enable else "no longer receiving"
     await send_text_response(
         interaction,
-        f"? {target.mention} is {action} {label} alerts.",
+        f"{target.mention} is {action} {label} alerts.",
         ephemeral=True,
     )
 
@@ -5799,7 +5799,7 @@ class DashboardRunPreviewButton(discord.ui.Button):
         clan_entry = _get_clan_entry(self.parent_view.guild.id, self.parent_view.selected_clan)
         if clan_entry is None:
             await interaction.followup.send(
-                f"?? `{self.parent_view.selected_clan}` is no longer configured.",
+                f"{self.parent_view.selected_clan} is no longer configured.",
                 ephemeral=True,
             )
             return
@@ -5810,11 +5810,11 @@ class DashboardRunPreviewButton(discord.ui.Button):
                 self.parent_view.selected_modules,
             )
         except ValueError as exc:
-            await interaction.followup.send(f"?? {exc}", ephemeral=True)
+            await interaction.followup.send(f"{exc}", ephemeral=True)
             return
 
         if not sections:
-            await interaction.followup.send("?? No dashboard content was produced.", ephemeral=True)
+            await interaction.followup.send("No dashboard content was produced.", ephemeral=True)
             return
 
         embed = None
@@ -5850,13 +5850,13 @@ class DashboardRunPostButton(discord.ui.Button):
         channel = self.parent_view.get_destination_channel()
         if channel is None:
             await interaction.response.send_message(
-                "?? I couldn't determine a channel to post in. Select one or run the command in a text channel.",
+                "I couldn't determine a channel to post in. Select one or run the command in a text channel.",
                 ephemeral=True,
             )
             return
         if not channel.permissions_for(channel.guild.me).send_messages:
             await interaction.response.send_message(
-                "?? I don't have permission to post in that channel.",
+                "I don't have permission to post in that channel.",
                 ephemeral=True,
             )
             return
@@ -5865,7 +5865,7 @@ class DashboardRunPostButton(discord.ui.Button):
         clan_entry = _get_clan_entry(self.parent_view.guild.id, self.parent_view.selected_clan)
         if clan_entry is None:
             await interaction.followup.send(
-                f"?? `{self.parent_view.selected_clan}` is no longer configured.",
+                f"`{self.parent_view.selected_clan}` is no longer configured.",
                 ephemeral=True,
             )
             return
@@ -5879,10 +5879,10 @@ class DashboardRunPostButton(discord.ui.Button):
                 destination=channel,
             )
         except ValueError as exc:
-            await interaction.followup.send(f"?? {exc}", ephemeral=True)
+            await interaction.followup.send(f"{exc}", ephemeral=True)
         except discord.HTTPException as exc:
             await interaction.followup.send(
-                f"?? Failed to post the dashboard: {exc}",
+                f"Failed to post the dashboard: {exc}",
                 ephemeral=True,
             )
 
@@ -8112,7 +8112,7 @@ class SetClanSelect(discord.ui.Select):
         self.parent_view = parent_view
         options: List[discord.SelectOption] = [
             discord.SelectOption(
-                label="? Create new clan",
+                label="Create new clan",
                 value="__new__",
                 description="Add a brand new clan configuration",
                 default=parent_view.selected_name is None,
@@ -9959,7 +9959,7 @@ class RegisterMeView(discord.ui.View):
     ) -> None:
         if not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message(
-                "?? I can only manage roles for members inside this server.",
+                "I can only manage roles for members inside this server.",
                 ephemeral=True,
             )
             return
@@ -9967,7 +9967,7 @@ class RegisterMeView(discord.ui.View):
         is_owner = interaction.user.id == self.member.id
         if not is_owner and not interaction.user.guild_permissions.administrator:
             await interaction.response.send_message(
-                "?? Only the member themselves or an administrator can manage these roles here.",
+                "Only the member themselves or an administrator can manage these roles here.",
                 ephemeral=True,
             )
             return
@@ -9975,7 +9975,7 @@ class RegisterMeView(discord.ui.View):
         role = self.guild.get_role(role_id)
         if role is None:
             await interaction.response.send_message(
-                "?? That role no longer exists. Ask an admin to reconfigure it.",
+                "That role no longer exists. Ask an admin to reconfigure it.",
                 ephemeral=True,
             )
             return
@@ -9988,7 +9988,7 @@ class RegisterMeView(discord.ui.View):
 
         if target_member is None:
             await interaction.response.send_message(
-                "?? I couldn't resolve your member details right now. Please try again shortly.",
+                "I couldn't resolve your member details right now. Please try again shortly.",
                 ephemeral=True,
             )
             return
@@ -9996,22 +9996,22 @@ class RegisterMeView(discord.ui.View):
         try:
             if role in getattr(target_member, "roles", []):
                 await interaction.response.send_message(
-                    f"?? You have already signed up for {role_name} alert(s).",
+                    f"You have already signed up for {role_name} alert(s).",
                     ephemeral=True,
                 )
                 return
 
             await target_member.add_roles(role, reason="RegisterMe subscription")
-            message = f"? {target_member.mention} is now subscribed to {role_name} alert(s)."
+            message = f"{target_member.mention} is now subscribed to {role_name} alert(s)."
         except discord.Forbidden:
             await interaction.response.send_message(
-                "?? I don't have permission to modify that role.",
+                "I don't have permission to modify that role.",
                 ephemeral=True,
             )
             return
         except discord.HTTPException as exc:
             await interaction.response.send_message(
-                f"?? Failed to update roles: {exc}",
+                f"Failed to update roles: {exc}",
                 ephemeral=True,
             )
             return
