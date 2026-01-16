@@ -5,11 +5,24 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+import os
+from dotenv import load_dotenv
 
+load_dotenv()
+try:
+    LOG_NAME = os.getenv("LOG_NAME", "coc_bot")
+    if LOG_NAME is None:
+        raise ValueError("LOG_NAME environment variable not set")
+    LOG_DIRECTORY = Path(os.getenv("LOG_DIRECTORY", "/data/logs"))
+    if LOG_DIRECTORY is None:
+        raise ValueError("LOG_DIRECTORY environment variable not set")
+    LOG_RETENTION_DAYS = (os.getenv("LOG_RETENTION_DAYS", 7))
+    if LOG_RETENTION_DAYS is None:
+        raise ValueError("LOG_RETENTION_DAYS environment variable not set")
+except Exception as e:
+    print(f"Error loading logging configuration: {e}")
+    raise
 
-LOG_NAME = "coc_bot"
-LOG_DIRECTORY = Path("logs")
-LOG_RETENTION_DAYS = 7
 _logger = logging.getLogger(LOG_NAME)
 _command_counters: Counter[str] = Counter()
 _command_metadata: Dict[str, Dict[str, Optional[datetime]]] = {}
