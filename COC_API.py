@@ -49,17 +49,21 @@ class CoCAPI:
                 "tag": player.tag,
                 "exp_level": player.exp_level,
                 "town_hall_level": getattr(player, "town_hall", None),
-                "builder_hall_level": getattr(player, "builder_hall_level", None),
+                "builder_hall_level": getattr(player, "builder_hall", None),
             },
             "clan": {
                 "name": player.clan.name if player.clan else None,
                 "tag": player.clan.tag if player.clan else None,
                 "role": getattr(player, "role", None),
             },
-            "league": player.league.name if player.league else None,
+            "league": {
+                "name": player.league.name if player.league else None,
+                "id": player.league.id if player.league else None,
+                "icon": player.league.icon if player.league else None,
+            },
             "trophies": player.trophies,
             "best_trophies": getattr(player, "best_trophies", None),
-            "versus_trophies": getattr(player, "versus_trophies", None),
+            "versus_trophies": getattr(player, "builder_base_trophies", None),
             "war_stars": getattr(player, "war_stars", None),
             "attack_wins": getattr(player, "attack_wins", None),
             "defense_wins": getattr(player, "defense_wins", None),
@@ -67,27 +71,27 @@ class CoCAPI:
             "donations_received": getattr(player, "donations_received", None),
             "heroes": [
                 {
-                    "name": hero.name,
-                    "level": hero.level,
-                    "max_level": hero.max_level,
-                    "village": hero.village,
+                    "name ": hero.name,
+                    "level ": hero.level,
+                    "max_level ": hero.max_level,
+                    "village ": hero.village,
                 }
                 for hero in getattr(player, "heroes", [])
             ],
             "troops": [
                 {
-                    "name": troop.name,
-                    "level": troop.level,
-                    "max_level": troop.max_level,
-                    "village": troop.village,
+                    "name ": troop.name,
+                    "level ": troop.level,
+                    "max_level ": troop.max_level,
+                    "village ": troop.village,
                 }
                 for troop in getattr(player, "troops", [])
             ],
             "spells": [
                 {
-                    "name": spell.name,
-                    "level": spell.level,
-                    "max_level": spell.max_level,
+                    "name ": spell.name,
+                    "level ": spell.level,
+                    "max_level ": spell.max_level,
                 }
                 for spell in getattr(player, "spells", [])
             ],
