@@ -1618,6 +1618,8 @@ async def war_plan(
         view.message = await interaction.original_response()
     except discord.HTTPException as exc:
         log.warning("Failed to capture war_plan view message: %s", exc)
+
+# ---------------------------------------------------------------------------
 # Slash command: /player_info
 # ---------------------------------------------------------------------------
 @bot.tree.command(name="player_info", description="Display detailed information about a Clash of Clans player.")
@@ -1905,6 +1907,8 @@ async def configure_donation_metrics(
         view.message = await interaction.original_response()
     except discord.HTTPException as exc:
         log.warning("Unable to capture configure_donation_metrics message handle: %s", exc)
+
+        
 # ---------------------------------------------------------------------------
 # Slash command: /set_donation_channel
 # ---------------------------------------------------------------------------
@@ -10513,7 +10517,7 @@ async def assign_bases(interaction: discord.Interaction, clan_name: str):
     ])
     intro_lines = [
         "After submitting the command with the clan name, choose how you want to share assignments.",
-        "• Use **Per Player Assignments** to build the familiar per-base list without memorising the syntax.",
+        "• Use **Per Player Assignments** to build the familiar per-base assignment list.",
         "• Use **General Assignment Rule** for a quick broadcast such as \"everyone attack your mirror.\"",
     ]
     intro = "\n".join(intro_lines)
@@ -10575,13 +10579,14 @@ async def build_war_roster(member, war, interaction):
         len(home_roster),
         len(enemy_positions),
     )
-    return home_roster, enemy_positions, alert_role
-# ---------------------------------------------------------------------------
-# Autocomplete
+    return home_roster, enemy_positions, alert_role 
+
+
 
 # ---------------------------------------------------------------------------
 # Slash command: /assign_clan_role
 # ---------------------------------------------------------------------------
+
 @bot.tree.command(name="assign_clan_role", description="Self-assign your clan role via select menu.")
 async def assign_clan_role(interaction: discord.Interaction):
     """Allow members to pick a clan role matching configured clans."""
