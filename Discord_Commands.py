@@ -28,7 +28,7 @@ MAX_MESSAGE_LENGTH = 1900
 ALERT_ROLE_NAME = "War Alerts"
 # Matches the poll frequency of the background alert loop (5 minutes).
 ALERT_WINDOW_SECONDS = 300
-README_URL = "https://github.com/mataeo/COC_Clan_Bot/blob/main/README.md"
+README_URL = "https://github.com/mataeo-eh/CoC_Clan_Bot/tree/main"
 WAR_NUDGE_REASONS = ("unused_attacks", "no_attacks", "low_stars")
 DEFAULT_EVENT_DEFINITIONS: "OrderedDict[str, Dict[str, str]]" = OrderedDict(
     [
@@ -1493,6 +1493,7 @@ async def save_war_plan(
         clan_map=clan_map,
         selected_clan=selected_clan,
         preselected_plan=plan_name,
+        actor=interaction.user,
     )
 
     await interaction.response.send_message(
