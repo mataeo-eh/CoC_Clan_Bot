@@ -1493,6 +1493,7 @@ async def save_war_plan(
         clan_map=clan_map,
         selected_clan=selected_clan,
         preselected_plan=plan_name,
+        actor=interaction.user,
     )
 
     await interaction.response.send_message(
@@ -1618,6 +1619,7 @@ async def war_plan(
         view.message = await interaction.original_response()
     except discord.HTTPException as exc:
         log.warning("Failed to capture war_plan view message: %s", exc)
+
 
 # ---------------------------------------------------------------------------
 # Slash command: /player_info
@@ -7691,8 +7693,17 @@ class WarPlanView(discord.ui.View):
         self.plan_store[plan_name] = {
             "content": self.plan_content,
             "updated_at": datetime.utcnow().isoformat(),
-            "updated_by": self.actor.id,
+            "updated_by": interaction.user.id,
         }
+        current = self.plan_store.get(plan_name)
+        if current:
+            if current.get("updated_at") != self.loaded_updated_at:
+                await interaction.response.send_message(
+                    "This plan was modified by someone else while you were editing. "
+                    "Please reopen the editor to avoid overwriting their changes.",
+                    ephemeral=True,
+                )
+                return
         save_server_config()
 
         self.available_plan_names = list(self.plan_store.keys())
