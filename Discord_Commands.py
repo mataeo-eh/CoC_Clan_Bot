@@ -7688,7 +7688,7 @@ class WarPlanView(discord.ui.View):
         self.plan_store[plan_name] = {
             "content": self.plan_content,
             "updated_at": datetime.utcnow().isoformat(),
-            "updated_by": self.actor.id,
+            "updated_by": interaction.user.id,
         }
         save_server_config()
 
