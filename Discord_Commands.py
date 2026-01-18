@@ -7697,7 +7697,7 @@ class WarPlanView(discord.ui.View):
         }
         current = self.plan_store.get(plan_name)
         if current:
-            if current.get("updated_at") != self.loaded_updated_at:
+            if current.get("updated_at") != self.last_updated_at:
                 await interaction.response.send_message(
                     "This plan was modified by someone else while you were editing. "
                     "Please reopen the editor to avoid overwriting their changes.",
