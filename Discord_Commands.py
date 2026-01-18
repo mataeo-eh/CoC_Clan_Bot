@@ -2626,7 +2626,7 @@ def _format_player_value(key: str, player_info: Dict[str, Any]) -> str:
             f"Tag: {profile.get('tag', 'N/A')}\n"
             f"Exp Level: {_fmt_numeric(profile.get('exp_level'))}\n"
             f"Town Hall: TH{profile.get('town_hall_level') or '?'}\n"
-            f"Builder Hall: BH{profile.get('builder_hall_level') or '?'}"
+            f"Builder Hall: BH{profile.get('builder_hall_level') or ' ?'}"
         )
 
     if key == "clan":
@@ -2640,14 +2640,15 @@ def _format_player_value(key: str, player_info: Dict[str, Any]) -> str:
         )
 
     if key == "league":
-        league = player_info.get("league")
+        league_dict = player_info.get("league")
+        league = f"League: {league_dict.get('name')} \nLeague ID: {league_dict.get('id')} \n {league_dict.get('icon')}" 
         return league or "Unranked"
 
     if key == "trophies_overview":
         return (
             f"Home: {_fmt_numeric(player_info.get('trophies'))} "
             f"(Best: {_fmt_numeric(player_info.get('best_trophies'))})\n"
-            f"Versus: {_fmt_numeric(player_info.get('versus_trophies'))}"
+            f"Builder Base: {_fmt_numeric(player_info.get('versus_trophies'))}"
         )
 
     if key == "war_stats":
@@ -4241,7 +4242,7 @@ class PlayerInfoView(discord.ui.View):
     @discord.ui.select(
         placeholder="Select the player details to display",
         min_values=1,
-        max_values=min(5, len(PLAYER_INFO_FIELD_MAP)),
+        max_values=len(PLAYER_INFO_FIELD_MAP),
         options=[
             discord.SelectOption(label=label, value=key)
             for key, label in PLAYER_INFO_FIELD_MAP.items()
