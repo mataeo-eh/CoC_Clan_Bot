@@ -1,8 +1,9 @@
 import re
 import json
+from pathlib import Path
 
 def parse_commands(filepath):
-    with open(filepath, 'r') as f:
+    with open(filepath, 'r', encoding='utf-8') as f:
         lines = f.readlines()
     
     commands = {}
@@ -12,7 +13,7 @@ def parse_commands(filepath):
         line = lines[i]
         
         # Found a command decorator
-        if '@bot.tree.command()' in line:
+        if '@bot.tree.command(' in line:
             decorator_line = i
             
             # Next line should be the function definition
@@ -59,7 +60,16 @@ def parse_commands(filepath):
 
 if __name__ == "__main__":
         
+    # Get project root (Scripts/../ = project root)
+    script_dir = Path(__file__).parent
+    project_root = script_dir.parent
+
     # Generate index
-    commands = parse_commands('../Discord_Commands.py')
-    with open('../command_index.json', 'w') as f:
+    commands_file = project_root / 'Discord_Commands.py'
+    output_file = project_root / 'command_index.json'
+
+    commands = parse_commands(commands_file)
+    with open(output_file, 'w') as f:
         json.dump(commands, indent=2, fp=f)
+
+    print(f"Generated index with {len(commands)} commands")
