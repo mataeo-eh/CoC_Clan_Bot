@@ -1,7 +1,14 @@
 {
   "set_clan": {
     "start_line": 676,
-    "end_line": 682
+    "end_line": 726,
+    "view_classes": [
+      {
+        "name": "SetClanView",
+        "start_line": 8334,
+        "end_line": 8552
+      }
+    ]
   },
   "help_command": {
     "start_line": 727,
@@ -33,11 +40,25 @@
   },
   "choose_war_alert_channel": {
     "start_line": 917,
-    "end_line": 1026
+    "end_line": 1026,
+    "view_classes": [
+      {
+        "name": "ChooseWarAlertChannelView",
+        "start_line": 4412,
+        "end_line": 4557
+      }
+    ]
   },
   "configure_war_nudge": {
     "start_line": 1027,
-    "end_line": 1036
+    "end_line": 1083,
+    "view_classes": [
+      {
+        "name": "WarNudgeConfigView",
+        "start_line": 9627,
+        "end_line": 9855
+      }
+    ]
   },
   "war_nudge": {
     "start_line": 1084,
@@ -45,19 +66,47 @@
   },
   "configure_dashboard": {
     "start_line": 1219,
-    "end_line": 1230
+    "end_line": 1282,
+    "view_classes": [
+      {
+        "name": "DashboardConfigView",
+        "start_line": 5093,
+        "end_line": 5167
+      }
+    ]
   },
   "dashboard": {
     "start_line": 1283,
-    "end_line": 1289
+    "end_line": 1355,
+    "view_classes": [
+      {
+        "name": "DashboardRunView",
+        "start_line": 5938,
+        "end_line": 6050
+      }
+    ]
   },
   "link_player": {
     "start_line": 1356,
-    "end_line": 1371
+    "end_line": 1442,
+    "view_classes": [
+      {
+        "name": "LinkPlayerView",
+        "start_line": 9027,
+        "end_line": 9198
+      }
+    ]
   },
   "save_war_plan": {
     "start_line": 1443,
-    "end_line": 1451
+    "end_line": 1512,
+    "view_classes": [
+      {
+        "name": "WarPlanView",
+        "start_line": 7521,
+        "end_line": 7769
+      }
+    ]
   },
   "list_war_plans": {
     "start_line": 1513,
@@ -65,15 +114,36 @@
   },
   "war_plan": {
     "start_line": 1560,
-    "end_line": 1570
+    "end_line": 1626,
+    "view_classes": [
+      {
+        "name": "WarPlanPostView",
+        "start_line": 7922,
+        "end_line": 8147
+      }
+    ]
   },
   "player_info": {
     "start_line": 1627,
-    "end_line": 1699
+    "end_line": 1699,
+    "view_classes": [
+      {
+        "name": "PlayerInfoView",
+        "start_line": 4238,
+        "end_line": 4295
+      }
+    ]
   },
   "plan_upgrade": {
     "start_line": 1700,
-    "end_line": 1709
+    "end_line": 1815,
+    "view_classes": [
+      {
+        "name": "PlanUpgradeView",
+        "start_line": 6268,
+        "end_line": 6524
+      }
+    ]
   },
   "set_upgrade_channel": {
     "start_line": 1816,
@@ -81,51 +151,93 @@
   },
   "configure_donation_metrics": {
     "start_line": 1861,
-    "end_line": 1870
+    "end_line": 1916,
+    "view_classes": [
+      {
+        "name": "DonationConfigView",
+        "start_line": 10137,
+        "end_line": 10228
+      }
+    ]
   },
   "set_donation_channel": {
     "start_line": 1917,
-    "end_line": 1928
+    "end_line": 1976
   },
   "donation_summary": {
     "start_line": 1977,
-    "end_line": 1985
+    "end_line": 2056
   },
   "configure_event_role": {
     "start_line": 2057,
-    "end_line": 2066
+    "end_line": 2117,
+    "view_classes": [
+      {
+        "name": "EventRoleConfigView",
+        "start_line": 5446,
+        "end_line": 5765
+      }
+    ]
   },
   "event_alert_opt": {
     "start_line": 2118,
-    "end_line": 2131
+    "end_line": 2216
   },
   "register_me": {
     "start_line": 2240,
-    "end_line": 2287
+    "end_line": 2287,
+    "view_classes": [
+      {
+        "name": "RegisterMeView",
+        "start_line": 9878,
+        "end_line": 10061
+      }
+    ]
   },
   "set_season_summary_channel": {
     "start_line": 2288,
-    "end_line": 2299
+    "end_line": 2347
   },
   "season_summary": {
     "start_line": 2348,
-    "end_line": 2359
+    "end_line": 2432,
+    "view_classes": [
+      {
+        "name": "SeasonSummaryView",
+        "start_line": 8679,
+        "end_line": 8863
+      }
+    ]
   },
   "schedule_report": {
     "start_line": 3806,
-    "end_line": 3817
+    "end_line": 3885,
+    "view_classes": [
+      {
+        "name": "ScheduleConfigView",
+        "start_line": 6913,
+        "end_line": 7284
+      }
+    ]
   },
   "list_schedules": {
     "start_line": 3886,
-    "end_line": 3945
+    "end_line": 3893
   },
   "cancel_schedule": {
     "start_line": 3946,
-    "end_line": 3994
+    "end_line": 3953
   },
   "clan_war_info_menu": {
     "start_line": 4196,
-    "end_line": 4237
+    "end_line": 4237,
+    "view_classes": [
+      {
+        "name": "WarInfoView",
+        "start_line": 4134,
+        "end_line": 4195
+      }
+    ]
   },
   "toggle_war_alerts": {
     "start_line": 10353,
@@ -133,10 +245,24 @@
   },
   "assign_bases": {
     "start_line": 10436,
-    "end_line": 10543
+    "end_line": 10543,
+    "view_classes": [
+      {
+        "name": "AssignBasesModeView",
+        "start_line": 4558,
+        "end_line": 4629
+      }
+    ]
   },
   "assign_clan_role": {
     "start_line": 10608,
-    "end_line": 10645
+    "end_line": 10645,
+    "view_classes": [
+      {
+        "name": "RoleAssignmentView",
+        "start_line": 10229,
+        "end_line": 10272
+      }
+    ]
   }
 }
