@@ -48,19 +48,30 @@ def convert_tool_format(tool):
     return converted_tool
 
 class MCPClient:
-    def __init__(self, model=None, temperature=0.7, streaming = False, extra_body = None):
+    def __init__(
+            self, model=None, temperature=1.0, streaming=False, 
+            extra_body=None, system_prompt=None
+        ):
         self.sessions = {}
         self.exit_stack = AsyncExitStack()
         self.openai = OpenAI(base_url=base_url, api_key=api_key)
         self.model = model or MODEL
-
-        # Stores conversation history for the current session
-        self.messages = []  # Move this here from connect_to_servers
-
-        # Store additional API parameters
+        self.messages = []
+        
+        # Store API parameters
         self.temperature = temperature
         self.streaming = streaming
         self.extra_body = extra_body or {}
+        
+        # Store system prompt
+        self.system_prompt = system_prompt
+        
+        # Default system prompt for tool usage guidance
+        self.default_tool_guidance = (
+            "You have access to a Python code execution tool. Only use it when the calculation "
+            "is complex or when you're uncertain. For simple arithmetic (like factorial, basic "
+            "multiplication, etc.), calculate directly without using tools."
+        )
     
     async def __aenter__(self):
         """Called when entering 'async with' block"""
@@ -89,8 +100,27 @@ class MCPClient:
             response = await session.list_tools()
             print(f"\n{name} server tools:", [tool.name for tool in response.tools])
     
+    def _ensure_system_prompt(self):
+        """Add system prompt if this is the first message and system prompt is set"""
+        if len(self.messages) == 0:
+            # Combine custom system prompt with default tool guidance
+            if self.system_prompt:
+                # User provided a custom system prompt
+                full_prompt = f"{self.system_prompt}\n\n{self.default_tool_guidance}"
+            else:
+                # Just use tool guidance
+                full_prompt = self.default_tool_guidance
+            
+            self.messages.append({
+                "role": "system",
+                "content": full_prompt
+            })
+    
     async def query(self, prompt: str) -> str:
         """Send a query and get a response - maintains conversation history"""
+        # Add system prompt on first query
+        self._ensure_system_prompt()
+        
         self.messages.append({"role": "user", "content": prompt})
         
         # Collect tools from ALL servers
@@ -148,7 +178,7 @@ class MCPClient:
                     "content": content_str
                 })
                 
-                # Get final response (also use same parameters)
+                # Get final response
                 response = self.openai.chat.completions.create(
                     model=self.model,
                     max_tokens=1000,
@@ -160,6 +190,136 @@ class MCPClient:
             final_text.append(content.content)
         
         return "\n".join(final_text)
+    
+    async def query_stream(self, prompt: str):
+        """
+        Send a query and stream the response - maintains conversation history
+        Yields response chunks as they arrive
+        """
+        # Add system prompt on first query
+        self._ensure_system_prompt()
+        
+        self.messages.append({"role": "user", "content": prompt})
+        
+        # Collect tools from ALL servers
+        all_tools = []
+        for session in self.sessions.values():
+            response = await session.list_tools()
+            all_tools.extend([convert_tool_format(tool) for tool in response.tools])
+        
+        # Build API call parameters
+        api_params = {
+            "model": self.model,
+            "tools": all_tools,
+            "messages": self.messages,
+            "temperature": self.temperature,
+            "stream": True,
+        }
+        
+        # Add extra_body if provided
+        if self.extra_body:
+            api_params["extra_body"] = self.extra_body
+        
+        # Send to LLM with streaming enabled
+        stream = self.openai.chat.completions.create(**api_params)
+        
+        # Collect the streamed response
+        full_content = ""
+        tool_calls = []
+        finish_reason = None
+        
+        for chunk in stream:
+            delta = chunk.choices[0].delta
+            finish_reason = chunk.choices[0].finish_reason
+            
+            # Handle text content
+            if delta.content:
+                full_content += delta.content
+                yield delta.content
+            
+            # Handle tool calls (streamed in parts)
+            if delta.tool_calls:
+                for tool_call_delta in delta.tool_calls:
+                    # Extend or append tool call
+                    if tool_call_delta.index >= len(tool_calls):
+                        tool_calls.append({
+                            "id": tool_call_delta.id,
+                            "type": "function",
+                            "function": {
+                                "name": tool_call_delta.function.name or "",
+                                "arguments": tool_call_delta.function.arguments or ""
+                            }
+                        })
+                    else:
+                        # Append to existing tool call arguments
+                        if tool_call_delta.function.arguments:
+                            tool_calls[tool_call_delta.index]["function"]["arguments"] += \
+                                tool_call_delta.function.arguments
+        
+        # Save the complete message to history
+        assistant_message = {
+            "role": "assistant",
+            "content": full_content if full_content else None
+        }
+        if tool_calls:
+            assistant_message["tool_calls"] = tool_calls
+        self.messages.append(assistant_message)
+        
+        # If LLM wants to use a tool, execute it and stream the final response
+        if tool_calls:
+            for tool_call in tool_calls:
+                tool_name = tool_call["function"]["name"]
+                tool_args = json.loads(tool_call["function"]["arguments"] or "{}")
+                
+                # Find which server has this tool and execute
+                result = None
+                for session_name, session in self.sessions.items():
+                    try:
+                        result = await session.call_tool(tool_name, tool_args)
+                        yield f"\n[Executed {tool_name}]\n"
+                        break
+                    except:
+                        continue
+                
+                if result:
+                    # Convert MCP result content to string
+                    if isinstance(result.content, list):
+                        content_str = "\n".join(
+                            item.text if hasattr(item, 'text') else str(item) 
+                            for item in result.content
+                        )
+                    else:
+                        content_str = str(result.content)
+                    
+                    # Add tool result to conversation
+                    self.messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call["id"],
+                        "name": tool_name,
+                        "content": content_str
+                    })
+            
+            # Get final response after tool execution, also streamed
+            final_stream = self.openai.chat.completions.create(
+                model=self.model,
+                max_tokens=1000,
+                messages=self.messages,
+                temperature=self.temperature,
+                stream=True,
+            )
+            
+            final_content = ""
+            for chunk in final_stream:
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    final_content += delta.content
+                    yield delta.content
+            
+            # Save final response to history
+            self.messages.append({
+                "role": "assistant",
+                "content": final_content
+            })
     
     async def cleanup(self):
         await self.exit_stack.aclose()
@@ -181,11 +341,63 @@ async def ask_command(interaction: discord.Interaction, prompt: str):
         # Each follow-up maintains conversation memory
         # When interaction ends, memory is cleared
 '''
-async def test():
+
+
+'''
+# Example usage of streaming query in Discord bot:
+async def example_discord_usage(interaction, prompt):
+    """Example of how to use streaming in Discord"""
+    await interaction.response.defer()  # "Bot is thinking..."
+    
     async with MCPClient() as client:
-        print(await client.query("What is 2+2?"))
-        print(await client.query("Now multiply that by 3"))  # Remembers previous answer
-    # Memory cleared here when context exits
+        accumulated_response = ""
+        message = None
+        
+        async for chunk in client.query_stream(prompt):
+            accumulated_response += chunk
+            
+            # Update Discord message every N characters or on tool execution
+            if len(accumulated_response) % 100 == 0 or "[Executed" in chunk:
+                if message is None:
+                    message = await interaction.followup.send(accumulated_response)
+                else:
+                    await message.edit(content=accumulated_response)
+        
+        # Final update
+        if message:
+            await message.edit(content=accumulated_response)
+        else:
+            await interaction.followup.send(accumulated_response)
+'''
+
+
+# Test both query methods:
+async def test():
+    EXTRA_BODY = {
+            "reasoning": {
+                "effort": "medium",
+                "exclude": True
+            }
+        }
+    prompt = f"""
+        You are a helpdesk bot. You purpose is to assist users with their questions.
+        You have access to some helpful tools to call as needed to best assist them.
+        You are called when the user uses the discord command /help_from_ai and the
+        user's question is passed as the prompt. Always try to answer the user's 
+        question as best as you can to help guide them through using the bot.
+    """
+    async with MCPClient(temperature=1, extra_body=EXTRA_BODY, system_prompt=prompt) as client:
+        # Non-streaming
+        print("=== Non-streaming ===")
+        response = await client.query("What is 5 factorial?")
+        print(response)
+        # Streaming 
+        print("\n=== Streaming ===")
+        print("Response: ", end="", flush=True)
+        async for chunk in client.query_stream("Now multiply that by 3 and explain the steps."):
+            print(chunk, end="", flush=True)
+        print()
+
 
 async def main():
     client = MCPClient()
@@ -197,5 +409,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    import sys
     asyncio.run(test())
