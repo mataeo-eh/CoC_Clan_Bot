@@ -68,6 +68,7 @@ def get_logger() -> logging.Logger:
 
 def _prune_old_logs(retention_days: int = LOG_RETENTION_DAYS) -> None:
     """Remove log files older than the retention window."""
+    retention_days = int(retention_days)
     cutoff = datetime.now() - timedelta(days=retention_days)
     for log_file in LOG_DIRECTORY.glob("COCbotlogfile_*.log"):
         try:
