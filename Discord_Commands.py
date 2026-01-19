@@ -2640,9 +2640,12 @@ def _format_player_value(key: str, player_info: Dict[str, Any]) -> str:
         )
 
     if key == "league":
-        league_dict = player_info.get("league")
-        league = f"League: {league_dict.get('name')} \nLeague ID: {league_dict.get('id')} \n {league_dict.get('icon')}" 
-        return league or "Unranked"
+        league = player_info.get("league")
+        return (
+            f"League: {getattr(league, 'name', 'Unranked')}"
+            f"ID: {getattr(league, 'id', 'N/A')})"
+            f"Icon: {getattr(league, 'icon', 'N/A')})"
+        )
 
     if key == "trophies_overview":
         return (

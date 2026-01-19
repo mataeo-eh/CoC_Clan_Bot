@@ -68,7 +68,7 @@ class CoCAPI:
             "attack_wins": getattr(player, "attack_wins", None),
             "defense_wins": getattr(player, "defense_wins", None),
             "donations": getattr(player, "donations", None),
-            "donations_received": getattr(player, "donations_received", None),
+            "donations_received": getattr(player, "received", None),
             "heroes": [
                 {
                     "name ": hero.name,
