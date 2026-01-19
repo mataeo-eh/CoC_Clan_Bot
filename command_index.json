@@ -1,0 +1,98 @@
+{
+  "set_clan": {
+    "start_line": 676,
+    "end_line": 682
+  },
+  "help_command": {
+    "start_line": 727,
+    "end_line": 746
+  },
+  "help_assign_bases": {
+    "start_line": 766,
+    "end_line": 785
+  },
+  "help_dashboard": {
+    "start_line": 806,
+    "end_line": 825
+  },
+  "help_usage": {
+    "start_line": 847,
+    "end_line": 916
+  },
+  "configure_war_nudge": {
+    "start_line": 1027,
+    "end_line": 1036
+  },
+  "war_nudge": {
+    "start_line": 1084,
+    "end_line": 1218
+  },
+  "dashboard": {
+    "start_line": 1283,
+    "end_line": 1289
+  },
+  "link_player": {
+    "start_line": 1356,
+    "end_line": 1371
+  },
+  "save_war_plan": {
+    "start_line": 1443,
+    "end_line": 1451
+  },
+  "list_war_plans": {
+    "start_line": 1513,
+    "end_line": 1559
+  },
+  "player_info": {
+    "start_line": 1627,
+    "end_line": 1699
+  },
+  "set_upgrade_channel": {
+    "start_line": 1816,
+    "end_line": 1860
+  },
+  "set_donation_channel": {
+    "start_line": 1917,
+    "end_line": 1928
+  },
+  "donation_summary": {
+    "start_line": 1977,
+    "end_line": 1985
+  },
+  "configure_event_role": {
+    "start_line": 2057,
+    "end_line": 2066
+  },
+  "event_alert_opt": {
+    "start_line": 2118,
+    "end_line": 2131
+  },
+  "register_me": {
+    "start_line": 2240,
+    "end_line": 2287
+  },
+  "season_summary": {
+    "start_line": 2348,
+    "end_line": 2359
+  },
+  "schedule_report": {
+    "start_line": 3806,
+    "end_line": 3817
+  },
+  "list_schedules": {
+    "start_line": 3886,
+    "end_line": 3945
+  },
+  "clan_war_info_menu": {
+    "start_line": 4196,
+    "end_line": 4237
+  },
+  "toggle_war_alerts": {
+    "start_line": 10353,
+    "end_line": 10435
+  },
+  "assign_clan_role": {
+    "start_line": 10608,
+    "end_line": 10645
+  }
+}
