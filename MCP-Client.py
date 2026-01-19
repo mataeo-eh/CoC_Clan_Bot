@@ -48,12 +48,19 @@ def convert_tool_format(tool):
     return converted_tool
 
 class MCPClient:
-    def __init__(self, model=None):
+    def __init__(self, model=None, temperature=0.7, streaming = False, extra_body = None):
         self.sessions = {}
         self.exit_stack = AsyncExitStack()
         self.openai = OpenAI(base_url=base_url, api_key=api_key)
         self.model = model or MODEL
+
+        # Stores conversation history for the current session
         self.messages = []  # Move this here from connect_to_servers
+
+        # Store additional API parameters
+        self.temperature = temperature
+        self.streaming = streaming
+        self.extra_body = extra_body or {}
     
     async def __aenter__(self):
         """Called when entering 'async with' block"""
@@ -92,12 +99,20 @@ class MCPClient:
             response = await session.list_tools()
             all_tools.extend([convert_tool_format(tool) for tool in response.tools])
         
+        # Build API call parameters
+        api_params = {
+            "model": self.model,
+            "tools": all_tools,
+            "messages": self.messages,
+            "temperature": self.temperature,
+        }
+        
+        # Add extra_body if provided
+        if self.extra_body:
+            api_params["extra_body"] = self.extra_body
+        
         # Send to LLM with all available tools
-        response = self.openai.chat.completions.create(
-            model=self.model,
-            tools=all_tools,
-            messages=self.messages
-        )
+        response = self.openai.chat.completions.create(**api_params)
         self.messages.append(response.choices[0].message.model_dump())
         
         final_text = []
@@ -133,11 +148,12 @@ class MCPClient:
                     "content": content_str
                 })
                 
-                # Get final response
+                # Get final response (also use same parameters)
                 response = self.openai.chat.completions.create(
                     model=self.model,
                     max_tokens=1000,
-                    messages=self.messages
+                    messages=self.messages,
+                    temperature=self.temperature,
                 )
                 final_text.append(response.choices[0].message.content)
         else:
