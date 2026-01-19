@@ -2625,8 +2625,10 @@ def _format_player_value(key: str, player_info: Dict[str, Any]) -> str:
             f"Name: {profile.get('name', 'Unknown')}\n"
             f"Tag: {profile.get('tag', 'N/A')}\n"
             f"Exp Level: {_fmt_numeric(profile.get('exp_level'))}\n"
-            f"Town Hall: TH{profile.get('town_hall_level') or '?'}\n"
-            f"Builder Hall: BH{profile.get('builder_hall_level') or ' ?'}"
+            f"Town Hall: TH{profile.get('town_hall_level') or ' ?'}\n"
+            f"Town Hall Weapon: {_fmt_numeric(profile.get('town_hall_weapon_level')) or 'N/A'}\n"
+            f"Builder Hall: BH{profile.get('builder_hall_level') or ' ?'} \n"
+            f"Legend Statistics: {profile.get('legend_statistics', 'N/A')}"
         )
 
     if key == "clan":
@@ -2642,23 +2644,24 @@ def _format_player_value(key: str, player_info: Dict[str, Any]) -> str:
     if key == "league":
         league = player_info.get("league")
         return (
-            f"League: {getattr(league, 'name', 'Unranked')}"
-            f"ID: {getattr(league, 'id', 'N/A')})"
-            f"Icon: {getattr(league, 'icon', 'N/A')})"
+            f"League: {getattr(league, 'name', 'Unranked')}\n"
+            f"ID: {getattr(league, 'id', 'N/A')})\n"
+            f"Icon: {getattr(league, 'icon', 'N/A')})\n"
+            f"Attack wins: {_fmt_numeric(player_info.get('attack_wins'))}\n"
+            f"Defense wins: {_fmt_numeric(player_info.get('defense_wins'))}"
         )
 
     if key == "trophies_overview":
         return (
             f"Home: {_fmt_numeric(player_info.get('trophies'))} "
             f"(Best: {_fmt_numeric(player_info.get('best_trophies'))})\n"
-            f"Builder Base: {_fmt_numeric(player_info.get('versus_trophies'))}"
+            f"Builder Base: {_fmt_numeric(player_info.get('versus_trophies'))} "
+            f"(Best: {_fmt_numeric(player_info.get('best_builder_base_trophies'))})"
         )
 
     if key == "war_stats":
         return (
             f"War stars: {_fmt_numeric(player_info.get('war_stars'))}\n"
-            f"Attack wins: {_fmt_numeric(player_info.get('attack_wins'))}\n"
-            f"Defense wins: {_fmt_numeric(player_info.get('defense_wins'))}"
         )
 
     if key == "donations":

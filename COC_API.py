@@ -49,7 +49,9 @@ class CoCAPI:
                 "tag": player.tag,
                 "exp_level": player.exp_level,
                 "town_hall_level": getattr(player, "town_hall", None),
+                "town_hall_weapon_level": getattr(player, "town_hall_weapon", None),
                 "builder_hall_level": getattr(player, "builder_hall", None),
+                "legend_statistics": getattr(player, "legend_statistics", None),
             },
             "clan": {
                 "name": player.clan.name if player.clan else None,
@@ -64,6 +66,7 @@ class CoCAPI:
             "trophies": player.trophies,
             "best_trophies": getattr(player, "best_trophies", None),
             "versus_trophies": getattr(player, "builder_base_trophies", None),
+            'best_builder_base_trophies': getattr(player, "best_builder_base_trophies", None),
             "war_stars": getattr(player, "war_stars", None),
             "attack_wins": getattr(player, "attack_wins", None),
             "defense_wins": getattr(player, "defense_wins", None),
