@@ -1,3 +1,10 @@
+"""
+This file is mainly intended as a reference for how to 
+use the MCPClient class in an application like a Discord bot.
+It includes an example of how to integrate the MCPClient into a Discord slash command, 
+as well as a test function that demonstrates both non-streaming and 
+streaming queries to the LLM with tool usage.
+"""
 import asyncio
 from typing import Optional
 from contextlib import AsyncExitStack
@@ -22,12 +29,18 @@ MODEL = os.getenv("OPENROUTER_MODEL")
 if not MODEL:
     raise RuntimeError("Missing OPENAI_MODEL environment variable.")
 
+cwd = os.getcwd()
 
 # Configuration for multiple servers
 SERVER_CONFIGS = {
     "python": {
         "command": "uvx",
         "args": ["mcp-run-python@latest", "stdio"],
+        "env": None
+    },
+    "filesystem": {
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-filesystem", cwd],
         "env": None
     }
 }
