@@ -39,7 +39,7 @@ MAX_MESSAGE_LENGTH = 1990
 # DISCORD MESSAGE CHUNKING
 # ============================================================================
 
-from Discord_Commands import _chunk_content
+
 
 
 # OpenRouter configuration
@@ -692,6 +692,8 @@ class CommandHelpSession:
         """
         response = await self.main_llm.respond(question)
         
+        # Import the function for chunking discord messages
+        from Discord_Commands import _chunk_content
         # Chunk the response for Discord's message length limits
         chunks = _chunk_content(response)
         
