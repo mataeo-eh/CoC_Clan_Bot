@@ -22,6 +22,7 @@ from logger import get_logger, log_command_call, get_usage_summary
 log = get_logger()
 from COC_API import ClanNotConfiguredError, GuildNotConfiguredError, notinWar
 from Clan_Configs import save_server_config, server_config
+from LLM_Usage import CommandHelpSession
 
 
 MAX_MESSAGE_LENGTH = 1900
@@ -909,6 +910,65 @@ async def help_usage(interaction: discord.Interaction):
         "\n".join(lines),
         ephemeral=True,
     )
+
+
+# ---------------------------------------------------------------------------
+# Slash command: /help_from_ai
+# ---------------------------------------------------------------------------
+@bot.tree.command(
+    name="help_from_ai",
+    description="Get AI-powered help with bot commands through an interactive conversation."
+)
+async def help_from_ai(interaction: discord.Interaction):
+    """Launch an interactive AI help session that maintains conversation context.
+
+    This command provides an AI-powered help system that can answer questions
+    about bot commands, features, and workflows. The AI maintains context across
+    multiple questions within the same session (up to 10 questions or 15 minutes).
+
+    Parameters:
+        interaction (discord.Interaction): The Discord interaction context.
+    """
+    _record_command_usage(interaction, "help_from_ai")
+    log.debug("help_from_ai invoked by user %s", interaction.user.id)
+
+    # Defer the initial response to give time to set up the session
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        # Create the AI help view with session
+        view = AIHelpView()
+
+        # Create the initial message with instructions
+        initial_message = (
+            "**AI Help Assistant**\n\n"
+            "I'm here to help you understand how to use the bot's commands and features. "
+            "You can ask me up to 10 questions in this session, and I'll maintain context "
+            "across our conversation.\n\n"
+            "Click the **Ask a Question** button below to get started, or click **End Session** "
+            "to finish at any time.\n\n"
+            "Session will expire in 15 minutes if inactive."
+        )
+
+        # Send the initial message with the view
+        await interaction.followup.send(
+            content=initial_message,
+            view=view,
+            ephemeral=True,
+        )
+
+        log.debug("AI help session started successfully for user %s", interaction.user.id)
+
+    except Exception:
+        log.exception("Error starting AI help session")
+        error_message = (
+            "Sorry, I encountered an error while starting the AI help session. "
+            "Please try again in a moment."
+        )
+        await interaction.followup.send(
+            error_message,
+            ephemeral=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -9407,6 +9467,184 @@ class WarNudgeReasonModal(discord.ui.Modal):
             name=self.reason_name.value.strip(),
             description=self.description.value.strip(),
         )
+
+
+# ---------------------------------------------------------------------------
+# AI Help System Modal and View
+# ---------------------------------------------------------------------------
+
+
+class AIHelpModal(discord.ui.Modal):
+    """Modal that captures user's question for the AI help system."""
+
+    def __init__(self, parent_view: "AIHelpView"):
+        super().__init__(title="Ask AI Help Assistant", timeout=None)
+        self.parent_view = parent_view
+
+        self.question = discord.ui.TextInput(
+            label="What would you like help with?",
+            placeholder="Example: How do I assign war bases?",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=500,
+        )
+        self.add_item(self.question)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        """Process the user's question and get AI response."""
+        question_text = self.question.value.strip()
+
+        if not question_text:
+            await interaction.response.send_message(
+                "Please enter a question.",
+                ephemeral=True,
+            )
+            return
+
+        # Defer the response as AI processing takes time
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            # Send "thinking" message
+            thinking_msg = await interaction.followup.send(
+                content="AI is thinking...",
+                ephemeral=True,
+            )
+
+            # Get AI response chunks
+            response_chunks = await self.parent_view.session.ask(question_text)
+
+            # Add Q&A to conversation history
+            self.parent_view.add_conversation_turn(question_text, response_chunks)
+
+            # Build updated embed with conversation history
+            embed = self.parent_view.build_embed()
+
+            # Delete the thinking message
+            try:
+                await thinking_msg.delete()
+            except discord.HTTPException:
+                pass
+
+            # Check if we've reached the turn limit
+            if self.parent_view.turn_count >= self.parent_view.max_turns:
+                # Session complete
+                await interaction.followup.send(
+                    content="Session complete! You've reached the maximum of 10 questions.",
+                    embed=embed,
+                    ephemeral=True,
+                )
+                # Disable buttons on the original view
+                self.parent_view.stop()
+            else:
+                # Send updated conversation with updated view (buttons still active)
+                await interaction.followup.send(
+                    content=f"Ready for question {self.parent_view.turn_count + 1}/{self.parent_view.max_turns}",
+                    embed=embed,
+                    view=self.parent_view,
+                    ephemeral=True,
+                )
+
+        except Exception:
+            log.exception("Error in AIHelpModal processing question")
+            error_message = (
+                "Sorry, I encountered an error while processing your question. "
+                "Please try again or rephrase your question."
+            )
+            await interaction.followup.send(
+                error_message,
+                ephemeral=True,
+            )
+
+
+class AIHelpView(discord.ui.View):
+    """View for managing the AI help conversation session."""
+
+    def __init__(self):
+        super().__init__(timeout=900)  # 15 minutes
+        self.session = CommandHelpSession()
+        self.conversation_history: List[Tuple[str, List[str]]] = []
+        self.turn_count = 0
+        self.max_turns = 10
+
+    def add_conversation_turn(self, question: str, answer_chunks: List[str]) -> None:
+        """Add a Q&A pair to the conversation history."""
+        self.conversation_history.append((question, answer_chunks))
+        self.turn_count += 1
+
+    def build_embed(self) -> discord.Embed:
+        """Build an embed displaying the conversation history."""
+        embed = discord.Embed(
+            title="AI Help Assistant",
+            description="Ask me anything about bot commands!",
+            color=discord.Color.blue(),
+        )
+
+        # Add each Q&A pair as fields
+        for idx, (question, answer_chunks) in enumerate(self.conversation_history, 1):
+            # Combine answer chunks
+            full_answer = "\n".join(answer_chunks)
+
+            # Truncate if too long for embed field (1024 char limit)
+            if len(question) > 256:
+                question = question[:253] + "..."
+
+            if len(full_answer) > 1024:
+                full_answer = full_answer[:1021] + "..."
+
+            embed.add_field(
+                name=f"Question {idx}",
+                value=question,
+                inline=False,
+            )
+            embed.add_field(
+                name=f"Answer {idx}",
+                value=full_answer,
+                inline=False,
+            )
+
+        # Add footer with session info
+        embed.set_footer(
+            text=f"Questions used: {self.turn_count}/{self.max_turns} | Session expires in 15 minutes"
+        )
+
+        return embed
+
+    @discord.ui.button(label="Ask a Question", style=discord.ButtonStyle.primary)
+    async def ask_question_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        """Open the modal for asking a question."""
+        if self.turn_count >= self.max_turns:
+            await interaction.response.send_message(
+                "You've reached the maximum of 10 questions for this session. "
+                "Please start a new session with /help_from_ai if you need more help.",
+                ephemeral=True,
+            )
+            return
+
+        modal = AIHelpModal(self)
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="End Session", style=discord.ButtonStyle.secondary)
+    async def end_session_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        """End the conversation session."""
+        self.stop()
+        await interaction.response.send_message(
+            "Session ended. Thank you for using AI Help! "
+            "Run /help_from_ai again if you need more assistance.",
+            ephemeral=True,
+        )
+
+    async def on_timeout(self) -> None:
+        """Handle view timeout after 15 minutes."""
+        log.debug("AIHelpView timed out after 15 minutes")
 
 
 class WarNudgeClanSelect(discord.ui.Select):
