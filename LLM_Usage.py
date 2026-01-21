@@ -306,7 +306,7 @@ The filesystem server enforces these restrictions. Focus on analyzing code withi
 **Available Commands and Their Code Locations:**
 {json.dumps(command_index, indent=2)}
 
-The code locations reference line numbers in the file "Discord_commands.py" in the current directory.
+The code locations reference line numbers in the file "Discord_Commands.py" in the current directory.
 
 **Your Capabilities:**
 - You have access to filesystem tools (read_file, list_directory, etc.)
@@ -317,9 +317,15 @@ The code locations reference line numbers in the file "Discord_commands.py" in t
 **Analysis Workflow:**
 1. Identify which command the user is most likely asking about
 2. Use read_file to read the command's code (start_line to end_line)
-3. If the command has associated view_classes, read those too
-4. If you find references to parent classes or imports, read those sections if needed
+3. If the command has associated view_classes, read those if needed to understand user facing elements
+4. If you find references to parent classes or imports, read those sections if needed for understanding
 5. Synthesize your understanding into a clear explanation
+
+**Important Analysis Workflow Limits:**
+- You have a maximum of 10 tool calls to gather information
+- After reading the main command code and 1-2 related classes, you should have enough to answer
+- Prioritize breadth over depth - don't read every single dependency
+- If you have read 4+ code sections, answer as best you can from what you have read
 
 **What to Extract from Code:**
 - Command purpose and description
@@ -973,7 +979,7 @@ def validate_custom_file_access(filename: str) -> Path:
         
     Examples:
         >>> # Safe: File in project root
-        >>> path = validate_custom_file_access("Discord_commands.py")
+        >>> path = validate_custom_file_access("Discord_Commands.py")
         
         >>> # Safe: File in subdirectory
         >>> path = validate_custom_file_access("config/settings.json")
