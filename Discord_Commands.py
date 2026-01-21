@@ -920,7 +920,7 @@ async def help_usage(interaction: discord.Interaction):
 # ---------------------------------------------------------------------------
 @bot.tree.command(
     name="help_from_ai",
-    description="Get AI-powered help with bot commands through an interactive conversation."
+    description="Ask questions about bot commands. Sessions track context; end with /help_from_ai_end_session."
 )
 @app_commands.describe(
     question="Your question about bot commands or features (optional - if not provided, starts a new session)"
@@ -949,8 +949,10 @@ async def help_from_ai(interaction: discord.Interaction, question: str = None):
 
     try:
         # Get or create session for this user
+        is_new_session = False
         if user_id not in active_ai_help_sessions:
             active_ai_help_sessions[user_id] = AIHelpSessionManager()
+            is_new_session = True
             log.debug("Created new AI help session for user %s", user_id)
 
         session_manager = active_ai_help_sessions[user_id]
@@ -960,6 +962,7 @@ async def help_from_ai(interaction: discord.Interaction, question: str = None):
             log.debug("Session expired for user %s, creating new session", user_id)
             active_ai_help_sessions[user_id] = AIHelpSessionManager()
             session_manager = active_ai_help_sessions[user_id]
+            is_new_session = True
 
         # Reset the timeout timer
         session_manager.reset_timeout()
@@ -977,10 +980,12 @@ async def help_from_ai(interaction: discord.Interaction, question: str = None):
                 "• `/help_from_ai question: How do I assign war bases?`\n"
                 "• `/help_from_ai question: Can I save multiple base assignments?`\n\n"
                 f"{session_info}\n\n"
-                "**Tips:**\n"
-                "• Scroll up to review previous answers while typing your next question\n"
+                "**Session Management:**\n"
                 "• I remember our conversation, so you can ask follow-ups naturally\n"
-                "• To end your session early, run `/help_from_ai_end_session`"
+                "• Scroll up to review previous answers while typing your next question\n"
+                "• **End your session** with `/help_from_ai_end_session` when:\n"
+                "  - Switching to a different topic (clears context)\n"
+                "  - Done asking questions (sessions auto-expire after 15 min or 10 questions)"
             )
 
             await interaction.followup.send(
@@ -1040,42 +1045,88 @@ async def help_from_ai(interaction: discord.Interaction, question: str = None):
             inline=False,
         )
 
-        # Answer embed (AI response in green)
-        answer_embed = discord.Embed(
-            color=discord.Color.green(),
-        )
-
         # Combine chunks and handle long answers
         full_answer = "\n".join(response_chunks)
 
         # Discord embed field value limit is 1024 chars
-        # If answer is too long, truncate with indicator
-        if len(full_answer) > 1024:
-            answer_display = full_answer[:1000] + "...\n\n*(Answer truncated due to length)*"
-        else:
-            answer_display = full_answer
+        # Chunk the answer if it exceeds the limit
+        answer_chunks = _chunk_content(full_answer, limit=1024)
+        total_parts = len(answer_chunks)
 
+        # Session info for footer
+        session_info = session_manager.get_session_info()
+
+        # First message: Question embed + first part of answer
+        answer_embed = discord.Embed(
+            color=discord.Color.green(),
+        )
+
+        # Add part indicator if chunked
+        first_field_name = "🤖 AI Assistant:" if total_parts == 1 else f"🤖 AI Assistant (Part 1/{total_parts}):"
         answer_embed.add_field(
-            name="🤖 AI Assistant:",
-            value=answer_display,
+            name=first_field_name,
+            value=answer_chunks[0],
             inline=False,
         )
 
         # Add session info to answer embed footer
-        session_info = session_manager.get_session_info()
         answer_embed.set_footer(text=f"Q{session_manager.turn_count} • {session_info}")
 
-        # Send the response with both embeds and next question prompt
-        next_question_prompt = (
+        # Send the first message with both embeds and next question prompt
+        # Build contextual guidance based on session state
+        next_question_prompt_parts = [
             f"**Ready for your next question!** ({session_manager.turn_count}/{session_manager.max_turns} used)\n"
             "Run `/help_from_ai question: <your next question>` • You can scroll up to review previous answers"
-        )
+        ]
+
+        # First-time user tip
+        if is_new_session and session_manager.turn_count == 1:
+            next_question_prompt_parts.append(
+                "\n💡 **Tip:** Your questions are tracked in a session. "
+                "Use `/help_from_ai_end_session` when switching topics or when done."
+            )
+
+        # Near-limit warning (at 8 or 9 questions)
+        elif session_manager.turn_count >= 8:
+            remaining = session_manager.max_turns - session_manager.turn_count
+            next_question_prompt_parts.append(
+                f"\n⚠️ **Note:** You have {remaining} question{'s' if remaining != 1 else ''} remaining. "
+                "Consider ending this session with `/help_from_ai_end_session` when done."
+            )
+
+        # Check for low time remaining (< 2 minutes)
+        elapsed = datetime.now(timezone.utc) - session_manager.created_at
+        elapsed_minutes = int(elapsed.total_seconds() / 60)
+        remaining_minutes = max(0, session_manager.timeout_minutes - elapsed_minutes)
+        if remaining_minutes < 2 and session_manager.turn_count < 8:
+            next_question_prompt_parts.append(
+                f"\n⏱️ **Session expires in < 2 min** if inactive"
+            )
+
+        next_question_prompt = "".join(next_question_prompt_parts)
 
         await interaction.followup.send(
             content=next_question_prompt,
             embeds=[question_embed, answer_embed],
             ephemeral=True,
         )
+
+        # Send remaining chunks as follow-up messages if needed
+        for part_num, chunk in enumerate(answer_chunks[1:], start=2):
+            continuation_embed = discord.Embed(
+                color=discord.Color.green(),
+            )
+            continuation_embed.add_field(
+                name=f"🤖 AI Assistant (Part {part_num}/{total_parts}):",
+                value=chunk,
+                inline=False,
+            )
+            continuation_embed.set_footer(text=f"Q{session_manager.turn_count} • {session_info}")
+
+            await interaction.followup.send(
+                embeds=[continuation_embed],
+                ephemeral=True,
+            )
 
         log.debug("AI help response sent to user %s (turn %d/%d)",
                  user_id, session_manager.turn_count, session_manager.max_turns)
@@ -1097,7 +1148,7 @@ async def help_from_ai(interaction: discord.Interaction, question: str = None):
 # ---------------------------------------------------------------------------
 @bot.tree.command(
     name="help_from_ai_end_session",
-    description="End your current AI help session and clear conversation history."
+    description="End your AI help session to start fresh. Sessions auto-expire after 15 min or 10 questions."
 )
 async def help_from_ai_end_session(interaction: discord.Interaction):
     """End the user's active AI help session.
@@ -1115,12 +1166,21 @@ async def help_from_ai_end_session(interaction: discord.Interaction):
 
     # Check if user has an active session
     if user_id in active_ai_help_sessions:
+        # Get session info before removing
+        session_manager = active_ai_help_sessions[user_id]
+        questions_used = session_manager.turn_count
+
         # Remove the session
         del active_ai_help_sessions[user_id]
 
         await interaction.response.send_message(
             content=(
-                "Your AI help session has been ended and conversation history cleared.\n\n"
+                f"✅ **Session ended successfully!**\n\n"
+                f"You used {questions_used}/{session_manager.max_turns} questions in this session.\n\n"
+                "**When to end sessions:**\n"
+                "• Switching to a different topic (starts fresh context)\n"
+                "• Done asking questions (frees up session)\n"
+                "• Getting unrelated responses (clears conversation history)\n\n"
                 "Run `/help_from_ai` to start a new session whenever you need help!"
             ),
             ephemeral=True,
