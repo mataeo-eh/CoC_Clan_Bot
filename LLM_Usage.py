@@ -439,7 +439,6 @@ class RouterAgent:
         for name, config in server_configs.items():
             try:
                 print(f"[RouterAgent] Connecting to {name} server...")
-                print(f"[DEBUG][RouterAgent] current PATH is {os.environ['PATH']}")
                 server_params = StdioServerParameters(**config)
                 stdio_transport = await self.exit_stack.enter_async_context(
                     stdio_client(server_params)
