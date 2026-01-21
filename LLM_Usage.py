@@ -28,6 +28,7 @@ from contextlib import AsyncExitStack
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from openai import OpenAI
+from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -314,10 +315,10 @@ The code locations reference line numbers in the file "Discord_commands.py" in t
 - You can follow code references to view_classes and parent classes
 
 **Analysis Workflow:**
-1. Identify which command the user is asking about
+1. Identify which command the user is most likely asking about
 2. Use read_file to read the command's code (start_line to end_line)
 3. If the command has associated view_classes, read those too
-4. If you find references to parent classes or imports, read those sections
+4. If you find references to parent classes or imports, read those sections if needed
 5. Synthesize your understanding into a clear explanation
 
 **What to Extract from Code:**
@@ -325,7 +326,7 @@ The code locations reference line numbers in the file "Discord_commands.py" in t
 - Required and optional parameters
 - User workflow (what happens when they run the command)
 - Interactive elements (buttons, dropdowns, modals)
-- Any special requirements or permissions
+- Any special requirements or permissions (e.g., admin only)
 
 **Response Format:**
 Provide a clear, concise summary suitable for a user learning how to use the command.
@@ -399,7 +400,7 @@ class RouterAgent:
         self.command_index = command_index
         self.sessions = {}
         self.exit_stack = AsyncExitStack()
-        self.openai = OpenAI(base_url=base_url, api_key=api_key)
+        self.openai = AsyncOpenAI(base_url=base_url, api_key=api_key)
         self.model = MODEL
         self.messages = []
         self.system_prompt = build_router_system_prompt(command_index)
@@ -417,7 +418,7 @@ class RouterAgent:
         """Connect to MCP servers (filesystem in this case)"""
         print(f"[RouterAgent] Connecting to {len(server_configs)} MCP server(s)...")
 
-        for name, config in server_configs.items():
+        async for name, config in server_configs.items():
             try:
                 print(f"[RouterAgent] Connecting to {name} server...")
 
@@ -472,7 +473,7 @@ class RouterAgent:
         # Collect all available tools from MCP servers
         all_tools = []
         try:
-            for session_name, session in self.sessions.items():
+            async for session_name, session in self.sessions.items():
                 response = await session.list_tools()
                 tool_names = [tool.name for tool in response.tools]
                 print(f"[RouterAgent] {session_name} server has {len(tool_names)} tools: {tool_names[:5]}...")
@@ -497,7 +498,7 @@ class RouterAgent:
             while retry_count < max_retries:
                 try:
                     # Call LLM with tools
-                    response = self.openai.chat.completions.create(
+                    response = await self.openai.chat.completions.create(
                         model=self.model,
                         messages=self.messages,
                         tools=all_tools,
@@ -540,7 +541,7 @@ class RouterAgent:
                     print(f"[RouterAgent] Processing {len(assistant_message.tool_calls)} tool calls")
 
                     # Execute each requested tool call
-                    for tool_call in assistant_message.tool_calls:
+                    async for tool_call in assistant_message.tool_calls:
                         tool_name = tool_call.function.name
                         tool_args = json.loads(tool_call.function.arguments or "{}")
 
@@ -549,7 +550,7 @@ class RouterAgent:
                         # Find which server has this tool and execute it
                         result = None
                         last_error = None
-                        for session_name, session in self.sessions.items():
+                        async for session_name, session in self.sessions.items():
                             try:
                                 result = await session.call_tool(tool_name, tool_args)
                                 print(f"[RouterAgent] Tool {tool_name} executed successfully via {session_name}")
@@ -726,7 +727,7 @@ class MainLLM:
     
     def __init__(self, command_index: Dict[str, Any]):
         self.command_index = command_index
-        self.openai = OpenAI(base_url=base_url, api_key=api_key)
+        self.openai = AsyncOpenAI(base_url=base_url, api_key=api_key)
         self.model = MODEL
         self.messages = []
         self.system_prompt = build_main_llm_system_prompt()
@@ -768,7 +769,7 @@ class MainLLM:
             while retry_count < max_retries:
                 try:
                     # Call LLM with streaming enabled
-                    stream = self.openai.chat.completions.create(
+                    stream = await self.openai.chat.completions.create(
                         model=self.model,
                         messages=self.messages,
                         tools=self.tools,
@@ -807,7 +808,7 @@ class MainLLM:
                 tool_calls = []
                 finish_reason = None
 
-                for chunk in stream:
+                async for chunk in stream:
                     delta = chunk.choices[0].delta
                     finish_reason = chunk.choices[0].finish_reason
 
@@ -849,7 +850,7 @@ class MainLLM:
                 if tool_calls:
                     print(f"[MainLLM] Processing {len(tool_calls)} tool call(s)")
 
-                    for tool_call in tool_calls:
+                    async for tool_call in tool_calls:
                         if tool_call["function"]["name"] == "analyze_command_code":
                             args = json.loads(tool_call["function"]["arguments"] or "{}")
                             question = args.get("question", "")
