@@ -418,7 +418,7 @@ class RouterAgent:
         """Connect to MCP servers (filesystem in this case)"""
         print(f"[RouterAgent] Connecting to {len(server_configs)} MCP server(s)...")
 
-        async for name, config in server_configs.items():
+        for name, config in server_configs.items():
             try:
                 print(f"[RouterAgent] Connecting to {name} server...")
 
@@ -541,7 +541,7 @@ class RouterAgent:
                     print(f"[RouterAgent] Processing {len(assistant_message.tool_calls)} tool calls")
 
                     # Execute each requested tool call
-                    async for tool_call in assistant_message.tool_calls:
+                    for tool_call in assistant_message.tool_calls:
                         tool_name = tool_call.function.name
                         tool_args = json.loads(tool_call.function.arguments or "{}")
 
@@ -850,7 +850,7 @@ class MainLLM:
                 if tool_calls:
                     print(f"[MainLLM] Processing {len(tool_calls)} tool call(s)")
 
-                    async for tool_call in tool_calls:
+                    for tool_call in tool_calls:
                         if tool_call["function"]["name"] == "analyze_command_code":
                             args = json.loads(tool_call["function"]["arguments"] or "{}")
                             question = args.get("question", "")
