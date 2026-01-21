@@ -497,7 +497,7 @@ class RouterAgent:
         all_tools = []
         try:
             for session_name, session in self.sessions.items():
-                response = session.list_tools()
+                response = await session.list_tools()
                 tool_names = [tool.name for tool in response.tools]
                 print(f"[RouterAgent] {session_name} server has {len(tool_names)} tools: {tool_names[:5]}...")
                 all_tools.extend([convert_tool_format(tool) for tool in response.tools])
