@@ -10,3 +10,5 @@ project_status.md
 prompts/
 .env
 .claude/
+venv/
+.venv/
