@@ -12,3 +12,4 @@ prompts/
 .claude/
 venv/
 .venv/
+.python*
