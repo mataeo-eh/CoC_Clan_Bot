@@ -421,7 +421,7 @@ class RouterAgent:
         for name, config in server_configs.items():
             try:
                 print(f"[RouterAgent] Connecting to {name} server...")
-
+                print(f"[DEBUG][RouterAgent] current PATH is {os.environ['PATH']}")
                 server_params = StdioServerParameters(**config)
                 stdio_transport = await self.exit_stack.enter_async_context(
                     stdio_client(server_params)
@@ -430,13 +430,18 @@ class RouterAgent:
                 session = await self.exit_stack.enter_async_context(
                     ClientSession(stdio, write)
                 )
-                await session.initialize()
-                print("[RouterAgent] ✓ MCP session initialized")
+                try:
+                    async with asyncio.timeout(25):  # 25 second timeout
+                        await session.initialize()
+                    print("[RouterAgent] ✓ MCP session initialized")
+                except asyncio.TimeoutError:
+                    print("[RouterAgent] ERROR: MCP server initialization timed out (subprocess not responding)")
+                    raise RuntimeError(f"{name} server failed to initialize - likely PATH issue")
 
                 self.sessions[name] = session
 
                 # Log available tools
-                response = session.list_tools()
+                response = await session.list_tools()
                 tool_names = [tool.name for tool in response.tools]
                 print(f"[RouterAgent] ✓ {name} server connected with {len(tool_names)} tools: {tool_names}")
 
