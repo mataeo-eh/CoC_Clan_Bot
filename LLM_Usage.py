@@ -407,24 +407,6 @@ class RouterAgent:
         
     async def __aenter__(self):
         """Initialize MCP connection when entering context"""
-        # Debug: Test if MCP package works before connecting
-        import subprocess
-        print("[DEBUG] Testing if MCP package is accessible...")
-        try:
-            result = subprocess.run(
-                ["npx", "@modelcontextprotocol/server-filesystem", "--help"],
-                capture_output=True,
-                text=True,
-                timeout=15
-            )
-            print(f"[DEBUG] Exit code: {result.returncode}")
-            print(f"[DEBUG] Stdout: {result.stdout[:500]}")
-            print(f"[DEBUG] Stderr: {result.stderr[:500]}")
-        except subprocess.TimeoutExpired:
-            print("[DEBUG] npx command timed out")
-        except Exception as e:
-            print(f"[DEBUG] Error: {e}")
-        
         await self.connect_to_servers(FILESYSTEM_SERVER_CONFIG)
         return self
     
@@ -573,7 +555,7 @@ class RouterAgent:
                         # Find which server has this tool and execute it
                         result = None
                         last_error = None
-                        async for session_name, session in self.sessions.items():
+                        for session_name, session in self.sessions.items():
                             try:
                                 result = await session.call_tool(tool_name, tool_args)
                                 print(f"[RouterAgent] Tool {tool_name} executed successfully via {session_name}")
