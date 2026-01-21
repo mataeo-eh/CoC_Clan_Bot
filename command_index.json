@@ -39,19 +39,21 @@
     "end_line": 917
   },
   "help_from_ai": {
-    "start_line": 918,
-    "end_line": 976,
-    "view_classes": [
-      {
-        "name": "AIHelpView",
-        "start_line": 9560,
-        "end_line": 9649
-      }
-    ]
+    "start_line": 921,
+    "end_line": 1090,
+    "session_manager_class": {
+      "name": "AIHelpSessionManager",
+      "start_line": 9639,
+      "end_line": 9686
+    }
+  },
+  "help_from_ai_end_session": {
+    "start_line": 1095,
+    "end_line": 1133
   },
   "choose_war_alert_channel": {
-    "start_line": 977,
-    "end_line": 1086,
+    "start_line": 1139,
+    "end_line": 1248,
     "view_classes": [
       {
         "name": "ChooseWarAlertChannelView",

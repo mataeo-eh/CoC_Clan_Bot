@@ -20,6 +20,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from typing import Optional, Dict, Any, List
 from pathlib import Path
 from contextlib import AsyncExitStack
@@ -38,6 +39,49 @@ MAX_MESSAGE_LENGTH = 1990
 # ============================================================================
 # DISCORD MESSAGE CHUNKING
 # ============================================================================
+
+
+# ============================================================================
+# RETRY LOGIC FOR API CALLS
+# ============================================================================
+
+async def retry_with_backoff(func, max_retries: int = 3, initial_delay: float = 1.0):
+    """
+    Retry an async function with exponential backoff.
+
+    Args:
+        func: Async callable to retry
+        max_retries: Maximum number of retry attempts
+        initial_delay: Initial delay in seconds (doubles each retry)
+
+    Returns:
+        Result from the function
+
+    Raises:
+        The last exception if all retries fail
+    """
+    last_exception = None
+
+    for attempt in range(max_retries):
+        try:
+            return await func()
+        except Exception as e:
+            last_exception = e
+            error_str = str(e).lower()
+
+            # Only retry on transient errors
+            if "rate_limit" in error_str or "timeout" in error_str or "503" in error_str or "429" in error_str:
+                if attempt < max_retries - 1:
+                    delay = initial_delay * (2 ** attempt)
+                    print(f"[Retry] Attempt {attempt + 1} failed with {type(e).__name__}. Retrying in {delay}s...")
+                    await asyncio.sleep(delay)
+                    continue
+
+            # Non-retryable error, raise immediately
+            raise
+
+    # All retries exhausted
+    raise last_exception
 
 
 
@@ -371,119 +415,236 @@ class RouterAgent:
     
     async def connect_to_servers(self, server_configs: Dict[str, Any]):
         """Connect to MCP servers (filesystem in this case)"""
+        print(f"[RouterAgent] Connecting to {len(server_configs)} MCP server(s)...")
+
         for name, config in server_configs.items():
-            server_params = StdioServerParameters(**config)
-            stdio_transport = await self.exit_stack.enter_async_context(
-                stdio_client(server_params)
-            )
-            stdio, write = stdio_transport
-            session = await self.exit_stack.enter_async_context(
-                ClientSession(stdio, write)
-            )
-            await session.initialize()
-            
-            self.sessions[name] = session
-            
-            # Log available tools
-            response = await session.list_tools()
-            print(f"[RouterAgent] {name} server tools:", [tool.name for tool in response.tools])
+            try:
+                print(f"[RouterAgent] Connecting to {name} server...")
+
+                server_params = StdioServerParameters(**config)
+                stdio_transport = await self.exit_stack.enter_async_context(
+                    stdio_client(server_params)
+                )
+                stdio, write = stdio_transport
+                session = await self.exit_stack.enter_async_context(
+                    ClientSession(stdio, write)
+                )
+                await session.initialize()
+
+                self.sessions[name] = session
+
+                # Log available tools
+                response = await session.list_tools()
+                tool_names = [tool.name for tool in response.tools]
+                print(f"[RouterAgent] ✓ {name} server connected with {len(tool_names)} tools: {tool_names}")
+
+            except FileNotFoundError as e:
+                print(f"[RouterAgent] ERROR: MCP server binary not found for {name}: {e}")
+                print(f"[RouterAgent] Make sure 'npx' is installed and @modelcontextprotocol/server-filesystem is available")
+                raise RuntimeError(f"Failed to start {name} MCP server: npx command not found. Install Node.js and npx.")
+
+            except Exception as e:
+                print(f"[RouterAgent] ERROR: Failed to connect to {name} server: {type(e).__name__}: {e}")
+                raise RuntimeError(f"Failed to connect to {name} MCP server: {str(e)}")
+
+        print(f"[RouterAgent] All {len(self.sessions)} server(s) connected successfully")
     
     async def analyze(self, question: str, max_iterations: int = 10) -> str:
         """
         Analyze codebase to answer a question.
         Uses agentic loop with interleaved thinking.
-        
+
         Args:
             question: User's question about a command
             max_iterations: Maximum tool call iterations
-            
+
         Returns:
             Analysis summary suitable for the main LLM
         """
+        print(f"[RouterAgent] Starting analysis for: {question[:100]}...")
+
         # Initialize conversation with system prompt
         self.messages = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": question}
         ]
-        
+
         # Collect all available tools from MCP servers
         all_tools = []
-        for session in self.sessions.values():
-            response = await session.list_tools()
-            all_tools.extend([convert_tool_format(tool) for tool in response.tools])
-        
+        try:
+            for session_name, session in self.sessions.items():
+                response = await session.list_tools()
+                tool_names = [tool.name for tool in response.tools]
+                print(f"[RouterAgent] {session_name} server has {len(tool_names)} tools: {tool_names[:5]}...")
+                all_tools.extend([convert_tool_format(tool) for tool in response.tools])
+
+            print(f"[RouterAgent] Total tools available: {len(all_tools)}")
+        except Exception as e:
+            print(f"[RouterAgent] ERROR: Failed to list tools: {e}")
+            return f"Error: Failed to access filesystem tools. {str(e)}"
+
         # Agentic loop - model can make multiple tool calls with reasoning
         iteration_count = 0
         while iteration_count < max_iterations:
             iteration_count += 1
-            
-            # Call LLM with tools
-            response = self.openai.chat.completions.create(
-                model=self.model,
-                messages=self.messages,
-                tools=all_tools,
-                temperature=0.3,  # Lower temperature for code analysis
-            )
-            
-            assistant_message = response.choices[0].message
-            self.messages.append(assistant_message.model_dump())
-            
-            # Check if model wants to use tools
-            if assistant_message.tool_calls:
-                # Execute each requested tool call
-                for tool_call in assistant_message.tool_calls:
-                    tool_name = tool_call.function.name
-                    tool_args = json.loads(tool_call.function.arguments or "{}")
-                    
-                    print(f"[RouterAgent] Tool call: {tool_name}({tool_args})")
-                    
-                    # Find which server has this tool and execute it
-                    result = None
-                    for session in self.sessions.values():
-                        try:
-                            result = await session.call_tool(tool_name, tool_args)
-                            break
-                        except Exception as e:
-                            continue
-                    
-                    # Convert MCP result to string format
-                    if result:
-                        if isinstance(result.content, list):
-                            content_str = "\n".join(
-                                item.text if hasattr(item, 'text') else str(item)
-                                for item in result.content
-                            )
-                        else:
-                            content_str = str(result.content)
-                        
-                        # Add tool result to conversation
-                        self.messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "name": tool_name,
-                            "content": content_str
-                        })
+            print(f"[RouterAgent] Iteration {iteration_count}/{max_iterations}")
+
+            # Retry logic for API calls
+            retry_count = 0
+            max_retries = 3
+            last_error = None
+
+            while retry_count < max_retries:
+                try:
+                    # Call LLM with tools
+                    response = self.openai.chat.completions.create(
+                        model=self.model,
+                        messages=self.messages,
+                        tools=all_tools,
+                        temperature=0.3,  # Lower temperature for code analysis
+                    )
+                    break  # Success, exit retry loop
+
+                except Exception as e:
+                    last_error = e
+                    error_str = str(e).lower()
+
+                    # Check if this is a retryable error
+                    is_retryable = any(keyword in error_str for keyword in [
+                        "rate_limit", "429", "timeout", "503", "502", "connection"
+                    ])
+
+                    if is_retryable and retry_count < max_retries - 1:
+                        retry_count += 1
+                        delay = 1.0 * (2 ** retry_count)  # Exponential backoff
+                        print(f"[RouterAgent] API call failed ({type(e).__name__}), retrying in {delay}s (attempt {retry_count}/{max_retries})...")
+                        await asyncio.sleep(delay)
+                        continue
                     else:
-                        # Tool execution failed
-                        self.messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "name": tool_name,
-                            "content": "Error: Tool execution failed"
-                        })
-                
-                # Continue loop - model can reason about results and make more tool calls
-                continue
-            
-            else:
-                # No more tool calls - model has final answer
-                final_response = assistant_message.content
-                print(f"[RouterAgent] Analysis complete in {iteration_count} iterations")
-                return final_response
-        
+                        # Non-retryable or out of retries
+                        raise
+
+            # Check if we exited the loop due to retries exhausted
+            if retry_count >= max_retries and last_error:
+                raise last_error
+
+            try:
+                assistant_message = response.choices[0].message
+                finish_reason = response.choices[0].finish_reason
+                print(f"[RouterAgent] Model finished with reason: {finish_reason}")
+
+                self.messages.append(assistant_message.model_dump())
+
+                # Check if model wants to use tools
+                if assistant_message.tool_calls:
+                    print(f"[RouterAgent] Processing {len(assistant_message.tool_calls)} tool calls")
+
+                    # Execute each requested tool call
+                    for tool_call in assistant_message.tool_calls:
+                        tool_name = tool_call.function.name
+                        tool_args = json.loads(tool_call.function.arguments or "{}")
+
+                        print(f"[RouterAgent] Tool call: {tool_name}({tool_args})")
+
+                        # Find which server has this tool and execute it
+                        result = None
+                        last_error = None
+                        for session_name, session in self.sessions.items():
+                            try:
+                                result = await session.call_tool(tool_name, tool_args)
+                                print(f"[RouterAgent] Tool {tool_name} executed successfully via {session_name}")
+                                break
+                            except Exception as e:
+                                last_error = e
+                                print(f"[RouterAgent] Tool {tool_name} failed on {session_name}: {str(e)[:100]}")
+                                continue
+
+                        # Convert MCP result to string format
+                        if result:
+                            if isinstance(result.content, list):
+                                content_str = "\n".join(
+                                    item.text if hasattr(item, 'text') else str(item)
+                                    for item in result.content
+                                )
+                            else:
+                                content_str = str(result.content)
+
+                            # CRITICAL FIX: Extract line range if requested
+                            # The MCP filesystem server returns the entire file, so we need to extract the lines
+                            if tool_name in ['read_text_file', 'read_file'] and ('start_line' in tool_args or 'end_line' in tool_args):
+                                start_line = int(tool_args.get('start_line', 1))
+                                end_line = int(tool_args.get('end_line', -1))
+
+                                lines = content_str.split('\n')
+                                if end_line == -1 or end_line > len(lines):
+                                    end_line = len(lines)
+
+                                # Extract the requested line range (1-indexed to 0-indexed)
+                                extracted_lines = lines[start_line-1:end_line]
+                                content_str = '\n'.join(extracted_lines)
+
+                                print(f"[RouterAgent] Extracted lines {start_line}-{end_line} ({len(extracted_lines)} lines, {len(content_str)} characters)")
+
+                            # Log result length
+                            print(f"[RouterAgent] Tool {tool_name} final result: {len(content_str)} characters")
+
+                            # Add tool result to conversation
+                            self.messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "name": tool_name,
+                                "content": content_str
+                            })
+                        else:
+                            # Tool execution failed - provide detailed error
+                            error_msg = f"Error executing {tool_name}: {str(last_error) if last_error else 'Unknown error'}"
+                            print(f"[RouterAgent] {error_msg}")
+
+                            self.messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "name": tool_name,
+                                "content": error_msg
+                            })
+
+                    # Continue loop - model can reason about results and make more tool calls
+                    continue
+
+                else:
+                    # No more tool calls - model has final answer
+                    final_response = assistant_message.content
+                    print(f"[RouterAgent] Analysis complete in {iteration_count} iterations")
+                    print(f"[RouterAgent] Response length: {len(final_response) if final_response else 0} characters")
+
+                    if not final_response:
+                        print("[RouterAgent] WARNING: Empty response from model")
+                        return "Error: Model provided empty response. Please try rephrasing your question."
+
+                    return final_response
+
+            except Exception as e:
+                print(f"[RouterAgent] ERROR in iteration {iteration_count}: {type(e).__name__}: {str(e)}")
+
+                # Check for specific error types
+                if "rate_limit" in str(e).lower():
+                    return "Error: API rate limit exceeded. Please try again in a moment."
+                elif "timeout" in str(e).lower():
+                    return "Error: Request timed out. The model may be overloaded. Please try again."
+                elif "authentication" in str(e).lower() or "api_key" in str(e).lower():
+                    return "Error: API authentication failed. Please check the API key configuration."
+                else:
+                    return f"Error: An unexpected error occurred during analysis: {str(e)}"
+
         # Max iterations reached
-        print(f"[RouterAgent] Warning: Max iterations ({max_iterations}) reached")
-        return self.messages[-1].get("content", "Unable to complete analysis")
+        print(f"[RouterAgent] WARNING: Max iterations ({max_iterations}) reached")
+
+        # Try to extract the last assistant message if available
+        for msg in reversed(self.messages):
+            if msg.get("role") == "assistant" and msg.get("content"):
+                print("[RouterAgent] Returning partial response from last assistant message")
+                return msg["content"]
+
+        return "Error: Unable to complete analysis within the maximum number of iterations. Please try asking a more specific question."
     
     async def cleanup(self):
         """Clean up MCP connections"""
@@ -498,17 +659,31 @@ async def analyze_command_code(question: str, command_index: Dict[str, Any]) -> 
     """
     Custom tool function that spawns router agent to analyze code.
     This is exposed to the main LLM as a tool.
-    
+
     Args:
         question: Question about a command
         command_index: Loaded command index
-        
+
     Returns:
         Analysis summary from router agent
     """
-    async with RouterAgent(command_index) as router:
-        summary = await router.analyze(question)
-        return summary
+    try:
+        print(f"[analyze_command_code] Spawning router agent for question: {question[:100]}...")
+        async with RouterAgent(command_index) as router:
+            summary = await router.analyze(question)
+            print(f"[analyze_command_code] Router agent returned {len(summary)} character response")
+            return summary
+    except RuntimeError as e:
+        # MCP server connection failures
+        error_msg = str(e)
+        print(f"[analyze_command_code] ERROR: {error_msg}")
+        return f"I'm experiencing technical difficulties accessing the command documentation. Error: {error_msg}"
+    except Exception as e:
+        # Unexpected errors
+        print(f"[analyze_command_code] UNEXPECTED ERROR: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
+        return f"I encountered an unexpected error while analyzing the command. Please try again or contact support."
 
 
 # Define tool schema for main LLM
@@ -561,109 +736,178 @@ class MainLLM:
         """
         Process user message and generate response with streaming.
         Uses agentic loop to handle tool calls.
-        
+
         Args:
             user_message: User's question
             max_iterations: Maximum tool call iterations
-            
+
         Returns:
             Complete response for the user
         """
+        print(f"[MainLLM] Processing user message: {user_message[:100]}...")
+
         # Add system prompt on first message
         if len(self.messages) == 0:
             self.messages.append({"role": "system", "content": self.system_prompt})
-        
+
         # Add user message
         self.messages.append({"role": "user", "content": user_message})
-        
+
         # Agentic loop with streaming
         iteration_count = 0
         while iteration_count < max_iterations:
             iteration_count += 1
-            
-            # Call LLM with streaming enabled
-            stream = self.openai.chat.completions.create(
-                model=self.model,
-                messages=self.messages,
-                tools=self.tools,
-                temperature=0.7,
-                stream=True,
-            )
-            
-            # Collect the streamed response
-            full_content = ""
-            tool_calls = []
-            finish_reason = None
-            
-            for chunk in stream:
-                delta = chunk.choices[0].delta
-                finish_reason = chunk.choices[0].finish_reason
-                
-                # Handle text content
-                if delta.content:
-                    full_content += delta.content
-                
-                # Handle tool calls (streamed in parts)
-                if delta.tool_calls:
-                    for tool_call_delta in delta.tool_calls:
-                        # Extend or append tool call
-                        if tool_call_delta.index >= len(tool_calls):
-                            tool_calls.append({
-                                "id": tool_call_delta.id,
-                                "type": "function",
-                                "function": {
-                                    "name": tool_call_delta.function.name or "",
-                                    "arguments": tool_call_delta.function.arguments or ""
-                                }
+            print(f"[MainLLM] Iteration {iteration_count}/{max_iterations}")
+
+            # Retry logic for API calls
+            retry_count = 0
+            max_retries = 3
+            last_error = None
+            stream = None
+
+            while retry_count < max_retries:
+                try:
+                    # Call LLM with streaming enabled
+                    stream = self.openai.chat.completions.create(
+                        model=self.model,
+                        messages=self.messages,
+                        tools=self.tools,
+                        temperature=0.7,
+                        stream=True,
+                    )
+                    break  # Success, exit retry loop
+
+                except Exception as e:
+                    last_error = e
+                    error_str = str(e).lower()
+
+                    # Check if this is a retryable error
+                    is_retryable = any(keyword in error_str for keyword in [
+                        "rate_limit", "429", "timeout", "503", "502", "connection"
+                    ])
+
+                    if is_retryable and retry_count < max_retries - 1:
+                        retry_count += 1
+                        delay = 1.0 * (2 ** retry_count)  # Exponential backoff
+                        print(f"[MainLLM] API call failed ({type(e).__name__}), retrying in {delay}s (attempt {retry_count}/{max_retries})...")
+                        await asyncio.sleep(delay)
+                        continue
+                    else:
+                        # Non-retryable or out of retries
+                        raise
+
+            # Check if we exited the loop due to retries exhausted
+            if retry_count >= max_retries and last_error:
+                raise last_error
+
+            try:
+
+                # Collect the streamed response
+                full_content = ""
+                tool_calls = []
+                finish_reason = None
+
+                for chunk in stream:
+                    delta = chunk.choices[0].delta
+                    finish_reason = chunk.choices[0].finish_reason
+
+                    # Handle text content
+                    if delta.content:
+                        full_content += delta.content
+
+                    # Handle tool calls (streamed in parts)
+                    if delta.tool_calls:
+                        for tool_call_delta in delta.tool_calls:
+                            # Extend or append tool call
+                            if tool_call_delta.index >= len(tool_calls):
+                                tool_calls.append({
+                                    "id": tool_call_delta.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": tool_call_delta.function.name or "",
+                                        "arguments": tool_call_delta.function.arguments or ""
+                                    }
+                                })
+                            else:
+                                # Append to existing tool call arguments
+                                if tool_call_delta.function.arguments:
+                                    tool_calls[tool_call_delta.index]["function"]["arguments"] += \
+                                        tool_call_delta.function.arguments
+
+                print(f"[MainLLM] Streaming complete. Content: {len(full_content)} chars, Tool calls: {len(tool_calls)}, Finish reason: {finish_reason}")
+
+                # Save the complete message to history
+                assistant_message = {
+                    "role": "assistant",
+                    "content": full_content if full_content else None
+                }
+                if tool_calls:
+                    assistant_message["tool_calls"] = tool_calls
+                self.messages.append(assistant_message)
+
+                # Check if model wants to use tools
+                if tool_calls:
+                    print(f"[MainLLM] Processing {len(tool_calls)} tool call(s)")
+
+                    for tool_call in tool_calls:
+                        if tool_call["function"]["name"] == "analyze_command_code":
+                            args = json.loads(tool_call["function"]["arguments"] or "{}")
+                            question = args.get("question", "")
+
+                            print(f"[MainLLM] Analyzing command: {question}")
+
+                            # Execute the tool (spawns router agent)
+                            try:
+                                result = await analyze_command_code(question, self.command_index)
+                            except Exception as e:
+                                print(f"[MainLLM] ERROR in analyze_command_code: {type(e).__name__}: {e}")
+                                result = f"Error analyzing command: {str(e)}"
+
+                            # Add tool result to conversation
+                            self.messages.append({
+                                "role": "tool",
+                                "tool_call_id": tool_call["id"],
+                                "name": "analyze_command_code",
+                                "content": result
                             })
-                        else:
-                            # Append to existing tool call arguments
-                            if tool_call_delta.function.arguments:
-                                tool_calls[tool_call_delta.index]["function"]["arguments"] += \
-                                    tool_call_delta.function.arguments
-            
-            # Save the complete message to history
-            assistant_message = {
-                "role": "assistant",
-                "content": full_content if full_content else None
-            }
-            if tool_calls:
-                assistant_message["tool_calls"] = tool_calls
-            self.messages.append(assistant_message)
-            
-            # Check if model wants to use tools
-            if tool_calls:
-                for tool_call in tool_calls:
-                    if tool_call["function"]["name"] == "analyze_command_code":
-                        args = json.loads(tool_call["function"]["arguments"] or "{}")
-                        question = args.get("question", "")
-                        
-                        print(f"[MainLLM] Analyzing command: {question}")
-                        
-                        # Execute the tool (spawns router agent)
-                        try:
-                            result = await analyze_command_code(question, self.command_index)
-                        except Exception as e:
-                            result = f"Error analyzing command: {str(e)}"
-                        
-                        # Add tool result to conversation
-                        self.messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call["id"],
-                            "name": "analyze_command_code",
-                            "content": result
-                        })
-                
-                # Continue loop - model will now respond to user with tool results
-                continue
-            
-            else:
-                # No tool calls - return final response
-                return full_content or "I'm not sure how to help with that."
-        
+
+                    # Continue loop - model will now respond to user with tool results
+                    continue
+
+                else:
+                    # No tool calls - return final response
+                    final_response = full_content or "I'm not sure how to help with that."
+                    print(f"[MainLLM] Returning final response: {len(final_response)} characters")
+                    return final_response
+
+            except Exception as e:
+                print(f"[MainLLM] ERROR in iteration {iteration_count}: {type(e).__name__}: {str(e)}")
+
+                # Check for specific error types
+                if "rate_limit" in str(e).lower():
+                    return "I apologize, but the AI service is experiencing high load (rate limit exceeded). Please try again in a moment."
+                elif "timeout" in str(e).lower():
+                    return "The request timed out. Please try again with a simpler question."
+                elif "authentication" in str(e).lower() or "api_key" in str(e).lower():
+                    return "I'm experiencing authentication issues with the AI service. Please contact an administrator."
+                elif "connection" in str(e).lower():
+                    return "I'm having trouble connecting to the AI service. Please check your internet connection and try again."
+                else:
+                    # Log full error for debugging
+                    import traceback
+                    traceback.print_exc()
+                    return f"I encountered an error while processing your request. Please try again or rephrase your question."
+
         # Max iterations reached
-        print(f"[MainLLM] Warning: Max iterations ({max_iterations}) reached")
-        return "I apologize, but I'm having trouble processing that request. Please try rephrasing your question."
+        print(f"[MainLLM] WARNING: Max iterations ({max_iterations}) reached")
+
+        # Try to extract the last assistant response
+        for msg in reversed(self.messages):
+            if msg.get("role") == "assistant" and msg.get("content"):
+                print("[MainLLM] Returning partial response from last assistant message")
+                return msg["content"] + "\n\n(Note: Response may be incomplete due to complexity. Please try asking a simpler question.)"
+
+        return "I apologize, but I'm having trouble completing this request within the allowed time. Please try breaking your question into smaller, more specific parts."
 
 
 # ============================================================================
