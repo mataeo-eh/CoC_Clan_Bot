@@ -431,11 +431,12 @@ class RouterAgent:
                     ClientSession(stdio, write)
                 )
                 await session.initialize()
+                print("[RouterAgent] ✓ MCP session initialized")
 
                 self.sessions[name] = session
 
                 # Log available tools
-                response = await session.list_tools()
+                response = session.list_tools()
                 tool_names = [tool.name for tool in response.tools]
                 print(f"[RouterAgent] ✓ {name} server connected with {len(tool_names)} tools: {tool_names}")
 
