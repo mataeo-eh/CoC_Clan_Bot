@@ -44,5 +44,6 @@ async def on_ready():
 if __name__ == "__main__":
     log.info("Starting bot runtime")
     import Discord_Commands  # registers slash commands
-
+    print("[DEBUG] Attempting to run bot")
     bot.run(Dkey)
+    print("[DEBUG] Bot run started")
