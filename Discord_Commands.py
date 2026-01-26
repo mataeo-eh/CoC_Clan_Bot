@@ -2267,7 +2267,7 @@ async def set_donation_channel(
 async def donation_summary(
     interaction: discord.Interaction,
     clan_name: str,
-    target_channel: Optional[discord.TextChannel] = None,
+    target_channel: Optional[str] = None,
 ):
     """Pull donation stats using the configured metrics and broadcast the summary."""
     _record_command_usage(interaction, "donation_summary")
@@ -2301,7 +2301,27 @@ async def donation_summary(
         await interaction.followup.send(f"⚠️ {exc}", ephemeral=True)
         return
 
-    destination = target_channel
+    # Resolve target_channel string (channel ID) to a TextChannel object
+    destination: Optional[discord.TextChannel] = None
+    if target_channel is not None:
+        try:
+            channel_id = int(target_channel)
+            channel = interaction.guild.get_channel(channel_id)
+            if isinstance(channel, discord.TextChannel):
+                destination = channel
+            else:
+                await interaction.followup.send(
+                    "⚠️ The selected channel is not a text channel.",
+                    ephemeral=True,
+                )
+                return
+        except ValueError:
+            await interaction.followup.send(
+                "⚠️ Invalid channel specified.",
+                ephemeral=True,
+            )
+            return
+
     if destination is None:
         destination = (
             interaction.guild.get_channel(default_channel_id)
@@ -2334,6 +2354,37 @@ async def donation_summary(
         f"✅ Donation summary posted to {destination.mention}.",
         ephemeral=True,
     )
+
+
+@donation_summary.autocomplete("target_channel")
+async def target_channel_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> List[app_commands.Choice[str]]:
+    """Provide text channel suggestions where the bot has send_messages permission."""
+    if interaction.guild is None:
+        return []
+
+    current_lower = current.lower()
+    suggestions: List[app_commands.Choice[str]] = []
+
+    for channel in interaction.guild.text_channels:
+        # Check if bot has permission to send messages in this channel
+        permissions = channel.permissions_for(interaction.guild.me)
+        if not permissions.send_messages:
+            continue
+
+        # Filter by current input
+        if current_lower and current_lower not in channel.name.lower():
+            continue
+
+        # Display with # prefix for clarity
+        suggestions.append(app_commands.Choice(name=f"#{channel.name}", value=str(channel.id)))
+
+        if len(suggestions) >= 25:
+            break
+
+    return suggestions
 
 
 # ---------------------------------------------------------------------------
@@ -10993,6 +11044,7 @@ async def assign_clan_role(interaction: discord.Interaction):
 @configure_dashboard.autocomplete("clan_name")
 @configure_donation_metrics.autocomplete("clan_name")
 @dashboard.autocomplete("clan_name")
+@donation_summary.autocomplete("clan_name")
 @save_war_plan.autocomplete("clan_name")
 @set_clan.autocomplete("clan_name")
 @war_plan.autocomplete("clan_name")
