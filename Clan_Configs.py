@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
-CONFIG_PATH = Path("/data/clan_configs.json")
+CONFIG_PATH = Path("/app/data/clan_configs.json")
 
 # Default scaffold mirrors the new schema.
 _DEFAULT_CONFIG: Dict[int, Dict[str, Any]] = {}
