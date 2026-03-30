@@ -13,3 +13,4 @@ prompts/
 venv/
 .venv/
 .python*
+.DS_Store
