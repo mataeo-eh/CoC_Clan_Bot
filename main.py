@@ -1,6 +1,6 @@
 import discord
 
-from bot_core import bot, client, Discord_bot_test_guild_ID, Dkey
+from bot_core import bot, client, Discord_bot_test_guild_IDs, Dkey
 from logger import get_logger, setup_logger
 
 logger = setup_logger()
@@ -16,12 +16,13 @@ async def on_ready():
     log.debug("Clash of Clans login completed")
     print(f"✅ {bot.user} is online and synced with Clash of Clans API")
     try:
-        log.debug("Synchronising commands to guild %s", Discord_bot_test_guild_ID)
-        test_guild = discord.Object(id=Discord_bot_test_guild_ID)
-        bot.tree.copy_global_to(guild=test_guild)
-        synced = await bot.tree.sync(guild=test_guild)
-        log.info("Synced %d slash commands to guild %s", len(synced), Discord_bot_test_guild_ID)
-        print(f"🔗 Synced {len(synced)} slash commands to guild {Discord_bot_test_guild_ID}")
+        for guild_id in Discord_bot_test_guild_IDs:
+            log.debug("Synchronising commands to guild %s", guild_id)
+            test_guild = discord.Object(id=guild_id)
+            bot.tree.copy_global_to(guild=test_guild)
+            synced = await bot.tree.sync(guild=test_guild)
+            log.info("Synced %d slash commands to guild %s", len(synced), guild_id)
+            print(f"🔗 Synced {len(synced)} slash commands to guild {guild_id}")
     except Exception as exc:
         log.exception("Sync error")
         print(f"Sync error: {exc}")
