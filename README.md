@@ -1,152 +1,125 @@
-# CoC_Clan_Bot
+# CoC Clan Bot
 
-A Discord bot that keeps Clash of Clans data at your fingertips: look up wars, assign targets, steer alerts, and explore player profiles without leaving your server. I rely on ChatGPT for research, prototyping ideas, and producing reference material while iterating on the code.
+CoC Clan Bot is a Discord bot for Clash of Clans servers. It centralizes war coordination, player lookups, upgrade planning, donation reporting, alert-role management, and recurring clan reports through Discord slash commands and interactive views.
 
-## Highlights
+## Current Project Progress
 
-- **Single source of truth** – configure clans once with `/set_clan`, link their alerts, and let the war loop broadcast timed reminders automatically.
-- **Custom dashboards & schedules** – mix-and-match dashboard modules, export CSV snapshots, and automate recurring reports without manual follow-ups.
-- **Guided workflows** – every interactive command explains what to do after you press enter and provides buttons or dropdowns to finish the job.
-- **Player intelligence** – link Discord members to their Clash accounts and surface player stats instantly with `/player_info`.
-- **Safety first** – duplicate-tag protection, permission checks, and clear logging make it easy to understand what the bot is doing.
+- The core runtime is in place: `main.py` logs into Discord and the Clash of Clans API, syncs slash commands, and starts the background loops.
+- Persistent server configuration is implemented in `Clan_Configs.py`, including clan records, alert settings, player links, event roles, report schedules, upgrade logs, and war-alert de-duplication state.
+- The main command surface is implemented in `Discord_Commands.py` and currently exposes **37 slash commands**.
+- War automation is live in code: a background loop checks configured clans every 5 minutes and sends milestone alerts to the selected channel.
+- Scheduled reporting is live in code: a separate loop checks stored schedules every minute and posts dashboards, donation summaries, or season summaries when due.
+- AI-assisted command help is implemented through `LLM_Usage.py` with session-based follow-up support.
+- Command usage analytics are implemented in `logger.py` so admins can inspect aggregate bot usage through `/help_usage`.
 
-## Project Overview (tracked files)
+## Current Feature Areas
 
-- `bot_core.py` – Centralises shared Discord state (`bot`, `client`, intents) so multiple modules can register commands without spinning up duplicate clients.
-- `main.py` – Entry point that logs into Discord/CoC, synchronises slash commands, and imports the command catalogue.
-- `Discord_Commands.py` – Production command suite (help, clan configuration, alert routing, player linking, war viewers, base assignments, role helpers, and alert toggles) plus the background war-alert loop.
-- `COC_API.py` – Thin wrapper around `coc.Client` for login, guild configuration, player snapshots, and war helpers.
-- `logger.py` – Shared logging utility writing DEBUG-level files to `logs/` while only surfacing errors on the console.
-- `ENV/Clan_Configs.py` – JSON-backed storage helpers for `clans`, `player_tags`, and `player_accounts`, keeping backward compatibility with earlier layouts.
-- `ENV/notify_codex_complete.applescript` – macOS helper the automation uses to notify me when a TODO run finishes.
-- `Discord_command_groups.py` – Experimental harness for alternative command grouping patterns.
-- `README.md` – This detailed guide.
+- **Clan setup and alert routing**: register clans, choose alert channels, and let members opt into war pings.
+- **War coordination**: interactive war info views, war plan templates, reusable war nudges, and assignment workflows.
+- **Player/account management**: link Clash player tags to Discord members and fetch interactive player info views.
+- **Upgrade and donation tracking**: log upgrades, configure summary channels, and generate donation leaderboards.
+- **Dashboards and recurring reports**: configure module-based dashboards, schedule automated posts, and publish season summaries.
+- **Role utilities and onboarding**: self-assign clan roles, opt into event roles, and onboard members with a guided registration command.
+- **Built-in help tooling**: static help commands plus a session-based AI help flow for follow-up questions.
 
-Everything under `ENV/` besides the files listed above (e.g., keys, documentation notes, generated configs) stays private and is ignored in the public repository.
+## Project Structure
 
-## Command Reference
+- `main.py` - Entry point that logs into Discord/CoC, syncs slash commands, and starts the background loops.
+- `bot_core.py` - Shared Discord bot/client state and environment-backed runtime configuration.
+- `Discord_Commands.py` - Main slash command implementation, interactive views, and background automation.
+- `COC_API.py` - Clash of Clans API wrapper for player, clan, war, and CWL data retrieval.
+- `Clan_Configs.py` - JSON-backed configuration storage and schema normalization.
+- `LLM_Usage.py` - Session-based AI help system for explaining bot commands and workflows.
+- `logger.py` - Shared logging and aggregate command-usage tracking.
+- `Scripts/Generate_Command_Index.py` - Utility script that rebuilds `command_index.json` from registered commands.
+- `command_index.json` - Generated command index for quick command inventory/reference.
+- `Dockerfile` / `railpack.json` - Container and deployment configuration.
 
-Each command behaves the same way: fill in any required options, press **Enter** to send the slash command, and then follow the menus or buttons that appear.
+## Typical Workflow
 
-### `/help`
-- **What it does:** Sends a short reminder of what the bot can do and links back to this README.
-- **How to use:** Run the command anywhere; it always answers ephemerally so you can revisit the documentation link without spamming the channel.
+Most interactive commands follow the same pattern:
 
-### Specialized help commands
-- `/help_war_info` – Recaps the dropdown workflow for the interactive war viewer.
-- `/help_assign_bases` – Walks admins through the per-player assignment view and broadcast button.
-- `/help_plan_upgrade` – Reminds members how to link accounts and submit upgrade plans.
-- `/help_dashboard` – Summarises the dashboard configuration flow and posting options.
-- `/help_schedule_report` – Explains the scheduler trio (`/schedule_report`, `/list_schedules`, `/cancel_schedule`).
+1. Run the slash command and fill in any required options.
+2. Submit the command in Discord.
+3. Use the follow-up dropdowns, buttons, or modals to finish the workflow.
 
-### `/set_clan`
-- **Purpose:** Register or update a clan name and tag for the server and choose whether war alerts should be enabled.
-- **After sending:** If a conflicting tag already exists, the bot prompts you with a replace/keep choice. Success messages recap the tag, whether alerts are enabled, and suggest linking an alert channel.
-- **Pro tip:** Start typing the optional `clan_name` field when invoking the command to auto-complete existing entries.
-- **Permissions:** Administrators only.
+That pattern is used throughout the bot for war views, dashboards, player linking, war plans, schedules, and role selection.
 
-### `/choose_war_alert_channel`
-- **Purpose:** Decide which text channel should receive time-based war alerts for a specific clan.
-- **After sending:** Step 1 – choose a category; Step 2 – pick the channel (use the 🔍 filter if there are tons of channels); Step 3 – confirm. The stored channel is used until you change it again.
-- **Permissions:** Administrators only.
+## Background Automation
 
-### `/configure_dashboard` & `/dashboard`
-- **Purpose:** Build configurable dashboards that combine war, donation, upgrade, and opt-in data, and post them on demand or export CSV snapshots.
-- **After sending:** `/configure_dashboard` opens an interactive view where admins choose modules, set the output format, and store a default channel. `/dashboard` lets anyone with access post the saved dashboard (or override the modules/format/channel for one-offs).
-- **Tips:** Modules accept comma-separated overrides (`war_overview,donation_snapshot`) and the dashboard format can be `embed`, `csv`, or `both`.
+### War alert loop
 
-### `/link_player`
-- **Purpose:** Link or unlink Clash of Clans player tags to Discord members so `/player_info` autocomplete stays fast.
-- **After sending:** Pick the action (link/unlink), optionally select another member (admins only), set the player tag and alias in the modal, then choose whether to keep the confirmation private or broadcast it to the channel with dedicated buttons.
-- **Pro tip:** The optional slash command arguments still work; use them to pre-fill the view when you already know the action, tag, or alias.
-- **Rules:** Non-admins can only manage their own links; admins can manage anyone. Tags are validated against the Clash API, aliases fall back to the in-game name, and multiple tags per Discord user are supported.
-- **Result:** After you confirm, the outcome is logged in the view and (if you broadcast it) announced to the channel, so `/player_info` can be used immediately.
+The war alert loop polls configured clans every 5 minutes and sends time-based alerts for key war milestones. Alerts respect the clan's configured alert channel and the member opt-in role.
 
-### `/clan_war_info_menu`
-- **Purpose:** Pull the current (or most recent) war data for a configured clan and explore it interactively.
-- **After sending:** A dropdown appears—select the data points you want (attacks, countdowns, rosters, etc.). Use the **Broadcast** button to share the current selection or the **Private Copy** button to keep it for yourself.
+### Scheduled report loop
 
-### `/player_info`
-- **Purpose:** View detailed player stats (heroes, troops, donations, achievements, and more).
-- **Options:** `player_reference` accepts a full tag (e.g., `#ABC123`), a saved alias, or a linked Discord member name.
-- **After sending:** The same menu-and-buttons pattern as the war view lets you choose the sections you care about and decide whether to share or keep them private.
+The report scheduler wakes up every minute, checks saved schedules, and posts due reports. Supported scheduled report types in the current codebase are:
 
-### `/assign_bases`
-- **Purpose:** Share per-player base assignments or broadcast a general battle plan during an active war.
-- **After sending:** You’re given two buttons:
-  1. **Per Player Assignments** – pick a home base from the dropdown, enter one or two enemy base numbers when prompted, repeat as needed, then hit **Post Assignments** to broadcast the summary (the bot adds the alert-role mention automatically).
-  2. **General Assignment Rule** – type any free-form instruction (for example, “Everyone attack your mirror”) and the bot posts it with the usual alert-role mention.
-- **Permissions:** Administrators only.
+- dashboards
+- donation summaries
+- season summaries
 
-### `/assign_clan_role`
-- **Purpose:** Let members assign the appropriate clan role to themselves.
-- **After sending:** Pick a clan from the dropdown, then choose whether the confirmation should be broadcast or private.
+## Complete Slash Command List
 
-### `/toggle_war_alerts`
-- **Purpose:** Opt in or out of the alert role so members control whether they get pinged when alerts fire.
-- **Usage:** Choose **True** to receive alerts or **False** to opt out; the command explains whether the role was added or removed.
+### Help and documentation
 
-### `/configure_war_nudge` & `/war_nudge`
-- **Purpose:** Let admins define reusable “reasons” (unused attacks, no attacks, low stars) and ping the appropriate members or roles on demand.
-- **After sending:** Configure reasons with mentions and an optional description via `/configure_war_nudge`, then run `/war_nudge` with that reason to post the reminder—no automated nudges, only when you call it.
+- `/help` - Show the main bot help message and README link.
+- `/help_war_info` - Explain the interactive war info workflow.
+- `/help_assign_bases` - Explain how the base-assignment flow works.
+- `/help_plan_upgrade` - Explain how upgrade planning works.
+- `/help_dashboard` - Explain dashboard configuration and posting.
+- `/help_schedule_report` - Explain recurring report scheduling.
+- `/help_usage` - Show aggregate command-usage analytics for admins.
+- `/help_from_ai` - Start or continue an AI help session for command questions.
+- `/help_from_ai_end_session` - End the current AI help session and clear its context.
 
-### War plan commands (`/save_war_plan`, `/list_war_plans`, `/war_plan`)
-- **Purpose:** Store reusable war plans per clan, review what’s available, and broadcast the chosen plan with an interactive picker.
-- **After sending:** `/save_war_plan` opens the editor for creating or updating templates, `/list_war_plans` lists what’s stored, and `/war_plan` now launches a poster view where you choose the clan, plan, and destination channel before previewing or posting the result.
+### Clan setup and alert routing
 
-### `/plan_upgrade` & `/set_upgrade_channel`
-- **Purpose:** Members log upcoming upgrades for their linked accounts while admins decide where those notices are posted.
-- **After sending:** Upgrades appear in the configured channel with the submitter, account alias, upgrade details, and notes.
-- **Bonus:** Each submission is stored (with optional clan association) so dashboards can highlight recent upgrade plans.
+- `/set_clan` - Add or update a clan configured for the Discord server.
+- `/choose_war_alert_channel` - Select which channel receives war alerts for a clan.
+- `/toggle_war_alerts` - Opt in or out of the war alert role.
 
-### Donation tracking (`/configure_donation_metrics`, `/set_donation_channel`, `/donation_summary`)
-- **Purpose:** Highlight top donors (and optionally low donors or negative balances) with per-clan configuration and a dedicated summary channel.
-- **After sending:** Metrics updates apply immediately; the summary command fetches live numbers from the Clash API and posts them to the chosen channel.
+### War coordination
 
-### Event roles (`/configure_event_role`, `/event_alert_opt`)
-- **Purpose:** Maintain opt-in alert roles for events like Clan Games or Raid Weekend.
-- **After sending:** Admins map or create the roles, and members (or admins on their behalf) toggle them on demand.
+- `/clan_war_info_menu` - Open the interactive war info view for a clan.
+- `/assign_bases` - Assign war targets or broadcast a general assignment rule.
+- `/configure_war_nudge` - Configure reusable war nudge reasons and mention targets.
+- `/war_nudge` - Send a configured war nudge for a clan.
+- `/save_war_plan` - Create or update a reusable war plan template.
+- `/list_war_plans` - List saved war plan templates for a clan.
+- `/war_plan` - Post a saved war plan through the interactive poster flow.
 
-### `/register_me`
-- **Purpose:** Give newcomers a single command to opt into alert roles, review linked accounts, and find the documentation.
-- **After sending:** Buttons toggle the configured roles, and the response explains how to link tags or explore other utilities.
+### Player accounts and upgrades
 
-### Seasonal summaries (`/set_season_summary_channel`, `/season_summary`)
-- **Purpose:** Drop end-of-season wrap-ups—war records, donation highlights, trophy leaders—into a dedicated channel.
-- **After sending:** The summary command pulls the latest clan data and posts it wherever you direct (or the default summary channel if set).
+- `/link_player` - Link or unlink Clash of Clans player tags to Discord members.
+- `/player_info` - Open the interactive player info view for a saved alias, member, or tag.
+- `/plan_upgrade` - Log a planned upgrade for a linked account.
+- `/set_upgrade_channel` - Set the default channel for upgrade-plan posts.
 
-### Scheduled reports (`/schedule_report`, `/list_schedules`, `/cancel_schedule`)
-- **Purpose:** Automate dashboards, donation summaries, and season wrap-ups so they appear on a daily or weekly cadence.
-- **After sending:** `/schedule_report` validates the cadence, stores the schedule, and tells you the next run time. `/list_schedules` shows what’s queued (with upcoming timestamps), and `/cancel_schedule` removes obsolete entries.
-- **Permissions:** Administrators only; the background scheduler respects per-clan channel settings and skips destinations the bot cannot write to.
+### Dashboards, season reports, and scheduling
 
-### `/help_usage`
-- **Purpose:** Give administrators anonymised insight into how the bot is used—top commands, total traffic, and high-level user activity.
-- **After sending:** The command replies ephemerally with aggregate counts (no user identifiers) so you can gauge adoption and spot unused workflows.
+- `/configure_dashboard` - Configure saved dashboard modules, output format, and default destination.
+- `/dashboard` - Post the configured dashboard for a clan.
+- `/set_season_summary_channel` - Set the default channel for season summaries.
+- `/season_summary` - Generate a season summary for a clan.
+- `/schedule_report` - Create or update a scheduled report.
+- `/list_schedules` - List saved schedules for the server or a specific clan.
+- `/cancel_schedule` - Remove a scheduled report by ID.
 
-### Command Workflow Reminder
-Whichever command you choose, remember the pattern:
-1. Fill in the slash command’s options.
-2. Press **Enter** to run it.
-3. Use the dropdowns, buttons, or modals that appear to finish the workflow.
+### Donations
 
-## War Alert Automation
+- `/configure_donation_metrics` - Configure which donation metrics are tracked for a clan.
+- `/set_donation_channel` - Set the default channel for donation summaries.
+- `/donation_summary` - Generate a donation leaderboard and summary for a clan.
 
-The background loop (defined in `Discord_Commands.py`) checks every tracked clan every five minutes. It sends alerts when:
+### Roles and onboarding
 
-- A war is about to start (1 hour, 5 minutes) or has just begun (5 minutes after the start).
-- A war is winding down (12 hours, 1 hour, 5 minutes) or just concluded (final score roundup).
+- `/assign_clan_role` - Self-assign a clan role from the configured clan list.
+- `/configure_event_role` - Configure opt-in roles for events like Clan Games or Raid Weekend.
+- `/event_alert_opt` - Opt into or out of a configured event alert role.
+- `/register_me` - Guided onboarding flow for new members.
 
-Alerts respect the per-clan channel set via `/choose_war_alert_channel`; if the bot loses send permissions for that channel, it skips the alerts until you pick a new destination.
+## Notes
 
-## Scheduled Reports
-
-Another background loop wakes up every minute, looks at the schedules created with `/schedule_report`, and runs anything that is due. Each run recalculates the next trigger using UTC, honours the per-report channel (falling back to configured defaults), and gracefully skips locations where the bot lacks send permissions. Use `/list_schedules` to monitor what’s queued and `/cancel_schedule` whenever you no longer need an automated recap.
-
-## Logging and Support Files
-
-- The logger writes detailed DEBUG files under `logs/` while only surfacing errors on stdout to keep noisy output away from the console.
-- `git_commands.md` (ignored in the public repo) is used in my private workflow to capture commit/push snippets once a TODO run finishes.
-- When automation completes a TODO pass, it runs `ENV/notify_codex_complete.applescript` so I get a macOS notification.
-
-If you have questions, open the README (via `/help`) or inspect the source—docstrings and inline comments explain the nuts and bolts of each flow. The goal is that an interested teenager—or anyone curious, regardless of technical background—can follow these instructions and get the most out of the bot. Happy raiding!
+- The bot stores configuration as JSON and normalizes older config formats into the current schema automatically.
+- The current command set is generated from `Discord_Commands.py`; if commands change, `Scripts/Generate_Command_Index.py` should be rerun so `command_index.json` stays in sync.
