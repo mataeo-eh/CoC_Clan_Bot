@@ -709,7 +709,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 # ---------------------------------------------------------------------------
 @bot.tree.command(name="set_clan", description="Manage the clans configured for this server.")
 @app_commands.describe(
-    clan_name="Optional clan to load when opening the editor.",
+    clan_name="Optional clan to load, or a new clan name to draft.",
 )
 async def set_clan(
     interaction: discord.Interaction,
@@ -735,8 +735,7 @@ async def set_clan(
         )
         return
 
-    clan_map = _clan_names_for_guild(interaction.guild.id)
-    selected_clan = clan_name if isinstance(clan_name, str) and clan_name in clan_map else None
+    selected_clan = clan_name.strip() if isinstance(clan_name, str) and clan_name.strip() else None
 
     view = SetClanView(
         guild=interaction.guild,
@@ -8521,7 +8520,7 @@ class SetClanSelect(discord.ui.Select):
                 label="Create new clan",
                 value="__new__",
                 description="Add a brand new clan configuration",
-                default=parent_view.selected_name is None,
+                default=parent_view.original_name is None,
             )
         ]
         for name in sorted(parent_view.clan_map.keys(), key=str.casefold):
@@ -8591,6 +8590,17 @@ class SetClanNameModal(discord.ui.Modal):
         await self.parent_view.refresh_view_message()
 
 
+class SetClanNameButton(discord.ui.Button):
+    """Open the modal for setting the clan display name."""
+
+    def __init__(self, parent_view: "SetClanView"):
+        super().__init__(label="Set Clan Name", style=discord.ButtonStyle.primary, row=1)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        await interaction.response.send_modal(SetClanNameModal(self.parent_view))
+
+
 class SetClanTagModal(discord.ui.Modal):
     """Modal used to validate and store the clan tag."""
 
@@ -8635,6 +8645,17 @@ class SetClanTagModal(discord.ui.Modal):
             ephemeral=True,
         )
         await self.parent_view.refresh_view_message()
+
+
+class SetClanTagButton(discord.ui.Button):
+    """Open the modal for setting and verifying the clan tag."""
+
+    def __init__(self, parent_view: "SetClanView"):
+        super().__init__(label="Set Clan Tag", style=discord.ButtonStyle.primary, row=1)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        await interaction.response.send_modal(SetClanTagModal(self.parent_view))
 
 
 class SetClanToggleAlertsButton(discord.ui.Button):
@@ -8725,7 +8746,7 @@ class SetClanView(discord.ui.View):
         if selected_clan and selected_clan in self.clans:
             self.load_clan(selected_clan)
         else:
-            self.start_new_clan()
+            self.start_new_clan(draft_name=selected_clan)
 
         self.refresh_components()
 
@@ -8750,13 +8771,13 @@ class SetClanView(discord.ui.View):
         self.clan_map = _clan_names_for_guild(self.guild.id)
         self.refresh_components()
 
-    def start_new_clan(self) -> None:
+    def start_new_clan(self, *, draft_name: Optional[str] = None) -> None:
         self.original_name = None
-        self.selected_name = None
+        self.selected_name = draft_name.strip() if isinstance(draft_name, str) and draft_name.strip() else None
         self.tag = None
         self.enable_alerts = True
         self.alert_channel_id = None
-        self.unsaved_changes = False
+        self.unsaved_changes = self.selected_name is not None
         self.refresh_components()
 
     def set_name(self, name: str) -> None:
@@ -8779,6 +8800,8 @@ class SetClanView(discord.ui.View):
         self.clear_items()
         self.clan_map = _clan_names_for_guild(self.guild.id)
         self.add_item(SetClanSelect(self))
+        self.add_item(SetClanNameButton(self))
+        self.add_item(SetClanTagButton(self))
         self.add_item(SetClanToggleAlertsButton(self))
         self.add_item(SetClanSaveButton(self))
         self.add_item(SetClanDeleteButton(self))
