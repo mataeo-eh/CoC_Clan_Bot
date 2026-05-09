@@ -2,6 +2,7 @@
 
 import copy
 import csv
+import os
 import re
 from datetime import datetime, timedelta, timezone
 from io import BytesIO, StringIO
@@ -68,6 +69,35 @@ _war_alert_state_loaded = False
 
 # Global dictionary to store active AI help sessions by user ID
 active_ai_help_sessions: Dict[int, "AIHelpSessionManager"] = {}
+
+
+def _load_admin_bypass_user_ids() -> Set[int]:
+    """Load Discord user IDs that can use admin-only bot commands."""
+    raw_user_ids = (
+        os.getenv("DISCORD_ADMIN_BYPASS_USER_IDS")
+        or os.getenv("DISCORD_ADMIN_BYPASS_USER_ID")
+        or ""
+    )
+    bypass_ids: Set[int] = set()
+    for raw_value in re.split(r"[\s,;]+", raw_user_ids.strip()):
+        if not raw_value:
+            continue
+        try:
+            bypass_ids.add(int(raw_value))
+        except ValueError:
+            log.warning("Ignoring invalid Discord admin bypass user ID: %s", raw_value)
+    return bypass_ids
+
+
+ADMIN_BYPASS_USER_IDS = _load_admin_bypass_user_ids()
+
+
+def user_has_admin_access(user: Any) -> bool:
+    """Return True for server admins or configured per-user command bypasses."""
+    if isinstance(user, discord.Member) and user.guild_permissions.administrator:
+        return True
+    user_id = getattr(user, "id", None)
+    return isinstance(user_id, int) and user_id in ADMIN_BYPASS_USER_IDS
 
 
 def _record_command_usage(interaction: discord.Interaction, command_name: str) -> None:
@@ -602,7 +632,7 @@ async def _link_player_account(
     if normalised_tag is None:
         raise PlayerLinkError("⚠️ Please provide a valid player tag like `#ABC123`.")
 
-    if target != actor and not actor.guild_permissions.administrator:
+    if target != actor and not user_has_admin_access(actor):
         raise PlayerLinkError("❌ Only administrators can manage linked tags for other members.")
 
     guild_config = _ensure_guild_config(guild.id)
@@ -697,7 +727,7 @@ async def set_clan(
         )
         return
 
-    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+    if not user_has_admin_access(interaction.user):
         await send_text_response(
             interaction,
             "You need the Administrator permission to configure this command.",
@@ -867,7 +897,7 @@ async def help_usage(interaction: discord.Interaction):
         return
 
     member = interaction.user
-    if not isinstance(member, discord.Member) or not member.guild_permissions.administrator:
+    if not user_has_admin_access(member):
         await send_text_response(
             interaction,
             "❌ Only administrators can view usage analytics.",
@@ -1224,7 +1254,7 @@ async def choose_war_alert_channel(interaction: discord.Interaction, clan_name: 
             log.warning("Failed to defer interaction for choose_war_alert_channel: %s", exc)
 
     member = interaction.user
-    if not isinstance(member, discord.Member) or not member.guild_permissions.administrator:
+    if not user_has_admin_access(member):
         await send_text_response(
             interaction,
             "❌ Only administrators can configure alert destinations.",
@@ -1332,7 +1362,7 @@ async def configure_war_nudge(
         )
         return
 
-    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+    if not user_has_admin_access(interaction.user):
         await send_text_response(
             interaction,
             "⚠️ Only administrators can configure war nudges.",
@@ -1525,7 +1555,7 @@ async def configure_dashboard(
             ephemeral=True,
         )
         return
-    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+    if not user_has_admin_access(interaction.user):
         await send_text_response(
             interaction,
             "❌ Only administrators can configure dashboards.",
@@ -1691,7 +1721,7 @@ async def link_player(
 
     target: discord.Member = actor
     if isinstance(target_member, discord.Member) and target_member.id != actor.id:
-        if actor.guild_permissions.administrator:
+        if user_has_admin_access(actor):
             target = target_member
         else:
             await send_text_response(
@@ -1747,7 +1777,7 @@ async def save_war_plan(
         )
         return
 
-    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+    if not user_has_admin_access(interaction.user):
         await send_text_response(
             interaction,
             "Only administrators can save war plans.",
@@ -2115,7 +2145,7 @@ async def set_upgrade_channel(interaction: discord.Interaction, channel: discord
             ephemeral=True,
         )
         return
-    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+    if not user_has_admin_access(interaction.user):
         await send_text_response(
             interaction,
             "❌ Only administrators can set the upgrade channel.",
@@ -2165,7 +2195,7 @@ async def configure_donation_metrics(
             ephemeral=True,
         )
         return
-    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+    if not user_has_admin_access(interaction.user):
         await send_text_response(
             interaction,
             "⚠️ Only administrators can configure donation metrics.",
@@ -2223,7 +2253,7 @@ async def set_donation_channel(
             ephemeral=True,
         )
         return
-    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+    if not user_has_admin_access(interaction.user):
         await send_text_response(
             interaction,
             "❌ Only administrators can set the donation channel.",
@@ -2413,7 +2443,7 @@ async def configure_event_role(
         )
         return
 
-    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+    if not user_has_admin_access(interaction.user):
         await send_text_response(
             interaction,
             'Only administrators can configure event roles.',
@@ -2503,7 +2533,7 @@ async def event_alert_opt(
         return
 
     target = target_member or actor
-    if target != actor and not actor.guild_permissions.administrator:
+    if target != actor and not user_has_admin_access(actor):
         await send_text_response(
             interaction,
             "Only administrators can toggle event roles for other members.",
@@ -2645,7 +2675,7 @@ async def set_season_summary_channel(
             ephemeral=True,
         )
         return
-    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+    if not user_has_admin_access(interaction.user):
         await send_text_response(
             interaction,
             "❌ Only administrators can set the summary channel.",
@@ -2706,7 +2736,7 @@ async def season_summary(
         )
         return
 
-    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+    if not user_has_admin_access(interaction.user):
         await send_text_response(
             interaction,
             "Only administrators can generate seasonal summaries.",
@@ -4164,7 +4194,7 @@ async def schedule_report(
         )
         return
 
-    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+    if not user_has_admin_access(interaction.user):
         await send_text_response(
             interaction,
             "Only administrators can manage report schedules.",
@@ -4239,7 +4269,7 @@ async def list_schedules(interaction: discord.Interaction, clan_name: Optional[s
         )
         return
     member = interaction.user
-    if not isinstance(member, discord.Member) or not member.guild_permissions.administrator:
+    if not user_has_admin_access(member):
         await send_text_response(
             interaction,
             "❌ Only administrators can view report schedules.",
@@ -4299,7 +4329,7 @@ async def cancel_schedule(interaction: discord.Interaction, schedule_id: str) ->
         )
         return
     member = interaction.user
-    if not isinstance(member, discord.Member) or not member.guild_permissions.administrator:
+    if not user_has_admin_access(member):
         await send_text_response(
             interaction,
             "❌ Only administrators can cancel report schedules.",
@@ -5462,7 +5492,7 @@ class DashboardConfigView(discord.ui.View):
 
     @discord.ui.button(label="Save", style=discord.ButtonStyle.success)
     async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:  # type: ignore[override]
-        if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+        if not user_has_admin_access(interaction.user):
             await interaction.response.send_message(
                 "⚠️ Only administrators can update the dashboard configuration.",
                 ephemeral=True,
@@ -5834,7 +5864,7 @@ class EventRoleConfigView(discord.ui.View):
 
     def user_is_admin(self, interaction: discord.Interaction) -> bool:
         member = interaction.user if isinstance(interaction.user, discord.Member) else self.guild.get_member(interaction.user.id)
-        return bool(member and member.guild_permissions.administrator)
+        return user_has_admin_access(member or interaction.user)
 
     def refresh_components(self) -> None:
         self.clear_items()
@@ -9288,7 +9318,7 @@ class LinkPlayerTargetSelect(discord.ui.UserSelect):
                 ephemeral=True,
             )
             return
-        if not interaction.user.guild_permissions.administrator:
+        if not user_has_admin_access(interaction.user):
             await interaction.response.send_message(
                 "⚠️ Only administrators can change the target member.",
                 ephemeral=True,
@@ -9432,7 +9462,7 @@ class LinkPlayerView(discord.ui.View):
     def refresh_components(self) -> None:
         self.clear_items()
         self.add_item(LinkPlayerActionSelect(self))
-        if self.actor.guild_permissions.administrator:
+        if user_has_admin_access(self.actor):
             self.add_item(LinkPlayerTargetSelect(self))
         self.add_item(LinkPlayerDetailsButton(self))
         private_button = LinkPlayerConfirmPrivateButton(self)
@@ -9576,7 +9606,7 @@ class LinkPlayerModal(discord.ui.Modal):
             )
             return
 
-        if actor.id != member.id and not actor.guild_permissions.administrator:
+        if actor.id != member.id and not user_has_admin_access(actor):
             await interaction.response.send_message(
                 "⚠️ Only the member themselves or an administrator can manage linked tags from this view.",
                 ephemeral=True,
@@ -9659,7 +9689,7 @@ class LinkPlayerSelect(discord.ui.Select):
 
         member = self.parent_view.member
         actor = interaction.user
-        if actor.id != member.id and not actor.guild_permissions.administrator:
+        if actor.id != member.id and not user_has_admin_access(actor):
             await interaction.response.send_message(
                 "⚠️ Only the member themselves or an administrator can manage linked tags from this view.",
                 ephemeral=True,
@@ -10400,7 +10430,7 @@ class RegisterMeView(discord.ui.View):
             return
 
         is_owner = interaction.user.id == self.member.id
-        if not is_owner and not interaction.user.guild_permissions.administrator:
+        if not is_owner and not user_has_admin_access(interaction.user):
             await interaction.response.send_message(
                 "Only the member themselves or an administrator can manage these roles here.",
                 ephemeral=True,
@@ -10846,7 +10876,7 @@ async def assign_bases(interaction: discord.Interaction, clan_name: str):
         return
 
     member = interaction.user
-    if not isinstance(member, discord.Member) or not member.guild_permissions.administrator:
+    if not user_has_admin_access(member):
         await send_text_response(
             interaction,
             "❌ Only administrators can assign war targets.",
