@@ -139,14 +139,14 @@ class CoCAPI:
         log.debug("CoCAPI.set_server_clan persisted configuration")
 
     async def get_clan_war_raw(self, tag: str):
-        """Fetch the live war object for a clan tag."""
+        """Fetch the regular current-war endpoint for a clan tag, excluding CWL."""
         log.debug("CoCAPI.get_clan_war_raw invoked")
         result = await self._require_client().get_clan_war(tag)
         log.debug("CoCAPI.get_clan_war_raw fetched data")
         return result
 
     async def get_active_war_raw(self, tag: str):
-        """Fetch the current active war (regular or CWL) for a clan tag."""
+        """Fetch the current war context for a clan tag, including CWL rounds."""
         log.debug("CoCAPI.get_active_war_raw invoked")
         client = self._require_client()
         war = await client.get_current_war(tag)
@@ -186,7 +186,9 @@ class CoCAPI:
         tag = clans[clan_name].get("tag")
         if not tag:
             raise ClanNotConfiguredError(f"Clan '{clan_name}' has no tag configured.")
-        clan = await self._require_client().get_clan_war(tag)
+        clan = await self.get_active_war_raw(tag)
+        if clan is None:
+            raise notinWar(f"Clan '{clan_name}' is not currently in an active war.")
         log.debug("CoCAPI.get_clan_war_info fetched war data")
         data = {
             "home clan": clan.clan,
@@ -205,8 +207,12 @@ class CoCAPI:
             "war day start time": clan.start_time,
             "war end time": clan.end_time,
             "league group": clan.league_group,
-            "all accounts in war": clan.members,
-            "Clan members in war": clan.clan.members
+            "clan members in war": clan.clan.members,
+            "all members in war": clan.members,
+            "members with unused attacks this war": clan.clan.members,
+            "members with no attacks this war": clan.clan.members,
+            "member stars this war": clan.clan.members,
+            "member attack summaries": clan.clan.members,
         }
         log.debug("CoCAPI.get_clan_war_info returning payload")
         return data

@@ -619,6 +619,7 @@ async def _link_player_account(
     action: Literal["link", "unlink"],
     player_tag: str,
     alias: Optional[str],
+    skip_remote_lookup: bool = False,
 ) -> str:
     """Perform the underlying link/unlink operation and return a user-facing message."""
     if guild.id != actor.guild.id or guild.id != target.guild.id:
@@ -641,16 +642,19 @@ async def _link_player_account(
     existing_entries = accounts.setdefault(user_key, [])
 
     if action_lower == "link":
-        try:
-            player_payload = await client.get_player(normalised_tag)
-        except coc.errors.NotFound:
-            raise PlayerLinkError(f"⚠️ I couldn't find a Clash of Clans profile with tag `{normalised_tag}`.")
-        except Exception as exc:  # pylint: disable=broad-except
-            log.exception("Unexpected error while linking player tag", exc_info=exc)
-            raise PlayerLinkError(f"⚠️ Unable to verify that tag right now: {exc}") from exc
-
         inferred_alias = alias.strip() if isinstance(alias, str) and alias.strip() else None
-        if inferred_alias is None:
+        if skip_remote_lookup:
+            player_payload = None
+        else:
+            try:
+                player_payload = await client.get_player(normalised_tag)
+            except coc.errors.NotFound:
+                raise PlayerLinkError(f"⚠️ I couldn't find a Clash of Clans profile with tag `{normalised_tag}`.")
+            except Exception as exc:  # pylint: disable=broad-except
+                log.exception("Unexpected error while linking player tag", exc_info=exc)
+                raise PlayerLinkError(f"⚠️ Unable to verify that tag right now: {exc}") from exc
+
+        if inferred_alias is None and isinstance(player_payload, dict):
             inferred_alias = player_payload.get("profile", {}).get("name")
         if isinstance(inferred_alias, str):
             inferred_alias = inferred_alias.strip() or None
@@ -1451,7 +1455,7 @@ async def war_nudge(interaction: discord.Interaction, clan_name: str, reason_nam
         return
 
     try:
-        war = await client.get_clan_war_raw(tag)
+        war = await client.get_active_war_raw(tag)
     except coc.errors.PrivateWarLog:
         await send_text_response(
             interaction,
@@ -1470,6 +1474,13 @@ async def war_nudge(interaction: discord.Interaction, clan_name: str, reason_nam
         await send_text_response(
             interaction,
             f"⚠️ Unable to fetch war information: {exc}.",
+            ephemeral=True,
+        )
+        return
+    if war is None:
+        await send_text_response(
+            interaction,
+            "⚠️ No active war found for this clan.",
             ephemeral=True,
         )
         return
@@ -2812,7 +2823,12 @@ WAR_INFO_FIELD_MAP: Dict[str, str] = {
     "war day start time": "War start countdown",
     "war end time": "War end countdown",
     "league group": "League group summary",
+    "clan members in war": "Home clan roster in this war",
     "all members in war": "Clan members participating",
+    "members with unused attacks this war": "Members with attacks remaining this war",
+    "members with no attacks this war": "Members with no attacks used this war",
+    "member stars this war": "Stars earned per member this war",
+    "member attack summaries": "Per-member attack summaries",
 }
 
 
@@ -2896,11 +2912,139 @@ def _format_timestamp_delta(source: datetime, duration_hours: int = 0) -> str:
     return f"{hours}h {minutes}m {seconds}s"
 
 
-def _format_war_value(key: str, value) -> str:
+def _war_attacks_per_member(war_info: Optional[Dict[str, object]] = None) -> int:
+    """Return the attack count each member has for the current war."""
+    raw_value = war_info.get("attacks per member") if isinstance(war_info, dict) else None
+    if isinstance(raw_value, int) and raw_value > 0:
+        return raw_value
+    return 1
+
+
+def _war_member_attack_stats(member: Any, attacks_per_member: int) -> Dict[str, Any]:
+    """Collect the current-war attack usage for a war member."""
+    attacks = list(getattr(member, "attacks", []) or [])
+    used_attacks = len(attacks)
+    remaining_attacks = max(attacks_per_member - used_attacks, 0)
+    total_stars = sum(getattr(attack, "stars", 0) for attack in attacks)
+    return {
+        "attacks": attacks,
+        "used": used_attacks,
+        "remaining": remaining_attacks,
+        "stars": total_stars,
+    }
+
+
+def _format_member_header(member: Any) -> str:
+    """Build a short label for a war member."""
+    position = getattr(member, "map_position", None)
+    name = getattr(member, "name", "Unknown")
+    town_hall = getattr(member, "town_hall", "?")
+    prefix = f"#{position} " if isinstance(position, int) and position > 0 else ""
+    return f"{prefix}{name} (TH{town_hall})"
+
+
+def _format_member_usage_list(
+    members: Iterable[Any],
+    attacks_per_member: int,
+    *,
+    filter_mode: str = "all",
+) -> str:
+    """Render war-member usage lines for the current war."""
+    lines: List[str] = []
+    for member in members:
+        stats = _war_member_attack_stats(member, attacks_per_member)
+        if filter_mode == "unused" and stats["remaining"] <= 0:
+            continue
+        if filter_mode == "no_attacks" and stats["used"] != 0:
+            continue
+        header = _format_member_header(member)
+        lines.append(
+            f"• {header} — used {stats['used']}/{attacks_per_member}, remaining {stats['remaining']}, stars {stats['stars']}"
+        )
+
+    if not lines:
+        if filter_mode == "unused":
+            return "No members have attacks remaining in this war."
+        if filter_mode == "no_attacks":
+            return "Everyone has used at least one attack in this war."
+        return "No members listed."
+    return "\n".join(lines)
+
+
+def _format_member_stars_list(members: Iterable[Any], attacks_per_member: int) -> str:
+    """Render stars earned by each member in the current war."""
+    lines: List[str] = []
+    for member in members:
+        stats = _war_member_attack_stats(member, attacks_per_member)
+        header = _format_member_header(member)
+        lines.append(
+            f"• {header} — {stats['stars']}⭐ from {stats['used']}/{attacks_per_member} attack(s)"
+        )
+    return "\n".join(lines) if lines else "No members listed."
+
+
+def _format_member_attack_summaries(members: Iterable[Any], attacks_per_member: int) -> str:
+    """Render per-member attack summaries for the current war."""
+    lines: List[str] = []
+    for member in members:
+        stats = _war_member_attack_stats(member, attacks_per_member)
+        header = _format_member_header(member)
+        if not stats["attacks"]:
+            lines.append(f"• {header} — no attacks used this war.")
+            continue
+
+        summaries: List[str] = []
+        for attack in stats["attacks"]:
+            defender = getattr(attack, "defender", None)
+            defender_position = getattr(defender, "map_position", "?")
+            defender_name = getattr(defender, "name", "Unknown")
+            stars = getattr(attack, "stars", 0)
+            destruction = getattr(attack, "destruction", 0)
+            summaries.append(
+                f"#{defender_position} {defender_name}: {stars}⭐ {destruction}%"
+            )
+        lines.append(f"• {header} — {'; '.join(summaries)}")
+
+    return "\n".join(lines) if lines else "No attack summaries available."
+
+
+def _format_league_group_summary(value: Any) -> str:
+    """Render the CWL league-group details when available."""
+    if not hasattr(value, "season"):
+        return str(value)
+
+    season = getattr(value, "season", "Unknown")
+    state = getattr(value, "state", "Unknown")
+    rounds = getattr(value, "rounds", []) or []
+    total_rounds = getattr(value, "number_of_rounds", len(rounds))
+    clans = getattr(value, "clans", []) or []
+
+    lines = [
+        f"Season: {season}",
+        f"State: {state}",
+        f"Rounds available: {len(rounds)}/{total_rounds}",
+    ]
+    if clans:
+        participant_names = [
+            f"{getattr(clan, 'name', 'Unknown')} ({getattr(clan, 'tag', 'N/A')})"
+            for clan in clans[:8]
+        ]
+        lines.append(f"Participating clans: {', '.join(participant_names)}")
+        if len(clans) > 8:
+            lines.append(f"… (+{len(clans) - 8} more clans)")
+    return "\n".join(lines)
+
+
+def _format_war_value(key: str, value, war_info: Optional[Dict[str, object]] = None) -> str:
     """Human readable formatter for war information values."""
     log.debug("_format_war_value invoked for key %s", key)
     if value is None:
         return "Not available"
+
+    attacks_per_member = _war_attacks_per_member(war_info)
+
+    if key == "clan members in war" and isinstance(value, Iterable):
+        return _format_member_usage_list(value, attacks_per_member)
 
     if key == "all members in war" and isinstance(value, Iterable):
         members: List[str] = []
@@ -2910,6 +3054,18 @@ def _format_war_value(key: str, value) -> str:
             stars = getattr(member, "star_count", 0)
             members.append(f"{name} (TH{th}) ⭐ {stars}")
         return "\n".join(members) if members else "No members listed."
+
+    if key == "members with unused attacks this war" and isinstance(value, Iterable):
+        return _format_member_usage_list(value, attacks_per_member, filter_mode="unused")
+
+    if key == "members with no attacks this war" and isinstance(value, Iterable):
+        return _format_member_usage_list(value, attacks_per_member, filter_mode="no_attacks")
+
+    if key == "member stars this war" and isinstance(value, Iterable):
+        return _format_member_stars_list(value, attacks_per_member)
+
+    if key == "member attack summaries" and isinstance(value, Iterable):
+        return _format_member_attack_summaries(value, attacks_per_member)
 
     if key == "all attacks done this war" and isinstance(value, Iterable):
         try:
@@ -2944,8 +3100,8 @@ def _format_war_value(key: str, value) -> str:
             f"| Destruction: {getattr(value, 'destruction', 'N/A')}%"
         )
 
-    if key == "league group" and hasattr(value, "season"):
-        return f"Season {value.season} • State: {value.state}"
+    if key == "league group":
+        return _format_league_group_summary(value)
 
     if isinstance(value, bool):
         return "Yes" if value else "No"
@@ -2977,7 +3133,7 @@ def _build_war_output(clan_name: str, selections: List[str], war_info: Dict[str,
 
     for key in selections:
         label = WAR_INFO_FIELD_MAP.get(key, key.title())
-        value = _format_war_value(key, war_info.get(key))
+        value = _format_war_value(key, war_info.get(key), war_info)
         lines.append(f"**{label}:**\n{value}")
     return "\n\n".join(lines)
 
@@ -3620,7 +3776,7 @@ def _collect_war_alerts(
 
 async def _fetch_war_overview(clan_name: str, tag: str) -> Tuple[str, str]:
     try:
-        war = await client.get_clan_war_raw(tag)
+        war = await client.get_active_war_raw(tag)
     except coc.errors.PrivateWarLog:
         return (
             "War Overview",
@@ -3635,6 +3791,11 @@ async def _fetch_war_overview(clan_name: str, tag: str) -> Tuple[str, str]:
         return (
             "War Overview",
             f"⚠️ Unable to fetch war data: {exc}",
+        )
+    if war is None:
+        return (
+            "War Overview",
+            "ℹ️ This clan is not currently in a war.",
         )
 
     state_value = war.state.value if hasattr(war.state, "value") else war.state
@@ -4417,7 +4578,7 @@ async def war_alert_loop() -> None:
                     continue
 
             try:
-                war = await client.get_clan_war_raw(tag)
+                war = await client.get_active_war_raw(tag)
             except coc.errors.NotFound:
                 _clear_war_alert_state_for_clan(guild.id, clan_name)
                 continue  # Skip clans without accessible war data
@@ -4425,6 +4586,9 @@ async def war_alert_loop() -> None:
                 continue  # Skip clans without accessible war data
             except Exception:
                 continue  # Fail-safe for unexpected library errors
+            if war is None:
+                _clear_war_alert_state_for_clan(guild.id, clan_name)
+                continue
 
             _prune_war_alert_state_for_clan(guild.id, clan_name, getattr(war, "war_tag", None) or tag)
             for alert in _collect_war_alerts(guild, clan_name, tag, war, alert_role, now):
@@ -4575,6 +4739,16 @@ async def clan_war_info_menu(interaction: discord.Interaction, clan_name: str):
     await interaction.response.defer(ephemeral=True, thinking=True)
     try:
         war_info = await client.get_clan_war_info(clan_name, interaction.guild.id)
+    except notinWar as exc:
+        await send_text_response(interaction, f"ℹ️ {exc}", ephemeral=True)
+        return
+    except coc.errors.PrivateWarLog:
+        await send_text_response(
+            interaction,
+            "⚠️ This clan's war log is private; current war details are unavailable.",
+            ephemeral=True,
+        )
+        return
     except GuildNotConfiguredError:
         await send_text_response(
             interaction,
@@ -9654,50 +9828,17 @@ class LinkPlayerModal(discord.ui.Modal):
             await interaction.response.send_message(exc.message, ephemeral=True)
             return
 
-        self.parent_view.refresh_components()
-        updated_intro = self.parent_view.build_intro_message()
-        parent_message = getattr(self.parent_view, "message", None)
-        if parent_message is not None:
-            try:
-                await parent_message.edit(content=updated_intro, view=self.parent_view)
-            except discord.HTTPException as exc:
-                log.warning("Failed to refresh register_me message after linking: %s", exc)
-        else:
-            log.debug("RegisterMeView message handle missing; skipping intro refresh")
+        await self.parent_view.refresh_view_message(source_message=interaction.message)
 
         await interaction.response.send_message(message, ephemeral=True)
 
-class LinkPlayerSelect(discord.ui.Select):
-    """Select menu that manages link/unlink actions for Clash accounts."""
+class RegisterMeManualLinkButton(discord.ui.Button):
+    """Button that opens the manual account-linking modal."""
 
-    def __init__(self, parent_view: "RegisterMeView", existing_accounts: List[Dict[str, Optional[str]]]):
-        options: List[discord.SelectOption] = [
-            discord.SelectOption(
-                label="Link new Clash account",
-                description="Add a new player tag",
-                value="link-new",
-                emoji="➕",
-            )
-        ]
-        for record in existing_accounts:
-            tag = record.get("tag")
-            if not isinstance(tag, str) or not tag.strip():
-                continue
-            alias = record.get("alias")
-            display = f"{alias} ({tag})" if isinstance(alias, str) and alias else tag
-            options.append(
-                discord.SelectOption(
-                    label=f"Remove {display}",
-                    description="Unlink this account",
-                    value=f"unlink|{tag}",
-                    emoji="🗑️",
-                )
-            )
+    def __init__(self, parent_view: "RegisterMeView"):
         super().__init__(
-            placeholder="Manage linked Clash accounts",
-            min_values=1,
-            max_values=1,
-            options=options[:25],
+            label="Link account manually",
+            style=discord.ButtonStyle.primary,
             row=0,
         )
         self.parent_view = parent_view
@@ -9719,21 +9860,56 @@ class LinkPlayerSelect(discord.ui.Select):
             )
             return
 
-        selection = self.values[0]
-        if selection == "link-new":
-            if interaction.message is not None:
-                self.parent_view.message = interaction.message
-            await interaction.response.send_modal(LinkPlayerModal(self.parent_view, action="link"))
-            return
+        if interaction.message is not None:
+            self.parent_view.message = interaction.message
+        await interaction.response.send_modal(LinkPlayerModal(self.parent_view, action="link"))
 
-        if not selection.startswith("unlink|"):
+class RegisterMeUnlinkSelect(discord.ui.Select):
+    """Select menu that unlinks one of the member's currently linked accounts."""
+
+    def __init__(self, parent_view: "RegisterMeView", existing_accounts: List[Dict[str, Optional[str]]]):
+        options: List[discord.SelectOption] = []
+        for record in existing_accounts:
+            tag = record.get("tag")
+            if not isinstance(tag, str) or not tag.strip():
+                continue
+            alias = record.get("alias")
+            display = f"{alias} ({tag})" if isinstance(alias, str) and alias else tag
+            options.append(
+                discord.SelectOption(
+                    label=f"Unlink {display}"[:100],
+                    description="Remove this linked account",
+                    value=tag,
+                    emoji="🗑️",
+                )
+            )
+        super().__init__(
+            placeholder="Unlink a linked Clash account",
+            min_values=1,
+            max_values=1,
+            options=options[:25],
+            row=1,
+        )
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        if not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message(
-                "⚠️ Unknown selection received. Please try again.",
+                "⚠️ I couldn't resolve your guild membership. Please try again.",
                 ephemeral=True,
             )
             return
 
-        tag = selection.split("|", 1)[1]
+        member = self.parent_view.member
+        actor = interaction.user
+        if actor.id != member.id and not user_has_admin_access(actor):
+            await interaction.response.send_message(
+                "⚠️ Only the member themselves or an administrator can manage linked tags from this view.",
+                ephemeral=True,
+            )
+            return
+
+        tag = self.values[0]
         try:
             message = await _link_player_account(
                 guild=self.parent_view.guild,
@@ -9747,24 +9923,181 @@ class LinkPlayerSelect(discord.ui.Select):
             await interaction.response.send_message(exc.message, ephemeral=True)
             return
 
-        self.parent_view.refresh_components()
-        updated_intro = self.parent_view.build_intro_message()
-        parent_message = getattr(self.parent_view, "message", None)
-        if interaction.message is not None:
-            self.parent_view.message = interaction.message
-            parent_message = interaction.message
-        if parent_message is not None:
-            try:
-                await parent_message.edit(content=updated_intro, view=self.parent_view)
-            except discord.HTTPException as exc:
-                log.warning("Failed to refresh register_me message after unlinking: %s", exc)
-        else:
-            log.debug("RegisterMeView message handle missing; skipping intro refresh")
+        await self.parent_view.refresh_view_message(source_message=interaction.message)
 
         await interaction.response.send_message(
             message + " You can relink it anytime with `/link_player action:link`.",
             ephemeral=True,
         )
+
+
+class RegisterMeRosterSearchButton(discord.ui.Button):
+    """Button that starts cached clan-roster searching for account linking."""
+
+    def __init__(self, parent_view: "RegisterMeView"):
+        super().__init__(
+            label="Link account from clan roster",
+            style=discord.ButtonStyle.secondary,
+            row=0,
+        )
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message(
+                "⚠️ I couldn't resolve your guild membership. Please try again.",
+                ephemeral=True,
+            )
+            return
+
+        member = self.parent_view.member
+        actor = interaction.user
+        if actor.id != member.id and not user_has_admin_access(actor):
+            await interaction.response.send_message(
+                "⚠️ Only the member themselves or an administrator can manage linked tags from this view.",
+                ephemeral=True,
+            )
+            return
+
+        if interaction.message is not None:
+            self.parent_view.message = interaction.message
+        await interaction.response.send_modal(RegisterMeRosterSearchModal(self.parent_view))
+
+
+class RegisterMeRosterSearchModal(discord.ui.Modal):
+    """Modal that collects a clan-roster search query."""
+
+    def __init__(self, parent_view: "RegisterMeView"):
+        super().__init__(title="Search Clan Roster", timeout=None)
+        self.parent_view = parent_view
+        self.query = discord.ui.TextInput(
+            label="Account name or player tag",
+            placeholder="Examples: runner, #ABC123, ABC123",
+            max_length=50,
+        )
+        self.add_item(self.query)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        query = self.query.value.strip()
+        if not query:
+            await interaction.response.send_message(
+                "⚠️ Enter part of an account name or player tag to search the roster.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            matches = await self.parent_view.find_roster_matches(query, limit=5)
+        except PlayerLinkError as exc:
+            await interaction.followup.send(exc.message, ephemeral=True)
+            return
+
+        if not matches:
+            await interaction.followup.send(
+                "⚠️ No clan-roster matches found for that search. Try a shorter name fragment or part of the tag.",
+                ephemeral=True,
+            )
+            return
+
+        result_view = RegisterMeRosterMatchView(self.parent_view, matches)
+        await interaction.followup.send(
+            f"Top {len(matches)} roster match(es) for `{query}`:",
+            ephemeral=True,
+            view=result_view,
+        )
+
+
+class RegisterMeRosterMatchSelect(discord.ui.Select):
+    """Select menu that links one of the roster search matches."""
+
+    def __init__(self, parent_view: "RegisterMeView", matches: List[Dict[str, str]]):
+        options: List[discord.SelectOption] = []
+        for entry in matches:
+            name = entry.get("name", "Unknown player")
+            tag = entry.get("tag", "")
+            clan_name = entry.get("clan_name", "")
+            description = tag if not clan_name else f"{tag} · {clan_name}"
+            options.append(
+                discord.SelectOption(
+                    label=name[:100],
+                    description=description[:100],
+                    value=tag,
+                    emoji="🏰",
+                )
+            )
+        super().__init__(
+            placeholder="Choose an account to link",
+            min_values=1,
+            max_values=1,
+            options=options[:25],
+            row=0,
+        )
+        self.parent_view = parent_view
+        self.match_lookup = {
+            entry.get("tag", ""): entry
+            for entry in matches
+            if isinstance(entry.get("tag"), str) and entry.get("tag")
+        }
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message(
+                "⚠️ I couldn't resolve your guild membership. Please try again.",
+                ephemeral=True,
+            )
+            return
+
+        member = self.parent_view.member
+        actor = interaction.user
+        if actor.id != member.id and not user_has_admin_access(actor):
+            await interaction.response.send_message(
+                "⚠️ Only the member themselves or an administrator can manage linked tags from this view.",
+                ephemeral=True,
+            )
+            return
+
+        selected_tag = self.values[0]
+        selected_entry = self.match_lookup.get(selected_tag)
+        alias = selected_entry.get("name") if isinstance(selected_entry, dict) else None
+        try:
+            message = await _link_player_account(
+                guild=self.parent_view.guild,
+                actor=actor,
+                target=member,
+                action="link",
+                player_tag=selected_tag,
+                alias=alias,
+                skip_remote_lookup=True,
+            )
+        except PlayerLinkError as exc:
+            await interaction.response.send_message(exc.message, ephemeral=True)
+            return
+
+        await self.parent_view.refresh_view_message(source_message=self.parent_view.message)
+
+        parent = self.view
+        if isinstance(parent, discord.ui.View):
+            for child in parent.children:
+                child.disabled = True
+
+        await interaction.response.edit_message(
+            content=message,
+            view=parent,
+        )
+
+
+class RegisterMeRosterMatchView(discord.ui.View):
+    """Ephemeral view that shows the best clan-roster matches for linking."""
+
+    def __init__(self, parent_view: "RegisterMeView", matches: List[Dict[str, str]], timeout: float = 180):
+        super().__init__(timeout=timeout)
+        self.parent_view = parent_view
+        self.add_item(RegisterMeRosterMatchSelect(parent_view, matches))
+
+    async def on_timeout(self) -> None:
+        for child in self.children:
+            child.disabled = True
 
 class WarNudgeReasonModal(discord.ui.Modal):
     """Modal used to capture reason metadata when saving."""
@@ -9975,7 +10308,7 @@ class WarNudgeRoleSelect(discord.ui.RoleSelect):
             min_values=0,
             max_values=1,
             default_values=default_values,
-            row=3,
+            row=4,
         )
 
     async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
@@ -10002,7 +10335,7 @@ class WarNudgeMemberSelect(discord.ui.UserSelect):
             min_values=0,
             max_values=1,
             default_values=default_values,
-            row=3,
+            row=4,
         )
 
     async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
@@ -10015,11 +10348,36 @@ class WarNudgeMemberSelect(discord.ui.UserSelect):
         )
 
 
+class WarNudgeTargetModeButton(discord.ui.Button):
+    """Button for switching between role and member target editors."""
+
+    def __init__(self, parent_view: "WarNudgeConfigView", target_mode: str):
+        label = "Role Target" if target_mode == "role" else "Member Target"
+        style = (
+            discord.ButtonStyle.primary
+            if parent_view.target_mode == target_mode
+            else discord.ButtonStyle.secondary
+        )
+        super().__init__(label=label, style=style, row=3)
+        self.parent_view = parent_view
+        self.target_mode = target_mode
+        self.disabled = parent_view.target_mode == target_mode
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        self.parent_view.target_mode = self.target_mode
+        self.parent_view.refresh_components()
+        self.parent_view.message = interaction.message
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
+
+
 class SaveWarNudgeButton(discord.ui.Button):
     """Button that triggers saving (adding/updating) a reason."""
 
     def __init__(self, parent_view: "WarNudgeConfigView"):
-        super().__init__(label="Save Reason", style=discord.ButtonStyle.success, row=4)
+        super().__init__(label="Save Reason", style=discord.ButtonStyle.success, row=3)
         self.parent_view = parent_view
 
     async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
@@ -10047,7 +10405,7 @@ class RemoveWarNudgeButton(discord.ui.Button):
     """Button for removing the currently selected reason."""
 
     def __init__(self, parent_view: "WarNudgeConfigView"):
-        super().__init__(label="Remove Reason", style=discord.ButtonStyle.danger, row=4)
+        super().__init__(label="Remove Reason", style=discord.ButtonStyle.danger, row=3)
         self.parent_view = parent_view
 
     async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
@@ -10065,7 +10423,7 @@ class ListWarNudgeButton(discord.ui.Button):
     """Button that displays all configured reasons for the current clan."""
 
     def __init__(self, parent_view: "WarNudgeConfigView"):
-        super().__init__(label="List Reasons", style=discord.ButtonStyle.primary, row=4)
+        super().__init__(label="List Reasons", style=discord.ButtonStyle.primary, row=3)
         self.parent_view = parent_view
 
     async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
@@ -10086,6 +10444,7 @@ class WarNudgeConfigView(discord.ui.View):
         self.selected_role_id: Optional[int] = None
         self.selected_user_id: Optional[int] = None
         self.selected_description: str = ""
+        self.target_mode = "role"
         self.pending_reason_name: Optional[str] = None
         self.pending_reason_description: Optional[str] = None
         self.refresh_state()
@@ -10107,11 +10466,16 @@ class WarNudgeConfigView(discord.ui.View):
                 self.selected_role_id = None
                 self.selected_user_id = None
                 self.selected_description = ""
+                self.target_mode = "role"
             else:
                 self.selected_reason_type = matched.get("type", WAR_NUDGE_REASONS[0])
                 self.selected_role_id = matched.get("mention_role_id")
                 self.selected_user_id = matched.get("mention_user_id")
                 self.selected_description = matched.get("description", "")
+                if self.selected_user_id and not self.selected_role_id:
+                    self.target_mode = "member"
+                else:
+                    self.target_mode = "role"
 
     def refresh_components(self) -> None:
         self.clear_items()
@@ -10127,11 +10491,15 @@ class WarNudgeConfigView(discord.ui.View):
         self.add_item(WarNudgeClanSelect(self, clan_map))
         self.add_item(WarNudgeReasonSelect(self, reasons))
         self.add_item(WarNudgeTypeSelect(self))
-        self.add_item(WarNudgeRoleSelect(self))
-        self.add_item(WarNudgeMemberSelect(self))
+        self.add_item(WarNudgeTargetModeButton(self, "role"))
+        self.add_item(WarNudgeTargetModeButton(self, "member"))
         self.add_item(SaveWarNudgeButton(self))
         self.add_item(RemoveWarNudgeButton(self))
         self.add_item(ListWarNudgeButton(self))
+        if self.target_mode == "member":
+            self.add_item(WarNudgeMemberSelect(self))
+        else:
+            self.add_item(WarNudgeRoleSelect(self))
 
     def set_clan(self, clan_name: str) -> None:
         self.clan_name = clan_name
@@ -10140,6 +10508,7 @@ class WarNudgeConfigView(discord.ui.View):
         self.selected_role_id = None
         self.selected_user_id = None
         self.selected_description = ""
+        self.target_mode = "role"
         self.refresh_state()
 
     def set_reason(self, value: str) -> None:
@@ -10149,6 +10518,7 @@ class WarNudgeConfigView(discord.ui.View):
             self.selected_role_id = None
             self.selected_user_id = None
             self.selected_description = ""
+            self.target_mode = "role"
         self.refresh_state()
 
     def render_message(self) -> str:
@@ -10350,6 +10720,7 @@ class RegisterMeView(discord.ui.View):
         ]
         self.event_roles: List[Dict[str, Any]] = []
         self.linked_account_records: List[Dict[str, Optional[str]]] = []
+        self.roster_cache: Optional[List[Dict[str, str]]] = None
         self.refresh_components()
 
     def refresh_components(self) -> None:
@@ -10377,9 +10748,13 @@ class RegisterMeView(discord.ui.View):
             role = _get_event_role(self.guild, key)
             self.event_roles.append({"key": key, "label": label, "role": role})
 
-        self.add_item(LinkPlayerSelect(self, self.linked_account_records))
+        self.add_item(RegisterMeManualLinkButton(self))
+        self.add_item(RegisterMeRosterSearchButton(self))
+        if self.linked_account_records:
+            self.add_item(RegisterMeUnlinkSelect(self, self.linked_account_records))
 
-        button_row = 1
+        role_rows = (2, 3, 4)
+        row_index = 0
         if self.war_alert_role is not None:
             self.add_item(
                 ToggleRoleButton(
@@ -10388,10 +10763,10 @@ class RegisterMeView(discord.ui.View):
                     role_name=self.war_alert_role.name,
                     parent_view=self,
                     style=discord.ButtonStyle.green,
-                    row=button_row,
+                    row=role_rows[row_index % len(role_rows)],
                 )
             )
-            button_row = 2 if button_row < 4 else 1
+            row_index += 1
         for entry in self.event_roles:
             role = entry.get("role")
             label = entry.get("label")
@@ -10404,17 +10779,17 @@ class RegisterMeView(discord.ui.View):
                     role_id=role.id,
                     role_name=role.name,
                     parent_view=self,
-                    row=button_row,
+                    row=role_rows[row_index % len(role_rows)],
                 )
             )
-            button_row = button_row + 1 if button_row < 4 else 1
+            row_index += 1
 
         self.add_item(
             discord.ui.Button(
                 label="For further help click here",
                 style=discord.ButtonStyle.link,
                 url=README_URL,
-                row=2,
+                row=1,
             )
         )
 
@@ -10433,11 +10808,129 @@ class RegisterMeView(discord.ui.View):
             [
                 "Welcome! Here's how to get set up:",
                 "1️⃣ Use the controls below to opt into the alert roles you want.",
-                f"2️⃣ Link your Clash accounts right here (current links: {linked_accounts}).",
+                f"2️⃣ Link one or more Clash accounts right here (current links: {linked_accounts}).",
                 f"3️⃣ {events_line}",
                 "4️⃣ Explore `/plan_upgrade` and the other slash commands to stay organised.",
             ]
         )
+
+    def clear_transient_state(self) -> None:
+        """Release per-session cached data once the onboarding view is done."""
+        self.roster_cache = None
+
+    async def refresh_view_message(self, source_message: Optional[discord.Message] = None) -> None:
+        """Refresh the onboarding message so account changes are visible immediately."""
+        self.refresh_components()
+        if source_message is not None:
+            self.message = source_message
+        if self.message is None:
+            log.debug("RegisterMeView message handle missing; skipping intro refresh")
+            return
+        try:
+            await self.message.edit(content=self.build_intro_message(), view=self)
+        except discord.HTTPException as exc:
+            log.warning("Failed to refresh register_me message after account update: %s", exc)
+
+    async def ensure_roster_cache(self) -> List[Dict[str, str]]:
+        """Fetch configured clan rosters once, then reuse them for local search."""
+        if self.roster_cache is not None:
+            return self.roster_cache
+
+        clan_map = _clan_names_for_guild(self.guild.id)
+        if not clan_map:
+            raise PlayerLinkError("⚠️ No clans are configured for this server yet, so there is no roster to search.")
+
+        roster: List[Dict[str, str]] = []
+        seen_tags: Set[str] = set()
+        failures: List[str] = []
+        for clan_name, clan_tag in clan_map.items():
+            try:
+                clan = await client.get_clan(clan_tag)
+            except Exception as exc:  # pylint: disable=broad-except
+                log.warning(
+                    "Failed to fetch roster for register_me search: guild=%s clan=%s tag=%s error=%s",
+                    self.guild.id,
+                    clan_name,
+                    clan_tag,
+                    exc,
+                )
+                failures.append(clan_name)
+                continue
+
+            for clan_member in getattr(clan, "members", []):
+                raw_tag = getattr(clan_member, "tag", None)
+                raw_name = getattr(clan_member, "name", None)
+                normalised_tag = _normalise_player_tag(raw_tag) if isinstance(raw_tag, str) else None
+                if normalised_tag is None or normalised_tag in seen_tags:
+                    continue
+                member_name = raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else normalised_tag
+                roster.append(
+                    {
+                        "name": member_name,
+                        "tag": normalised_tag,
+                        "clan_name": clan_name,
+                    }
+                )
+                seen_tags.add(normalised_tag)
+
+        if not roster:
+            if failures:
+                raise PlayerLinkError(
+                    "⚠️ I couldn't load the configured clan roster(s) right now. Try again in a moment."
+                )
+            raise PlayerLinkError("⚠️ The configured clan roster is empty right now.")
+
+        self.roster_cache = roster
+        return roster
+
+    async def find_roster_matches(self, query: str, *, limit: int = 5) -> List[Dict[str, str]]:
+        """Return the strongest local clan-roster matches for a search query."""
+        roster = await self.ensure_roster_cache()
+        query_text = query.strip().casefold()
+        compact_query = query_text.replace(" ", "").lstrip("#")
+        if not compact_query:
+            return []
+
+        ranked: List[Tuple[Tuple[int, int, str, str], Dict[str, str]]] = []
+        for entry in roster:
+            name = entry.get("name", "")
+            tag = entry.get("tag", "")
+            name_text = name.casefold()
+            compact_name = name_text.replace(" ", "")
+            tag_text = tag.casefold()
+            tag_no_hash = tag_text.lstrip("#")
+
+            score = None
+            position = 999
+            if compact_query == tag_no_hash:
+                score = 0
+            elif query_text == name_text or compact_query == compact_name:
+                score = 1
+            elif tag_no_hash.startswith(compact_query):
+                score = 2
+                position = tag_no_hash.find(compact_query)
+            elif compact_name.startswith(compact_query):
+                score = 3
+                position = compact_name.find(compact_query)
+            elif compact_query in tag_no_hash:
+                score = 4
+                position = tag_no_hash.find(compact_query)
+            elif compact_query in compact_name:
+                score = 5
+                position = compact_name.find(compact_query)
+
+            if score is None:
+                continue
+
+            ranked.append(
+                (
+                    (score, position, name.casefold(), tag.casefold()),
+                    entry,
+                )
+            )
+
+        ranked.sort(key=lambda item: item[0])
+        return [entry for _, entry in ranked[:limit]]
 
     async def toggle_role(
         self,
@@ -10505,6 +10998,19 @@ class RegisterMeView(discord.ui.View):
             return
 
         await interaction.response.send_message(message, ephemeral=True)
+
+    async def on_timeout(self) -> None:
+        self.clear_transient_state()
+        for child in self.children:
+            child.disabled = True  # type: ignore[attr-defined]
+        if self.message is not None:
+            try:
+                await self.message.edit(
+                    content="Register session timed out. Run `/register_me` again to continue.",
+                    view=self,
+                )
+            except discord.HTTPException:
+                pass
 
 
 class DonationClanSelect(discord.ui.Select):
