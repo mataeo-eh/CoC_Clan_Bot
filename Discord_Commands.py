@@ -2829,6 +2829,7 @@ WAR_INFO_FIELD_MAP: Dict[str, str] = {
     "members with no attacks this war": "Members with no attacks used this war",
     "member stars this war": "Stars earned per member this war",
     "member attack summaries": "Per-member attack summaries",
+    "member stars this cwl": "Season CWL stars per member",
 }
 
 
@@ -3008,6 +3009,32 @@ def _format_member_attack_summaries(members: Iterable[Any], attacks_per_member: 
     return "\n".join(lines) if lines else "No attack summaries available."
 
 
+def _format_cwl_member_totals(entries: Iterable[Any]) -> str:
+    """Render season-wide CWL totals for each player rostered in played rounds."""
+    lines: List[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name", "Unknown")
+        town_hall = entry.get("town_hall", "?")
+        attacks_used = entry.get("attacks_used", 0)
+        attacks_available = entry.get("attacks_available", 0)
+        stars_earned = entry.get("stars_earned", 0)
+        max_stars = entry.get("max_stars", 0)
+        rounds_rostered = entry.get("rounds_rostered", 0)
+        lines.append(
+            f"• {name} (TH{town_hall}) — {attacks_used}/{attacks_available} attacks used, "
+            f"{stars_earned}/{max_stars} stars"
+            + (
+                f" across {rounds_rostered} round(s)"
+                if isinstance(rounds_rostered, int) and rounds_rostered > 0
+                else ""
+            )
+        )
+
+    return "\n".join(lines) if lines else "No CWL round totals are available yet."
+
+
 def _format_league_group_summary(value: Any) -> str:
     """Render the CWL league-group details when available."""
     if not hasattr(value, "season"):
@@ -3066,6 +3093,9 @@ def _format_war_value(key: str, value, war_info: Optional[Dict[str, object]] = N
 
     if key == "member attack summaries" and isinstance(value, Iterable):
         return _format_member_attack_summaries(value, attacks_per_member)
+
+    if key == "member stars this cwl" and isinstance(value, Iterable):
+        return _format_cwl_member_totals(value)
 
     if key == "all attacks done this war" and isinstance(value, Iterable):
         try:
@@ -10789,7 +10819,8 @@ class RegisterMeView(discord.ui.View):
                 label="For further help click here",
                 style=discord.ButtonStyle.link,
                 url=README_URL,
-                row=1,
+                # Keep row 1 available for the full-width unlink select when present.
+                row=0,
             )
         )
 

@@ -1,5 +1,5 @@
 import asyncio
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 import coc
 from coc.enums import WarRound
@@ -169,6 +169,64 @@ class CoCAPI:
         )
         return war
 
+    async def _build_cwl_member_totals(self, war) -> List[Dict[str, Any]]:
+        """Aggregate attacks and stars for each member across CWL rounds played so far."""
+        if not getattr(war, "is_cwl", False):
+            return []
+
+        league_group = getattr(war, "league_group", None)
+        clan_tag = getattr(war, "clan_tag", None)
+        if league_group is None or not clan_tag:
+            return []
+
+        totals: Dict[str, Dict[str, Any]] = {}
+        async for league_war in league_group.get_wars_for_clan(clan_tag):
+            state_value = getattr(getattr(league_war, "state", None), "value", getattr(league_war, "state", None))
+            if state_value == "preparation":
+                continue
+
+            attacks_per_member = getattr(league_war, "attacks_per_member", 1) or 1
+            for member in getattr(getattr(league_war, "clan", None), "members", []):
+                member_tag = getattr(member, "tag", None)
+                if not member_tag:
+                    continue
+
+                attacks = list(getattr(member, "attacks", []) or [])
+                stars_earned = sum(getattr(attack, "stars", 0) for attack in attacks)
+                entry = totals.setdefault(
+                    member_tag,
+                    {
+                        "tag": member_tag,
+                        "name": getattr(member, "name", "Unknown"),
+                        "town_hall": getattr(member, "town_hall", "?"),
+                        "rounds_rostered": 0,
+                        "attacks_used": 0,
+                        "attacks_available": 0,
+                        "stars_earned": 0,
+                        "max_stars": 0,
+                    },
+                )
+                entry["name"] = getattr(member, "name", entry["name"])
+                entry["town_hall"] = getattr(member, "town_hall", entry["town_hall"])
+                entry["rounds_rostered"] += 1
+                entry["attacks_used"] += len(attacks)
+                entry["attacks_available"] += attacks_per_member
+                entry["stars_earned"] += stars_earned
+                entry["max_stars"] += attacks_per_member * 3
+
+        ordered = sorted(
+            totals.values(),
+            key=lambda item: (
+                -item["attacks_available"],
+                -item["attacks_used"],
+                -item["stars_earned"],
+                str(item["name"]).casefold(),
+                str(item["tag"]).casefold(),
+            ),
+        )
+        log.debug("CoCAPI._build_cwl_member_totals aggregated %d members", len(ordered))
+        return ordered
+
     async def get_clan_war_info(self, clan_name, guild_id):
         log.debug("CoCAPI.get_clan_war_info invoked")
         if guild_id not in server_config:
@@ -189,6 +247,7 @@ class CoCAPI:
         clan = await self.get_active_war_raw(tag)
         if clan is None:
             raise notinWar(f"Clan '{clan_name}' is not currently in an active war.")
+        cwl_member_totals = await self._build_cwl_member_totals(clan)
         log.debug("CoCAPI.get_clan_war_info fetched war data")
         data = {
             "home clan": clan.clan,
@@ -213,6 +272,7 @@ class CoCAPI:
             "members with no attacks this war": clan.clan.members,
             "member stars this war": clan.clan.members,
             "member attack summaries": clan.clan.members,
+            "member stars this cwl": cwl_member_totals,
         }
         log.debug("CoCAPI.get_clan_war_info returning payload")
         return data
