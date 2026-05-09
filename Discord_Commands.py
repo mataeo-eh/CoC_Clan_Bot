@@ -8639,7 +8639,7 @@ class SetClanTagModal(discord.ui.Modal):
             )
             return
 
-        self.parent_view.set_tag(normalized, api_name=clan_payload.get("name"))
+        self.parent_view.set_tag(normalized, api_name=getattr(clan_payload, "name", None))
         await interaction.response.send_message(
             f"Clan tag set to `{normalized}`.",
             ephemeral=True,
