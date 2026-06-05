@@ -11633,11 +11633,13 @@ async def assign_clan_role(interaction: discord.Interaction):
 @choose_war_alert_channel.autocomplete("clan_name")
 @configure_dashboard.autocomplete("clan_name")
 @configure_donation_metrics.autocomplete("clan_name")
+@configure_war_nudge.autocomplete("clan_name")
 @dashboard.autocomplete("clan_name")
 @donation_summary.autocomplete("clan_name")
 @save_war_plan.autocomplete("clan_name")
 @set_clan.autocomplete("clan_name")
 @war_plan.autocomplete("clan_name")
+@war_nudge.autocomplete("clan_name")
 async def clan_name_autocomplete(interaction: discord.Interaction, current: str):
     """Provide clan name suggestions from the server configuration."""
     if interaction.guild is None:
@@ -11650,6 +11652,61 @@ async def clan_name_autocomplete(interaction: discord.Interaction, current: str)
         if current_lower in name.lower()
     ]
     return suggestions[:25]
+
+
+@war_nudge.autocomplete("reason_name")
+async def war_nudge_reason_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> List[app_commands.Choice[str]]:
+    """Suggest configured war nudge reasons for the selected clan."""
+    if interaction.guild is None:
+        return []
+
+    # Autocomplete interactions must return quickly. The command itself still
+    # validates whether the selected clan has an active classic/CWL war before
+    # sending nudges; suggestions are based only on local configured reasons.
+    namespace = getattr(interaction, "namespace", None)
+    selected_clan = getattr(namespace, "clan_name", None) if namespace else None
+    current_lower = current.casefold()
+    clan_map = _clan_names_for_guild(interaction.guild.id)
+    clan_names = (
+        [selected_clan]
+        if isinstance(selected_clan, str) and selected_clan in clan_map
+        else list(clan_map.keys())
+    )
+
+    suggestions: List[app_commands.Choice[str]] = []
+    seen_values: Set[str] = set()
+    for clan_name in clan_names:
+        clan_entry = _get_clan_entry(interaction.guild.id, clan_name)
+        war_nudge = clan_entry.get("war_nudge", {}) if isinstance(clan_entry, dict) else {}
+        reasons = war_nudge.get("reasons", []) if isinstance(war_nudge, dict) else []
+        for reason in reasons:
+            if not isinstance(reason, dict):
+                continue
+            reason_name = reason.get("name")
+            if not isinstance(reason_name, str) or not reason_name.strip():
+                continue
+            reason_name = reason_name.strip()
+            description = reason.get("description")
+            searchable_text = " ".join(
+                value
+                for value in [clan_name, reason_name, description if isinstance(description, str) else ""]
+                if value
+            ).casefold()
+            if current_lower and current_lower not in searchable_text:
+                continue
+            value_key = reason_name.casefold()
+            if value_key in seen_values:
+                continue
+            label = reason_name if len(clan_names) == 1 else f"{clan_name}: {reason_name}"
+            suggestions.append(app_commands.Choice(name=label[:100], value=reason_name[:100]))
+            seen_values.add(value_key)
+            if len(suggestions) >= 25:
+                return suggestions
+
+    return suggestions
 
 
 @player_info.autocomplete("player_reference")
