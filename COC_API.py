@@ -8,6 +8,15 @@ from logger import get_logger
 
 log = get_logger()
 
+# coc.py's Client.get_current_war() returns a ClanWar object for the classic
+# endpoint even when the API state is "notInWar" or "inMatchmaking". Those
+# objects are useful as raw API data, but this application treats
+# get_active_war_raw() as the shared "usable war" search for alerts, nudges,
+# dashboards, and assignments. Normalising those inactive classic states here
+# keeps every caller handling classic wars and CWL wars through the same
+# contract: return a populated war object, or None when there is no usable war.
+INACTIVE_WAR_STATES = {"notInWar", "inMatchmaking"}
+
 
 class GuildNotConfiguredError(Exception):
     """Raised when a Discord guild has no stored configuration."""
@@ -18,6 +27,20 @@ class ClanNotConfiguredError(Exception):
 
 class notinWar(Exception):
     "Raised when war.state is notinWar/warEnded"
+
+
+def _war_state_value(war: Optional[coc.wars.ClanWar]) -> Optional[str]:
+    """Return the coc.py war state as a plain string for deterministic checks."""
+    if war is None:
+        return None
+    state = getattr(war, "state", None)
+    return getattr(state, "value", state)
+
+
+def _is_inactive_war(war: Optional[coc.wars.ClanWar]) -> bool:
+    """Identify coc.py war placeholders that do not contain an active roster."""
+    return _war_state_value(war) in INACTIVE_WAR_STATES
+
 
 class CoCAPI:
     def __init__(self, token):
@@ -146,26 +169,35 @@ class CoCAPI:
         return result
 
     async def get_active_war_raw(self, tag: str):
-        """Fetch the current war context for a clan tag, including CWL rounds."""
+        """Fetch the current usable war context for a clan tag, including CWL rounds."""
         log.debug("CoCAPI.get_active_war_raw invoked")
         client = self._require_client()
-        war = await client.get_current_war(tag)
+
+        async def fetch_war(cwl_round: Optional[WarRound] = None):
+            """Call coc.py and convert inactive classic placeholders to None."""
+            if cwl_round is None:
+                candidate = await client.get_current_war(tag)
+            else:
+                candidate = await client.get_current_war(tag, cwl_round=cwl_round)
+            if _is_inactive_war(candidate):
+                log.debug(
+                    "CoCAPI.get_active_war_raw ignored inactive war state=%s",
+                    _war_state_value(candidate),
+                )
+                return None
+            return candidate
+
+        war = await fetch_war()
         if war is None:
             log.debug("CoCAPI.get_active_war_raw: no current war, checking current preparation round")
-            war = await client.get_current_war(
-                tag,
-                cwl_round=WarRound.current_preparation,
-            )
+            war = await fetch_war(WarRound.current_preparation)
         if war is None:
             log.debug("CoCAPI.get_active_war_raw: no preparation war, checking previous round")
-            war = await client.get_current_war(
-                tag,
-                cwl_round=WarRound.previous_war,
-            )
+            war = await fetch_war(WarRound.previous_war)
         log.debug(
             "CoCAPI.get_active_war_raw fetched war: is_cwl=%s state=%s",
             getattr(war, "is_cwl", None),
-            getattr(war, "state", None) if war else None,
+            _war_state_value(war),
         )
         return war
 
