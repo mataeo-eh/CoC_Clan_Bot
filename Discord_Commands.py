@@ -1512,20 +1512,20 @@ async def war_nudge(interaction: discord.Interaction, clan_name: str, reason_nam
     lines = []
     for member, info in targets:
         tag = getattr(member, "tag", None)
-        discord_member = _lookup_member_by_tag(interaction.guild, tag) if tag else None
         name = getattr(member, "name", "Unknown")
-        display = discord_member.mention if discord_member else name
+        discord_ping = _lookup_member_mention_by_tag(interaction.guild, tag) if tag else None
+        ping_suffix = f" {discord_ping}" if discord_ping else ""
         if reason_type == "unused_attacks":
             lines.append(
-                f"• {display} — {info.get('remaining', '?')} attack(s) remaining."
+                f"• {name} — {info.get('remaining', '?')} attack(s) remaining.{ping_suffix}"
             )
         elif reason_type == "no_attacks":
             lines.append(
-                f"• {display} — has not attacked yet."
+                f"• {name} — has not attacked yet.{ping_suffix}"
             )
         elif reason_type == "low_stars":
             lines.append(
-                f"• {display} — best attack {info.get('best_stars', 0)}⭐ ({info.get('used', 0)} attempt(s))."
+                f"• {name} — best attack {info.get('best_stars', 0)}⭐ ({info.get('used', 0)} attempt(s)).{ping_suffix}"
             )
 
     mention_prefix = _build_reason_mention(interaction.guild, selected_reason)
@@ -3678,6 +3678,10 @@ def _lookup_member_by_tag(
     tag: str,
 ) -> Optional[discord.Member]:
     """Attempt to resolve a Discord member from a player tag."""
+    normalised_lookup = _normalise_player_tag(tag)
+    if normalised_lookup is None:
+        return None
+
     guild_config = _ensure_guild_config(guild.id)
     accounts = guild_config.get("player_accounts", {})
     for user_id_str, records in accounts.items():
@@ -3686,11 +3690,38 @@ def _lookup_member_by_tag(
         for record in records:
             if not isinstance(record, dict):
                 continue
-            if record.get("tag") == tag:
+            linked_tag = _normalise_player_tag(record.get("tag"))
+            if linked_tag == normalised_lookup:
                 if user_id_str.isdigit():
                     member = guild.get_member(int(user_id_str))
                     if member:
                         return member
+    return None
+
+
+def _lookup_member_mention_by_tag(guild: discord.Guild, tag: str) -> Optional[str]:
+    """Return a Discord mention string for the member linked to a CoC tag."""
+    normalised_lookup = _normalise_player_tag(tag)
+    if normalised_lookup is None:
+        return None
+
+    guild_config = _ensure_guild_config(guild.id)
+    accounts = guild_config.get("player_accounts", {})
+    for user_id_str, records in accounts.items():
+        if not isinstance(records, list) or not user_id_str.isdigit():
+            continue
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            linked_tag = _normalise_player_tag(record.get("tag"))
+            if linked_tag != normalised_lookup:
+                continue
+
+            # Prefer discord.py's Member.mention when the member is cached; the
+            # raw user mention keeps linked-account nudges working even when the
+            # guild member object has not been hydrated in memory.
+            member = guild.get_member(int(user_id_str))
+            return member.mention if member else f"<@{user_id_str}>"
     return None
 
 
