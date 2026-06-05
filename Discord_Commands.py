@@ -283,6 +283,34 @@ def _resolve_war_automation_channel(
     return channel
 
 
+async def _resolve_selected_text_channel(
+    guild: discord.Guild,
+    selected_channel: Any,
+) -> Optional[discord.TextChannel]:
+    """Resolve a Discord UI channel selection to a concrete text channel.
+
+    ChannelSelect values can arrive as cached channel objects or lightweight
+    resolved-channel objects. The channel ID is the stable API field, so the
+    callback resolves that ID against the guild cache first and fetches it when
+    needed before applying permission checks.
+    """
+    channel_id = getattr(selected_channel, "id", None)
+    if not isinstance(channel_id, int):
+        return None
+
+    cached_channel = guild.get_channel(channel_id)
+    if isinstance(cached_channel, discord.TextChannel):
+        return cached_channel
+    if cached_channel is not None:
+        return None
+
+    try:
+        fetched_channel = await guild.fetch_channel(channel_id)
+    except (discord.Forbidden, discord.HTTPException):
+        return None
+    return fetched_channel if isinstance(fetched_channel, discord.TextChannel) else None
+
+
 def _resolve_alert_destination_channel(
     guild: discord.Guild,
     clan_name: str,
@@ -11298,28 +11326,34 @@ class WarNudgeAutomationChannelSelect(discord.ui.ChannelSelect):
 
     async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
         channel = self.values[0] if self.values else None
-        if channel is not None and not isinstance(channel, discord.TextChannel):
+        selected_channel = (
+            await _resolve_selected_text_channel(self.parent_view.config_view.guild, channel)
+            if channel is not None
+            else None
+        )
+        if channel is not None and selected_channel is None:
             await interaction.response.send_message(
                 "⚠️ Choose a text channel for automated nudges.",
                 ephemeral=True,
             )
             return
-        if isinstance(channel, discord.TextChannel):
-            if not _bot_can_send_to_channel(self.parent_view.config_view.guild, channel):
+        if selected_channel is not None:
+            if not _bot_can_send_to_channel(self.parent_view.config_view.guild, selected_channel):
                 await interaction.response.send_message(
                     "⚠️ I cannot send messages in that channel. Please choose another channel.",
                     ephemeral=True,
                 )
                 return
-            if not _user_can_configure_channel(interaction.user, channel):
+            if not _user_can_configure_channel(interaction.user, selected_channel):
                 await interaction.response.send_message(
                     "⚠️ You need access to that channel before using it for automated nudges.",
                     ephemeral=True,
                 )
                 return
-            self.parent_view.config_view.selected_automation_channel_id = channel.id
+            self.parent_view.config_view.selected_automation_channel_id = selected_channel.id
         else:
             self.parent_view.config_view.selected_automation_channel_id = None
+        self.parent_view.config_view.automation_dirty = True
         await self.parent_view.refresh(interaction)
 
 
@@ -11336,6 +11370,7 @@ class WarNudgeAutomationToggleButton(discord.ui.Button):
         self.parent_view.config_view.selected_automation_enabled = (
             not self.parent_view.config_view.selected_automation_enabled
         )
+        self.parent_view.config_view.automation_dirty = True
         await self.parent_view.refresh(interaction)
 
 
@@ -11353,6 +11388,7 @@ class WarNudgeAutomationClearChannelButton(discord.ui.Button):
 
     async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
         self.parent_view.config_view.selected_automation_channel_id = None
+        self.parent_view.config_view.automation_dirty = True
         await self.parent_view.refresh(interaction)
 
 
@@ -11364,9 +11400,17 @@ class WarNudgeAutomationDoneButton(discord.ui.Button):
         self.parent_view = parent_view
 
     async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        saved = await self.parent_view.persist_existing_reason_automation(interaction)
+        if saved is None:
+            return
         await self.parent_view.refresh_parent_config_message()
+        status = (
+            "Automation settings saved."
+            if saved
+            else "Automation settings staged. Use **Save Reason** to persist them."
+        )
         await interaction.response.edit_message(
-            content="Automation settings staged. Use **Save Reason** to persist them.",
+            content=status,
             view=None,
         )
 
@@ -11429,6 +11473,67 @@ class WarNudgeAutomationView(discord.ui.View):
             view=self,
         )
 
+    async def persist_existing_reason_automation(
+        self,
+        interaction: discord.Interaction,
+    ) -> Optional[bool]:
+        """Persist automation fields immediately when editing an existing reason.
+
+        The main configuration message and this ephemeral automation message are
+        separate Discord interactions. Persisting existing-reason automation here
+        avoids losing changes if a later button interaction is routed through a
+        view instance that still has the old staged values.
+        """
+        config_view = self.config_view
+        if config_view.selected_reason_name == "__new__":
+            return False
+        if config_view.selected_automation_enabled and not config_view.selected_automation_offsets:
+            await interaction.response.send_message(
+                "⚠️ Choose at least one automation timing, or turn automation off.",
+                ephemeral=True,
+            )
+            return None
+        if config_view.selected_automation_channel_id is not None:
+            channel = _resolve_war_automation_channel(
+                config_view.guild,
+                config_view.selected_automation_channel_id,
+            )
+            if channel is None:
+                await interaction.response.send_message(
+                    "⚠️ I can no longer send messages in the selected nudge channel. "
+                    "Choose another channel or clear the channel override.",
+                    ephemeral=True,
+                )
+                return None
+            if not _user_can_configure_channel(interaction.user, channel):
+                await interaction.response.send_message(
+                    "⚠️ You no longer have access to the selected nudge channel.",
+                    ephemeral=True,
+                )
+                return None
+
+        clan_entry = _get_clan_entry(config_view.guild.id, config_view.clan_name)
+        war_nudge = clan_entry.get("war_nudge", {}) if isinstance(clan_entry, dict) else {}
+        reasons = war_nudge.get("reasons", []) if isinstance(war_nudge, dict) else []
+        reason = _find_war_nudge_reason(reasons, config_view.selected_reason_name)
+        if reason is None:
+            await interaction.response.send_message(
+                "⚠️ That war nudge reason no longer exists. Re-open `/configure_war_nudge` and try again.",
+                ephemeral=True,
+            )
+            return None
+
+        reason["automation_enabled"] = bool(
+            config_view.selected_automation_enabled
+            and config_view.selected_automation_offsets
+        )
+        reason["automation_offsets"] = list(config_view.selected_automation_offsets)
+        reason["automation_channel_id"] = config_view.selected_automation_channel_id
+        save_server_config()
+        config_view.refresh_state()
+        config_view.automation_dirty = False
+        return True
+
     async def update_offsets(
         self,
         interaction: discord.Interaction,
@@ -11461,6 +11566,7 @@ class WarNudgeAutomationView(discord.ui.View):
             return
 
         self.config_view.selected_automation_offsets = combined
+        self.config_view.automation_dirty = True
         await self.refresh(interaction)
 
 
@@ -11481,6 +11587,7 @@ class WarNudgeConfigView(discord.ui.View):
         self.selected_automation_enabled = False
         self.selected_automation_offsets: List[int] = []
         self.selected_automation_channel_id: Optional[int] = None
+        self.automation_dirty = False
         self.target_mode = "role"
         self.pending_reason_name: Optional[str] = None
         self.pending_reason_description: Optional[str] = None
@@ -11506,6 +11613,7 @@ class WarNudgeConfigView(discord.ui.View):
                 self.selected_automation_enabled = False
                 self.selected_automation_offsets = []
                 self.selected_automation_channel_id = None
+                self.automation_dirty = False
                 self.target_mode = "role"
             else:
                 self.selected_reason_type = matched.get("type", WAR_NUDGE_REASONS[0])
@@ -11520,6 +11628,7 @@ class WarNudgeConfigView(discord.ui.View):
                 )
                 channel_id = matched.get("automation_channel_id")
                 self.selected_automation_channel_id = channel_id if isinstance(channel_id, int) else None
+                self.automation_dirty = False
                 if self.selected_user_id and not self.selected_role_id:
                     self.target_mode = "member"
                 else:
@@ -11559,6 +11668,7 @@ class WarNudgeConfigView(discord.ui.View):
         self.selected_automation_enabled = False
         self.selected_automation_offsets = []
         self.selected_automation_channel_id = None
+        self.automation_dirty = False
         self.target_mode = "role"
         self.refresh_state()
 
@@ -11572,6 +11682,7 @@ class WarNudgeConfigView(discord.ui.View):
             self.selected_automation_enabled = False
             self.selected_automation_offsets = []
             self.selected_automation_channel_id = None
+            self.automation_dirty = False
             self.target_mode = "role"
         self.refresh_state()
 
@@ -11659,6 +11770,28 @@ class WarNudgeConfigView(discord.ui.View):
         clan_entry = _get_clan_entry(self.guild.id, self.clan_name)
         war_nudge = clan_entry.setdefault("war_nudge", {})
         reasons: List[Dict[str, Any]] = war_nudge.setdefault("reasons", [])
+        existing_reason = None
+        if self.selected_reason_name != "__new__":
+            existing_reason = _find_war_nudge_reason(reasons, self.selected_reason_name)
+        if existing_reason is None:
+            existing_reason = _find_war_nudge_reason(reasons, name)
+
+        automation_offsets = list(self.selected_automation_offsets)
+        automation_enabled = bool(
+            self.selected_automation_enabled and automation_offsets
+        )
+        automation_channel_id = self.selected_automation_channel_id
+        if existing_reason is not None and not self.automation_dirty:
+            automation_offsets = _normalise_war_nudge_automation_offsets(
+                existing_reason.get("automation_offsets")
+            )
+            automation_enabled = bool(
+                existing_reason.get("automation_enabled") and automation_offsets
+            )
+            existing_channel_id = existing_reason.get("automation_channel_id")
+            automation_channel_id = (
+                existing_channel_id if isinstance(existing_channel_id, int) else None
+            )
 
         payload = {
             "name": name,
@@ -11666,11 +11799,9 @@ class WarNudgeConfigView(discord.ui.View):
             "mention_role_id": self.selected_role_id,
             "mention_user_id": self.selected_user_id,
             "description": description,
-            "automation_enabled": bool(
-                self.selected_automation_enabled and self.selected_automation_offsets
-            ),
-            "automation_offsets": list(self.selected_automation_offsets),
-            "automation_channel_id": self.selected_automation_channel_id,
+            "automation_enabled": automation_enabled,
+            "automation_offsets": automation_offsets,
+            "automation_channel_id": automation_channel_id,
         }
 
         updated = False
@@ -11687,6 +11818,7 @@ class WarNudgeConfigView(discord.ui.View):
         self.selected_description = description
         self.pending_reason_name = None
         self.pending_reason_description = None
+        self.automation_dirty = False
         self.refresh_state()
         self.refresh_components()
 
@@ -11729,6 +11861,7 @@ class WarNudgeConfigView(discord.ui.View):
         self.selected_automation_enabled = False
         self.selected_automation_offsets = []
         self.selected_automation_channel_id = None
+        self.automation_dirty = False
         self.refresh_state()
         self.refresh_components()
 
