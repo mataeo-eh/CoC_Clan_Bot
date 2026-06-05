@@ -803,6 +803,25 @@ async def _link_player_account(
 
     if action_lower == "link":
         inferred_alias = alias.strip() if isinstance(alias, str) and alias.strip() else None
+        roster = await _fetch_configured_clan_roster(
+            guild,
+            context="link_player roster validation",
+        )
+        roster_entry = next((entry for entry in roster if entry.get("tag") == normalised_tag), None)
+        if roster_entry is None:
+            raise PlayerLinkError(
+                f"⚠️ `{normalised_tag}` is not in any configured clan roster. "
+                "Start typing the tag in `/link_player player_tag:` and choose a roster suggestion, "
+                "or use the roster search button so Discord shows the exact account tag."
+            )
+
+        # Configured clan rosters come from the Clash API and include each member's
+        # exact tag/name. They are the source of truth for preventing O/0-style
+        # transcription mistakes before a Discord link is persisted.
+        if inferred_alias is None:
+            roster_alias = roster_entry.get("name")
+            inferred_alias = roster_alias.strip() if isinstance(roster_alias, str) and roster_alias.strip() else None
+
         if skip_remote_lookup:
             player_payload = None
         else:
@@ -947,6 +966,60 @@ def _search_configured_roster_tags(
                     entry.get("name", "").casefold(),
                     tag_text,
                 ),
+                entry,
+            )
+        )
+
+    ranked.sort(key=lambda item: item[0])
+    return [entry for _, entry in ranked[:limit]]
+
+
+def _search_configured_roster_entries(
+    roster: List[Dict[str, str]],
+    query: str,
+    *,
+    limit: int = 5,
+) -> List[Dict[str, str]]:
+    """Rank configured clan roster entries by exact, prefix, then substring matches."""
+    query_text = query.strip().casefold()
+    compact_query = query_text.replace(" ", "").lstrip("#")
+    if not compact_query:
+        return []
+
+    ranked: List[Tuple[Tuple[int, int, str, str], Dict[str, str]]] = []
+    for entry in roster:
+        name = entry.get("name", "")
+        tag = entry.get("tag", "")
+        name_text = name.casefold()
+        compact_name = name_text.replace(" ", "")
+        tag_text = tag.casefold()
+        tag_no_hash = tag_text.lstrip("#")
+
+        score = None
+        position = 999
+        if compact_query == tag_no_hash:
+            score = 0
+        elif query_text == name_text or compact_query == compact_name:
+            score = 1
+        elif tag_no_hash.startswith(compact_query):
+            score = 2
+            position = tag_no_hash.find(compact_query)
+        elif compact_name.startswith(compact_query):
+            score = 3
+            position = compact_name.find(compact_query)
+        elif compact_query in tag_no_hash:
+            score = 4
+            position = tag_no_hash.find(compact_query)
+        elif compact_query in compact_name:
+            score = 5
+            position = compact_name.find(compact_query)
+
+        if score is None:
+            continue
+
+        ranked.append(
+            (
+                (score, position, name.casefold(), tag.casefold()),
                 entry,
             )
         )
@@ -10093,11 +10166,132 @@ class LinkPlayerTargetSelect(discord.ui.UserSelect):
         )
 
 
+class LinkPlayerRosterSearchButton(discord.ui.Button):
+    """Button that opens roster-backed search for selecting an exact player tag."""
+
+    def __init__(self, parent_view: "LinkPlayerView"):
+        super().__init__(label="Search clan roster", style=discord.ButtonStyle.primary, row=2)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        if interaction.message is not None:
+            self.parent_view.message = interaction.message
+        await interaction.response.send_modal(LinkPlayerRosterSearchModal(self.parent_view))
+
+
+class LinkPlayerRosterSearchModal(discord.ui.Modal):
+    """Modal that collects a name or tag fragment before showing roster choices."""
+
+    def __init__(self, parent_view: "LinkPlayerView"):
+        super().__init__(title="Search Clan Roster", timeout=None)
+        self.parent_view = parent_view
+        self.query = discord.ui.TextInput(
+            label="Account name or player tag",
+            placeholder="Examples: trickster, LL0L, #ABC123",
+            max_length=50,
+        )
+        self.add_item(self.query)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        query = self.query.value.strip()
+        if not query:
+            await interaction.response.send_message(
+                "⚠️ Enter part of an account name or player tag to search the roster.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            matches = await self.parent_view.find_roster_matches(query, limit=5)
+        except PlayerLinkError as exc:
+            await interaction.followup.send(exc.message, ephemeral=True)
+            return
+
+        if not matches:
+            await interaction.followup.send(
+                "⚠️ No clan-roster matches found for that search. Try a shorter name fragment or part of the tag.",
+                ephemeral=True,
+            )
+            return
+
+        result_view = LinkPlayerRosterMatchView(self.parent_view, matches)
+        await interaction.followup.send(
+            f"Top {len(matches)} roster match(es) for `{query}`:",
+            ephemeral=True,
+            view=result_view,
+        )
+
+
+class LinkPlayerRosterMatchSelect(discord.ui.Select):
+    """Select menu that stages one exact roster result on the link player view."""
+
+    def __init__(self, parent_view: "LinkPlayerView", matches: List[Dict[str, str]]):
+        options: List[discord.SelectOption] = []
+        for entry in matches:
+            name = entry.get("name", "Unknown player")
+            tag = entry.get("tag", "")
+            clan_name = entry.get("clan_name", "")
+            description = tag if not clan_name else f"{tag} · {clan_name}"
+            options.append(
+                discord.SelectOption(
+                    label=name[:100],
+                    description=description[:100],
+                    value=tag,
+                    emoji="🏰",
+                )
+            )
+        super().__init__(
+            placeholder="Choose an account for the link view",
+            min_values=1,
+            max_values=1,
+            options=options[:25],
+            row=0,
+        )
+        self.parent_view = parent_view
+        self.match_lookup = {
+            entry.get("tag", ""): entry
+            for entry in matches
+            if isinstance(entry.get("tag"), str) and entry.get("tag")
+        }
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        selected_tag = self.values[0]
+        selected_entry = self.match_lookup.get(selected_tag)
+        alias = selected_entry.get("name") if isinstance(selected_entry, dict) else None
+        self.parent_view.set_details(selected_tag, alias)
+        await self.parent_view.refresh_view_message()
+
+        parent = self.view
+        if isinstance(parent, discord.ui.View):
+            for child in parent.children:
+                child.disabled = True
+
+        alias_label = f" `{alias}`" if isinstance(alias, str) and alias else ""
+        await interaction.response.edit_message(
+            content=f"Selected{alias_label} (`{selected_tag}`). Return to the link view and confirm.",
+            view=parent,
+        )
+
+
+class LinkPlayerRosterMatchView(discord.ui.View):
+    """Ephemeral view that shows roster matches for the link player view."""
+
+    def __init__(self, parent_view: "LinkPlayerView", matches: List[Dict[str, str]], timeout: float = 180):
+        super().__init__(timeout=timeout)
+        self.parent_view = parent_view
+        self.add_item(LinkPlayerRosterMatchSelect(parent_view, matches))
+
+    async def on_timeout(self) -> None:
+        for child in self.children:
+            child.disabled = True
+
+
 class LinkPlayerDetailsButton(discord.ui.Button):
     """Button to open the modal for editing tag and alias."""
 
     def __init__(self, parent_view: "LinkPlayerView"):
-        super().__init__(label="Set player details", style=discord.ButtonStyle.primary, row=2)
+        super().__init__(label="Manual tag entry", style=discord.ButtonStyle.secondary, row=2)
         self.parent_view = parent_view
 
     async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
@@ -10167,6 +10361,7 @@ class LinkPlayerView(discord.ui.View):
         self.message: Optional[discord.Message] = None
         self.last_result: Optional[str] = None
         self._linked_summary = ""
+        self.roster_cache: Optional[List[Dict[str, str]]] = None
 
         self.refresh_state()
         self.refresh_components()
@@ -10199,7 +10394,9 @@ class LinkPlayerView(discord.ui.View):
             "**Link Clash Accounts**" if self.selected_action == "link" else "**Unlink Clash Accounts**",
             f"Action: {self.selected_action.title()}",
             f"Target member: {target.mention}",
-            f"Player tag: `{tag_display}`" if self.selected_tag else "Player tag: (use *Set player details*)",
+            f"Player tag: `{tag_display}`"
+            if self.selected_tag
+            else "Player tag: (use *Search clan roster* or *Manual tag entry*)",
         ]
         if self.selected_action == "link":
             alias_display = self.selected_alias or "(auto-detect from profile)"
@@ -10209,7 +10406,9 @@ class LinkPlayerView(discord.ui.View):
             lines.append("")
             lines.append(f"Last result: {self.last_result}")
         lines.append("")
-        lines.append("Use the controls below to set the account details, then choose whether to broadcast the update or keep it private.")
+        lines.append(
+            "Use roster search to select the exact account tag, then choose whether to broadcast the update or keep it private."
+        )
         return "\n".join(lines)
 
     def refresh_components(self) -> None:
@@ -10217,6 +10416,7 @@ class LinkPlayerView(discord.ui.View):
         self.add_item(LinkPlayerActionSelect(self))
         if user_has_admin_access(self.actor):
             self.add_item(LinkPlayerTargetSelect(self))
+        self.add_item(LinkPlayerRosterSearchButton(self))
         self.add_item(LinkPlayerDetailsButton(self))
         private_button = LinkPlayerConfirmPrivateButton(self)
         broadcast_button = LinkPlayerConfirmBroadcastButton(self)
@@ -10234,6 +10434,23 @@ class LinkPlayerView(discord.ui.View):
             await self.message.edit(content=self.render_message(), view=self)
         except discord.HTTPException as exc:
             log.warning("Failed to refresh link_player view message: %s", exc)
+
+    async def ensure_roster_cache(self) -> List[Dict[str, str]]:
+        """Fetch configured clan rosters once for this interactive link session."""
+        if self.roster_cache is not None:
+            return self.roster_cache
+
+        roster = await _fetch_configured_clan_roster(
+            self.guild,
+            context="link_player roster search",
+        )
+        self.roster_cache = roster
+        return roster
+
+    async def find_roster_matches(self, query: str, *, limit: int = 5) -> List[Dict[str, str]]:
+        """Return the strongest configured-roster matches for a link-player search."""
+        roster = await self.ensure_roster_cache()
+        return _search_configured_roster_entries(roster, query, limit=limit)
 
     async def handle_submit(self, interaction: discord.Interaction, *, broadcast: bool) -> None:
         target = self.selected_target if isinstance(self.selected_target, discord.Member) else self.actor
@@ -10393,8 +10610,8 @@ class RegisterMeManualLinkButton(discord.ui.Button):
 
     def __init__(self, parent_view: "RegisterMeView"):
         super().__init__(
-            label="Link account manually",
-            style=discord.ButtonStyle.primary,
+            label="Manual tag entry",
+            style=discord.ButtonStyle.secondary,
             row=0,
         )
         self.parent_view = parent_view
@@ -10493,7 +10710,7 @@ class RegisterMeRosterSearchButton(discord.ui.Button):
     def __init__(self, parent_view: "RegisterMeView"):
         super().__init__(
             label="Link account from clan roster",
-            style=discord.ButtonStyle.secondary,
+            style=discord.ButtonStyle.primary,
             row=0,
         )
         self.parent_view = parent_view
@@ -11643,8 +11860,8 @@ class RegisterMeView(discord.ui.View):
             role = _get_event_role(self.guild, key)
             self.event_roles.append({"key": key, "label": label, "role": role})
 
-        self.add_item(RegisterMeManualLinkButton(self))
         self.add_item(RegisterMeRosterSearchButton(self))
+        self.add_item(RegisterMeManualLinkButton(self))
         if self.linked_account_records:
             self.add_item(RegisterMeUnlinkSelect(self, self.linked_account_records))
 
@@ -11742,51 +11959,7 @@ class RegisterMeView(discord.ui.View):
     async def find_roster_matches(self, query: str, *, limit: int = 5) -> List[Dict[str, str]]:
         """Return the strongest local clan-roster matches for a search query."""
         roster = await self.ensure_roster_cache()
-        query_text = query.strip().casefold()
-        compact_query = query_text.replace(" ", "").lstrip("#")
-        if not compact_query:
-            return []
-
-        ranked: List[Tuple[Tuple[int, int, str, str], Dict[str, str]]] = []
-        for entry in roster:
-            name = entry.get("name", "")
-            tag = entry.get("tag", "")
-            name_text = name.casefold()
-            compact_name = name_text.replace(" ", "")
-            tag_text = tag.casefold()
-            tag_no_hash = tag_text.lstrip("#")
-
-            score = None
-            position = 999
-            if compact_query == tag_no_hash:
-                score = 0
-            elif query_text == name_text or compact_query == compact_name:
-                score = 1
-            elif tag_no_hash.startswith(compact_query):
-                score = 2
-                position = tag_no_hash.find(compact_query)
-            elif compact_name.startswith(compact_query):
-                score = 3
-                position = compact_name.find(compact_query)
-            elif compact_query in tag_no_hash:
-                score = 4
-                position = tag_no_hash.find(compact_query)
-            elif compact_query in compact_name:
-                score = 5
-                position = compact_name.find(compact_query)
-
-            if score is None:
-                continue
-
-            ranked.append(
-                (
-                    (score, position, name.casefold(), tag.casefold()),
-                    entry,
-                )
-            )
-
-        ranked.sort(key=lambda item: item[0])
-        return [entry for _, entry in ranked[:limit]]
+        return _search_configured_roster_entries(roster, query, limit=limit)
 
     async def toggle_role(
         self,
