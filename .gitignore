@@ -15,3 +15,6 @@ venv/
 .venv/
 .python*
 .DS_Store
+
+# AI help assistant's isolated code-intelligence index (jcodemunch/jdocmunch)
+.bot_code_index/

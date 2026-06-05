@@ -1,24 +1,59 @@
 """
-Discord Bot Command Help System with AI-Powered Code Analysis
+Discord Bot Command Help System with AI-Powered Code Intelligence
 
 This module implements an AI-powered help system for Discord slash commands.
 It uses a two-tier LLM architecture:
-1. User-facing LLM - Maintains Discord conversation context
-2. Code-analysis LLM (router agent) - Analyzes codebase using filesystem tools
+1. User-facing LLM (``MainLLM``) - Maintains Discord conversation context.
+2. Code-analysis LLM (``RouterAgent``) - Navigates the real source code to
+   understand how a command works, then summarizes it for the user-facing tier.
 
-The router agent uses MCP filesystem tools to read and understand command code,
-following OpenRouter's interleaved thinking pattern for sophisticated reasoning.
+CODE INTELLIGENCE / "RAG":
+Rather than dumping hand-maintained line ranges into a prompt and post-slicing
+whole files (the previous, brittle approach), the router agent drives two
+local MCP servers that maintain a proper structural index of this codebase:
 
-SECURITY MODEL:
-- All file access is restricted to BOT_CODE_DIR (project root)
-- Paths are validated using pathlib.resolve() to prevent directory traversal
-- The MCP filesystem server is configured with BOT_CODE_DIR as the only allowed directory
-- Multiple layers of validation ensure no access outside the sandbox
+  - jcodemunch  -> symbol-level code navigation (search_symbols, get_symbol_source,
+                   get_file_outline, get_file_tree, search_text, ...).
+  - jdocmunch   -> documentation navigation (README/TODO sections, etc.).
+
+This lets the agent jump straight to the relevant function/class/section
+instead of guessing at line numbers, which is both cheaper and far more
+accurate. The legacy ``command_index.json`` is no longer used for navigation;
+it now only supplies the list of command *names* so the agent knows what
+exists (see ``build_router_system_prompt``).
+
+SECURITY MODEL (defense-in-depth):
+- All filesystem-style tool arguments are validated against BOT_CODE_DIR with
+  ``PathValidator`` (pathlib.resolve() containment check) before being forwarded
+  to an MCP server - this blocks ``../`` traversal and absolute-path escapes.
+- The agent may only call a curated, read-only allowlist of MCP tools
+  (``ALLOWED_TOOLS``). Index-mutating / outbound tools (delete_index, embed_repo,
+  arbitrary index_folder, tune_weights, ...) are never advertised to the model.
+- The ``repo`` argument on every tool call is overridden by the server to the
+  pinned bot-repo id, so a user cannot steer the agent at another project's index.
+- The jcodemunch/jdocmunch servers are spawned WITHOUT any API keys or GitHub
+  token and with AI summaries disabled ("basic servers" only). The MCP stdio
+  client inherits just HOME/PATH/SHELL/USER/LOGNAME, so the bot's own
+  OPENROUTER_API_KEY and the developer's personal jcodemunch credentials never
+  reach these subprocesses.
+- The index is stored in a project-local directory (``CODE_INDEX_PATH``), fully
+  isolated from the developer's global ``~/.code-index`` (which holds indexes of
+  unrelated projects).
+
+LONG-TERM VISION:
+The current orchestration is a hand-rolled agentic loop (LLM -> tool -> LLM).
+This is intentionally kept simple and "acceptable for now". The intended
+evolution is to migrate this two-tier flow into an explicit LangGraph / LangChain
+graph: nodes for routing, retrieval (jcodemunch/jdocmunch), synthesis, and
+guardrails, with typed state and checkpointing instead of the ad-hoc message
+list and manual retry/iteration bookkeeping below. The MCP-backed retrieval layer
+added here is designed to drop cleanly into such a graph as the "tools" node.
 """
 
 import asyncio
 import json
 import os
+import shutil
 import sys
 import time
 from typing import Optional, Dict, Any, List
@@ -30,6 +65,11 @@ from mcp.client.stdio import stdio_client
 from openai import OpenAI
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
+
+# Generic MCP -> OpenAI tool plumbing (tool discovery, execution routing, and
+# result formatting). The RouterAgent layers repo-pinning, a read-only tool
+# allowlist, and path validation on top of this manager (see RouterAgent).
+from MCP_To_OpenAI_Tool import MCPToolManager
 
 load_dotenv()
 
@@ -240,23 +280,108 @@ except PermissionError as e:
     print(f"[FATAL] Security violation: {e}")
     sys.exit(1)
 
-# MCP Server configuration for filesystem access
-# SECURITY: The filesystem server is restricted to BOT_CODE_DIR only
-# This provides defense-in-depth - even if our validation fails,
-# the MCP server itself won't allow access outside this directory
-FILESYSTEM_SERVER_CONFIG = {
-    "filesystem": {
-        "command": "npx",
-        "args": [
-            "-y", 
-            "@modelcontextprotocol/server-filesystem",
-            BOT_CODE_DIR  # Only this directory is accessible
-        ],
-        "env": None
-    }
+# ----------------------------------------------------------------------------
+# CODE-INTELLIGENCE MCP SERVERS (jcodemunch + jdocmunch)
+# ----------------------------------------------------------------------------
+# These local stdio servers maintain a structural index of this codebase and
+# expose symbol/section navigation tools. They replace the old filesystem MCP
+# server + brittle line-range reads.
+#
+# ISOLATED INDEX STORAGE:
+# The servers honor CODE_INDEX_PATH for where they persist indexes. We point it
+# at a project-local hidden directory so the bot's index is fully isolated from
+# the developer's global ~/.code-index (which holds indexes of OTHER projects).
+# The bot must never be able to query those.
+CODE_INDEX_PATH = str(Path(BOT_CODE_DIR) / ".bot_code_index")
+os.makedirs(CODE_INDEX_PATH, exist_ok=True)
+
+
+def _resolve_mcp_binary(name: str) -> Optional[str]:
+    """
+    Resolve the absolute path to a jcodemunch/jdocmunch launcher.
+
+    The bot process may not have ~/.local/bin on PATH, so we resolve explicitly
+    and fall back to the conventional uv-tools install location. Returns None if
+    the binary cannot be found (the help agent then degrades gracefully).
+    """
+    found = shutil.which(name)
+    if found:
+        return found
+    fallback = Path.home() / ".local" / "bin" / name
+    return str(fallback) if fallback.exists() else None
+
+
+# Minimal, key-free environment overrides for the spawned servers.
+# SECURITY: We deliberately pass NO GITHUB_TOKEN and NO OPENAI/ANTHROPIC keys,
+# and disable AI summaries. The MCP stdio client only inherits a safe env subset
+# (HOME/PATH/SHELL/USER/LOGNAME), so the bot's OPENROUTER_API_KEY and the
+# developer's personal jcodemunch credentials never reach these subprocesses.
+# This satisfies the "basic servers, no LLM integration inside them" requirement.
+_CODE_INTEL_ENV = {
+    "CODE_INDEX_PATH": CODE_INDEX_PATH,
+    "JCODEMUNCH_USE_AI_SUMMARIES": "false",
 }
 
-print(f"[Security] MCP filesystem server restricted to: {BOT_CODE_DIR}")
+_JCODEMUNCH_BIN = _resolve_mcp_binary("jcodemunch-mcp")
+_JDOCMUNCH_BIN = _resolve_mcp_binary("jdocmunch-mcp")
+
+# Build the server config, including only the servers whose binaries we found.
+CODE_INTELLIGENCE_SERVER_CONFIG: Dict[str, Any] = {}
+if _JCODEMUNCH_BIN:
+    CODE_INTELLIGENCE_SERVER_CONFIG["jcodemunch"] = {
+        "command": _JCODEMUNCH_BIN,
+        "args": [],
+        "env": dict(_CODE_INTEL_ENV),
+        "cwd": BOT_CODE_DIR,
+    }
+if _JDOCMUNCH_BIN:
+    CODE_INTELLIGENCE_SERVER_CONFIG["jdocmunch"] = {
+        "command": _JDOCMUNCH_BIN,
+        "args": [],
+        "env": dict(_CODE_INTEL_ENV),
+        "cwd": BOT_CODE_DIR,
+    }
+
+if not CODE_INTELLIGENCE_SERVER_CONFIG:
+    print("[WARNING] Neither jcodemunch-mcp nor jdocmunch-mcp was found on PATH "
+          "or in ~/.local/bin. The AI help agent will be unable to read code.")
+else:
+    print(f"[Security] Code-intelligence MCP servers: "
+          f"{list(CODE_INTELLIGENCE_SERVER_CONFIG)}; index isolated at {CODE_INDEX_PATH}")
+
+
+# ----------------------------------------------------------------------------
+# READ-ONLY TOOL ALLOWLIST
+# ----------------------------------------------------------------------------
+# jcodemunch + jdocmunch expose ~150 tools combined, including index-mutating and
+# outbound ones (delete_index, embed_repo, arbitrary index_folder, tune_weights).
+# We advertise ONLY this curated, read-only navigation set to the model. Every
+# tool here accepts a `repo` argument, which we override with the pinned bot-repo
+# id on each call so the agent cannot query another project's index.
+JCODEMUNCH_ALLOWED_TOOLS = {
+    "search_symbols",
+    "get_symbol_source",
+    "get_file_outline",
+    "get_file_tree",
+    "get_repo_outline",
+    "get_related_symbols",
+    "search_text",
+}
+JDOCMUNCH_ALLOWED_TOOLS = {
+    "search_sections",
+    "get_section",
+    "get_toc",
+    "search_titles",
+    "get_document_outline",
+}
+ALLOWED_TOOLS = JCODEMUNCH_ALLOWED_TOOLS | JDOCMUNCH_ALLOWED_TOOLS
+
+# Tool-argument keys that name a filesystem path (repo-relative). These are
+# validated against BOT_CODE_DIR before forwarding. Glob patterns (file_pattern)
+# and opaque index ids (symbol_id, section ids) are not filesystem paths and are
+# left untouched.
+_PATH_ARG_KEYS = ("file_path", "path", "doc_path")
+_PATH_LIST_ARG_KEYS = ("file_paths",)
 
 
 # ============================================================================
@@ -286,65 +411,72 @@ def load_command_index() -> Dict[str, Any]:
 
 def build_router_system_prompt(command_index: Dict[str, Any]) -> str:
     """
-    Build system prompt for the code-analysis router agent.
-    This agent has access to filesystem tools and knows command locations.
+    Build the system prompt for the code-analysis router agent.
+
+    The agent navigates the real source via the jcodemunch (code) and jdocmunch
+    (docs) MCP tools. We deliberately do NOT inject line numbers here anymore;
+    we only list the command *names* that exist so the agent has a starting map.
+    It then resolves each command to actual code with the index-backed tools,
+    which is far more accurate than the previous hand-maintained line ranges.
     """
-    return f"""You are a code analysis agent helping users understand Discord bot slash commands.
+    # Retire command_index as a navigation source: keep only the command names
+    # as a lightweight catalog of what exists.
+    command_names = sorted(command_index.keys())
+    command_catalog = "\n".join(f"- {name}" for name in command_names)
 
-Your task is to analyze Python code to explain how Discord commands work.
+    return f"""You are a code-analysis agent that explains how this Discord bot's slash commands work.
 
-**SECURITY NOTICE:**
-You have access to filesystem tools, but they are restricted to the project directory only.
-You CANNOT and should not attempt to access:
-- System files (e.g., /etc/passwd, /windows/system32)
-- User home directories outside the project
-- Parent directories (../ paths are blocked)
-- Any files outside the project root
+You answer by reading the bot's ACTUAL source code and documentation using a set
+of code-intelligence tools backed by a structural index of the repository. Always
+ground your answer in what you actually read - never guess at behavior.
 
-The filesystem server enforces these restrictions. Focus on analyzing code within the project.
+**TOOLS AVAILABLE TO YOU:**
+Code navigation (jcodemunch):
+- search_symbols: find a function/class/method by name or description (start here).
+- get_symbol_source: read the full source of a specific symbol you found.
+- get_file_outline: list all symbols in a file with signatures.
+- get_file_tree: see the repository's file layout.
+- get_repo_outline: high-level overview of the repository.
+- get_related_symbols: find callers/callees/related code for a symbol.
+- search_text: full-text search for string literals, decorators, or comments.
+Documentation navigation (jdocmunch):
+- search_sections / search_titles: find relevant sections in README/docs.
+- get_section / get_document_outline / get_toc: read docs structure and content.
 
-**Available Commands and Their Code Locations:**
-{json.dumps(command_index, indent=2)}
+**REPO ARGUMENT:**
+The tools take a `repo` argument. It is automatically pinned to this bot's repo
+for you - you do not need to discover it, and you cannot point these tools at any
+other project. Just pass the repo value you are given (or omit it).
 
-The code locations reference line numbers in the file "Discord_Commands.py" in the current directory.
+**RECOMMENDED WORKFLOW:**
+1. Map the user's question to a likely slash command (see the catalog below).
+2. search_symbols for that command's handler function (slash command handlers are
+   functions whose name matches the command, in Discord_Commands.py).
+3. get_symbol_source to read the handler. Slash commands in this bot typically
+   follow the pattern: user runs the command -> an interactive menu / buttons /
+   modal appears. Note the parameters and the interactive elements.
+4. If the handler references a View/Modal/Select class (the UI the user sees),
+   search_symbols + get_symbol_source on that class to understand the experience.
+5. For high-level "how do I use the bot / what can it do" questions, also consult
+   jdocmunch (search_sections over the README/docs).
 
-**Your Capabilities:**
-- You have access to filesystem tools (read_file, list_directory, etc.)
-- All file access is restricted to the project directory for security
-- You can read specific line ranges from files
-- You can follow code references to view_classes and parent classes
+**EFFICIENCY LIMITS:**
+- You have at most 10 tool calls. Prefer breadth over depth.
+- After reading the handler and 1-2 related UI classes you usually have enough.
+- If you've read 4+ symbols, answer from what you have rather than digging further.
 
-**Analysis Workflow:**
-1. Identify which command the user is most likely asking about
-2. Use read_file to read the command's code (start_line to end_line)
-3. If the command has associated view_classes, read those if needed to understand user facing elements
-4. If you find references to parent classes or imports, read those sections if needed for understanding
-5. Synthesize your understanding into a clear explanation
+**WHAT TO EXTRACT:**
+- The command's purpose, and its required/optional parameters.
+- The user-facing workflow: what happens, step by step, when they run it.
+- Interactive elements (buttons, dropdowns, modals) and what the user sees.
+- Any special requirements or permissions (e.g. admin-only).
 
-**Important Analysis Workflow Limits:**
-- You have a maximum of 10 tool calls to gather information
-- After reading the main command code and 1-2 related classes, you should have enough to answer
-- Prioritize breadth over depth - don't read every single dependency
-- If you have read 4+ code sections, answer as best you can from what you have read
+**RESPONSE FORMAT:**
+Write a clear, concise, natural-language summary for a user learning the command.
+Focus on the user experience, not implementation details. Do not paste code.
 
-**What to Extract from Code:**
-- Command purpose and description
-- Required and optional parameters
-- User workflow (what happens when they run the command)
-- Interactive elements (buttons, dropdowns, modals)
-- Any special requirements or permissions (e.g., admin only)
-
-**Response Format:**
-Provide a clear, concise summary suitable for a user learning how to use the command.
-Focus on the user experience, not implementation details.
-Use natural language, not code snippets in your final response.
-
-**Important:**
-- Read the actual code before responding - don't guess
-- If a command uses UI elements, explain what the user will see
-- Chain multiple file reads if needed to fully understand the command
-- Be thorough but concise in your final summary
-- Stay within the project directory - do not attempt to access external files"""
+**COMMANDS THAT EXIST IN THIS BOT (names only - resolve them with the tools):**
+{command_catalog}"""
 
 
 def build_main_llm_system_prompt() -> str:
@@ -355,8 +487,11 @@ def build_main_llm_system_prompt() -> str:
     return """You are a helpful assistant for a Discord Clash of Clans bot.
 
 Users will ask you questions about how to use the bot's slash commands.
-You have access to a tool called "analyze_command_code" that allows you to 
-investigate the bot's source code to understand how commands work.
+You have access to a tool called "analyze_command_code" that investigates the
+bot's ACTUAL source code and documentation (via a structural code index) to
+understand exactly how a command works. Rely on this tool whenever a question
+depends on what a command actually does - prefer reading the real code over
+answering from memory.
 
 **Your Role:**
 - Help users understand how to use slash commands
@@ -380,48 +515,53 @@ investigate the bot's source code to understand how commands work.
 # MCP CLIENT FOR ROUTER AGENT
 # ============================================================================
 
-def convert_tool_format(tool):
-    """Convert MCP tool format to OpenAI tool format"""
-    return {
-        "type": "function",
-        "function": {
-            "name": tool.name,
-            "description": tool.description,
-            "parameters": {
-                "type": "object",
-                "properties": tool.inputSchema["properties"],
-                "required": tool.inputSchema.get("required", [])
-            }
-        }
-    }
-
-
 class RouterAgent:
     """
-    Code-analysis agent with filesystem MCP tools.
-    Uses interleaved thinking to chain multiple tool calls.
+    Code-analysis agent backed by the jcodemunch/jdocmunch MCP servers.
+
+    Responsibilities layered on top of the generic ``MCPToolManager``:
+    - Connect to the code-intelligence servers (stdio).
+    - Index this repository (incremental) and *pin* the resulting repo ids, so the
+      model never has to (and never gets to) point the tools at another project.
+    - Advertise only a read-only allowlist of navigation tools to the model.
+    - Validate/repin every tool call's arguments before execution.
+
+    NOTE (long-term vision): this hand-rolled agentic loop is the piece slated to
+    become a LangGraph node graph (route -> retrieve -> synthesize). The retrieval
+    plumbing here is intentionally self-contained so it can be lifted out cleanly.
     """
-    
+
     def __init__(self, command_index: Dict[str, Any]):
         self.command_index = command_index
-        self.sessions = {}
+        self.sessions: Dict[str, Any] = {}
         self.exit_stack = AsyncExitStack()
         self.openai = AsyncOpenAI(base_url=base_url, api_key=api_key)
         self.model = MODEL
-        self.messages = []
+        self.messages: List[Dict[str, Any]] = []
         self.system_prompt = build_router_system_prompt(command_index)
-        
+        # Generic MCP tool plumbing (discovery / execution routing / formatting).
+        self.tool_manager = MCPToolManager()
+        # server name -> pinned repo id (only set after a successful index).
+        self.repo_ids: Dict[str, str] = {}
+
     async def __aenter__(self):
-        """Initialize MCP connection when entering context"""
-        await self.connect_to_servers(FILESYSTEM_SERVER_CONFIG)
+        """Connect to the code-intelligence servers and prepare the index."""
+        await self.connect_to_servers(CODE_INTELLIGENCE_SERVER_CONFIG)
+        await self._index_and_pin_repos()
         return self
-    
+
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Cleanup when exiting context"""
         await self.cleanup()
-    
+
     async def connect_to_servers(self, server_configs: Dict[str, Any]):
-        """Connect to MCP servers (filesystem in this case)"""
+        """Connect to the configured MCP servers and register their sessions."""
+        if not server_configs:
+            raise RuntimeError(
+                "No code-intelligence MCP servers are configured "
+                "(jcodemunch-mcp / jdocmunch-mcp not found)."
+            )
+
         print(f"[RouterAgent] Connecting to {len(server_configs)} MCP server(s)...")
 
         for name, config in server_configs.items():
@@ -438,33 +578,147 @@ class RouterAgent:
                 try:
                     async with asyncio.timeout(25):  # 25 second timeout
                         await session.initialize()
-                    print("[RouterAgent] ✓ MCP session initialized")
+                    print(f"[RouterAgent] ✓ {name} MCP session initialized")
                 except asyncio.TimeoutError:
-                    print("[RouterAgent] ERROR: MCP server initialization timed out (subprocess not responding)")
+                    print(f"[RouterAgent] ERROR: {name} server initialization timed out")
                     raise RuntimeError(f"{name} server failed to initialize - likely PATH issue")
 
                 self.sessions[name] = session
+                # Register the session with the generic tool manager so it can
+                # discover, route, and format tool calls for this server.
+                self.tool_manager.add_session(name, session)
 
-                # Log available tools
                 response = await session.list_tools()
                 tool_names = [tool.name for tool in response.tools]
-                print(f"[RouterAgent] ✓ {name} server connected with {len(tool_names)} tools: {tool_names}")
+                print(f"[RouterAgent] ✓ {name} server connected ({len(tool_names)} tools)")
 
             except FileNotFoundError as e:
-                print(f"[RouterAgent] ERROR: MCP server binary not found for {name}: {e}")
-                print(f"[RouterAgent] Make sure 'npx' is installed and @modelcontextprotocol/server-filesystem is available")
-                raise RuntimeError(f"Failed to start {name} MCP server: npx command not found. Install Node.js and npx.")
+                print(f"[RouterAgent] ERROR: MCP binary not found for {name}: {e}")
+                raise RuntimeError(
+                    f"Failed to start {name} MCP server: launcher not found. "
+                    f"Install it so '{name}-mcp' is on PATH or in ~/.local/bin."
+                )
 
             except Exception as e:
                 print(f"[RouterAgent] ERROR: Failed to connect to {name} server: {type(e).__name__}: {e}")
                 raise RuntimeError(f"Failed to connect to {name} MCP server: {str(e)}")
 
         print(f"[RouterAgent] All {len(self.sessions)} server(s) connected successfully")
-    
+
+    async def _index_and_pin_repos(self):
+        """
+        Incrementally (re)index this repository on each server and remember the
+        repo id each one assigns. This is driven by our own code - NOT exposed to
+        the model - so the model can only ever read the bot's own pinned index.
+
+        A server whose indexing fails contributes no tools (its repo stays
+        unpinned), so the help agent degrades gracefully to whatever is available.
+        """
+        # jcodemunch: structural code index over the whole project.
+        if "jcodemunch" in self.sessions:
+            try:
+                result = await self.sessions["jcodemunch"].call_tool("index_folder", {
+                    "path": BOT_CODE_DIR,
+                    "incremental": True,
+                    "use_ai_summaries": False,  # basic server only, no LLM calls
+                    "extra_ignore_patterns": [".bot_code_index/"],  # never index our own index
+                })
+                data = json.loads(self.tool_manager._format_result(result))
+                repo = data.get("repo")
+                if repo:
+                    self.repo_ids["jcodemunch"] = repo
+                    print(f"[RouterAgent] jcodemunch index ready: repo={repo} "
+                          f"symbols={data.get('symbol_count')}")
+            except Exception as e:
+                print(f"[RouterAgent] WARNING: jcodemunch indexing failed: {e}")
+
+        # jdocmunch: documentation index (README/TODO sections, etc.).
+        if "jdocmunch" in self.sessions:
+            try:
+                result = await self.sessions["jdocmunch"].call_tool("index_local", {
+                    "path": BOT_CODE_DIR,
+                    "incremental": True,
+                    "use_ai_summaries": False,
+                    "use_embeddings": False,
+                })
+                data = json.loads(self.tool_manager._format_result(result))
+                repo = data.get("repo") or data.get("name")
+                if repo:
+                    self.repo_ids["jdocmunch"] = repo
+                    print(f"[RouterAgent] jdocmunch index ready: repo={repo}")
+            except Exception as e:
+                print(f"[RouterAgent] WARNING: jdocmunch indexing failed: {e}")
+
+    def _sanitize_args(self, tool_name: str, server_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Make a tool call safe before it reaches an MCP server:
+
+        1. Override the `repo` argument with the pinned bot-repo id for that
+           server, so the model cannot read any other project's index.
+        2. Validate any filesystem-path argument against BOT_CODE_DIR. Escapes
+           (``../``, absolute paths outside the project) raise PermissionError.
+
+        Opaque ids (symbol_id, section ids) and glob patterns are left untouched.
+        """
+        safe = dict(args or {})
+
+        # (1) Pin the repo. Every allowlisted tool accepts a `repo` argument.
+        safe["repo"] = self.repo_ids[server_name]
+
+        # (2) Validate path-like arguments. validate_path raises on escape.
+        for key in _PATH_ARG_KEYS:
+            value = safe.get(key)
+            if isinstance(value, str) and value:
+                PATH_VALIDATOR.validate_path(value)
+        for key in _PATH_LIST_ARG_KEYS:
+            value = safe.get(key)
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, str) and item:
+                        PATH_VALIDATOR.validate_path(item)
+
+        return safe
+
+    async def _safe_execute(self, tool_name: str, raw_args: Dict[str, Any]) -> str:
+        """
+        Enforce the allowlist + sanitize args, then execute via the tool manager.
+        Returns a string result (or an error string the model can reason about).
+        """
+        server_name = self.tool_manager._tool_registry.get(tool_name)
+
+        # Defense in depth: even though we only advertise allowlisted tools, never
+        # execute one that isn't allowlisted or whose server has no pinned repo.
+        if tool_name not in ALLOWED_TOOLS or server_name not in self.repo_ids:
+            return f"Error: tool '{tool_name}' is not permitted in the help assistant."
+
+        try:
+            safe_args = self._sanitize_args(tool_name, server_name, raw_args)
+        except PermissionError as e:
+            print(f"[RouterAgent] BLOCKED unsafe path in {tool_name}: {e}")
+            return f"Access denied: {e}"
+
+        try:
+            return await self.tool_manager.execute_tool_call(tool_name, safe_args)
+        except Exception as e:
+            print(f"[RouterAgent] Tool {tool_name} failed: {e}")
+            return f"Error executing {tool_name}: {str(e)}"
+
+    def _advertised_tools(self, all_openai_tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Filter the servers' full tool catalog down to the read-only allowlist,
+        and only for servers whose repo we successfully pinned.
+        """
+        advertised = []
+        for tool in all_openai_tools:
+            name = tool.get("function", {}).get("name")
+            server = self.tool_manager._tool_registry.get(name)
+            if name in ALLOWED_TOOLS and server in self.repo_ids:
+                advertised.append(tool)
+        return advertised
+
     async def analyze(self, question: str, max_iterations: int = 10) -> str:
         """
-        Analyze codebase to answer a question.
-        Uses agentic loop with interleaved thinking.
+        Analyze the codebase to answer a question using an agentic tool loop.
 
         Args:
             question: User's question about a command
@@ -481,19 +735,19 @@ class RouterAgent:
             {"role": "user", "content": question}
         ]
 
-        # Collect all available tools from MCP servers
-        all_tools = []
+        # Discover tools from all servers, then restrict to the read-only allowlist.
         try:
-            for session_name, session in self.sessions.items():
-                response = await session.list_tools()
-                tool_names = [tool.name for tool in response.tools]
-                print(f"[RouterAgent] {session_name} server has {len(tool_names)} tools: {tool_names[:5]}...")
-                all_tools.extend([convert_tool_format(tool) for tool in response.tools])
-
-            print(f"[RouterAgent] Total tools available: {len(all_tools)}")
+            all_openai_tools = await self.tool_manager.get_all_openai_tools()
+            all_tools = self._advertised_tools(all_openai_tools)
+            print(f"[RouterAgent] Advertising {len(all_tools)} allowlisted tool(s) "
+                  f"from pinned repos: {self.repo_ids}")
         except Exception as e:
             print(f"[RouterAgent] ERROR: Failed to list tools: {e}")
-            return f"Error: Failed to access filesystem tools. {str(e)}"
+            return f"Error: Failed to access the code-intelligence tools. {str(e)}"
+
+        if not all_tools:
+            return ("Error: The code-intelligence index is unavailable right now, "
+                    "so I can't read the command's source code. Please try again later.")
 
         # Agentic loop - model can make multiple tool calls with reasoning
         iteration_count = 0
@@ -551,73 +805,24 @@ class RouterAgent:
                 if assistant_message.tool_calls:
                     print(f"[RouterAgent] Processing {len(assistant_message.tool_calls)} tool calls")
 
-                    # Execute each requested tool call
+                    # Execute each requested tool call through the security wrapper
+                    # (allowlist enforcement, repo pinning, path validation).
                     for tool_call in assistant_message.tool_calls:
                         tool_name = tool_call.function.name
                         tool_args = json.loads(tool_call.function.arguments or "{}")
 
                         print(f"[RouterAgent] Tool call: {tool_name}({tool_args})")
 
-                        # Find which server has this tool and execute it
-                        result = None
-                        last_error = None
-                        for session_name, session in self.sessions.items():
-                            try:
-                                result = await session.call_tool(tool_name, tool_args)
-                                print(f"[RouterAgent] Tool {tool_name} executed successfully via {session_name}")
-                                break
-                            except Exception as e:
-                                last_error = e
-                                print(f"[RouterAgent] Tool {tool_name} failed on {session_name}: {str(e)[:100]}")
-                                continue
+                        content_str = await self._safe_execute(tool_name, tool_args)
+                        print(f"[RouterAgent] Tool {tool_name} result: {len(content_str)} characters")
 
-                        # Convert MCP result to string format
-                        if result:
-                            if isinstance(result.content, list):
-                                content_str = "\n".join(
-                                    item.text if hasattr(item, 'text') else str(item)
-                                    for item in result.content
-                                )
-                            else:
-                                content_str = str(result.content)
-
-                            # CRITICAL FIX: Extract line range if requested
-                            # The MCP filesystem server returns the entire file, so we need to extract the lines
-                            if tool_name in ['read_text_file', 'read_file'] and ('start_line' in tool_args or 'end_line' in tool_args):
-                                start_line = int(tool_args.get('start_line', 1))
-                                end_line = int(tool_args.get('end_line', -1))
-
-                                lines = content_str.split('\n')
-                                if end_line == -1 or end_line > len(lines):
-                                    end_line = len(lines)
-
-                                # Extract the requested line range (1-indexed to 0-indexed)
-                                extracted_lines = lines[start_line-1:end_line]
-                                content_str = '\n'.join(extracted_lines)
-
-                                print(f"[RouterAgent] Extracted lines {start_line}-{end_line} ({len(extracted_lines)} lines, {len(content_str)} characters)")
-
-                            # Log result length
-                            print(f"[RouterAgent] Tool {tool_name} final result: {len(content_str)} characters")
-
-                            # Add tool result to conversation
-                            self.messages.append({
-                                "role": "tool",
-                                "tool_call_id": tool_call.id,
-                                "name": tool_name,
-                                "content": content_str
-                            })
-                        else:
-                            # Tool execution failed - provide detailed error
-                            error_msg = f"Error executing {tool_name}: {str(last_error) if last_error else 'Unknown error'}"
-                            print(f"[RouterAgent] {error_msg}")
-
-                            self.messages.append({
-                                "role": "tool",
-                                "tool_call_id": tool_call.id,
-                                "name": tool_name,
-                                "content": error_msg
-                            })
+                        # Add tool result to conversation
+                        self.messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "name": tool_name,
+                            "content": content_str,
+                        })
 
                     # Continue loop - model can reason about results and make more tool calls
                     continue
