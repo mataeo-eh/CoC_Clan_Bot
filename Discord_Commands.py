@@ -38,6 +38,14 @@ WAR_NUDGE_REASON_DESCRIPTIONS = {
     "no_attacks": "Members who have not used any attack yet.",
     "low_stars": "Members who attacked, but whose best attack is 0 or 1 star.",
 }
+# Automated nudges are stored as "minutes remaining in battle day" because the
+# Clash war payload exposes `end_time` as the battle-day end timestamp. Discord
+# selects support at most 25 options, so the UI presents these as two predefined
+# selectors while this canonical tuple defines every allowed stored value.
+AUTOMATED_WAR_NUDGE_INTERVAL_MINUTES = tuple(
+    list(range(23 * 60, 0, -60)) + [30, 15, 5]
+)
+MAX_AUTOMATED_WAR_NUDGE_TIMINGS = 5
 DEFAULT_EVENT_DEFINITIONS: "OrderedDict[str, Dict[str, str]]" = OrderedDict(
     [
         ("clan_games", {"label": "Clan Games", "role_name": "Clan Games Alerts"}),
@@ -247,6 +255,71 @@ def _find_alert_channel(guild: discord.Guild) -> Optional[discord.TextChannel]:
     return None
 
 
+def _bot_can_send_to_channel(guild: discord.Guild, channel: discord.TextChannel) -> bool:
+    """Return True when the bot can post automated messages in a text channel."""
+    bot_member = guild.me
+    return bot_member is not None and channel.permissions_for(bot_member).send_messages
+
+
+def _user_can_configure_channel(user: Any, channel: discord.TextChannel) -> bool:
+    """Return True when the configuring user can see the selected destination."""
+    if not isinstance(user, discord.Member):
+        return False
+    return channel.permissions_for(user).view_channel
+
+
+def _resolve_war_automation_channel(
+    guild: discord.Guild,
+    channel_id: Any,
+) -> Optional[discord.TextChannel]:
+    """Resolve a stored automation channel ID if the bot can still send there."""
+    if not isinstance(channel_id, int):
+        return None
+    channel = guild.get_channel(channel_id)
+    if not isinstance(channel, discord.TextChannel):
+        return None
+    if not _bot_can_send_to_channel(guild, channel):
+        return None
+    return channel
+
+
+def _resolve_alert_destination_channel(
+    guild: discord.Guild,
+    clan_name: str,
+    alerts_cfg: Dict[str, Any],
+    default_channel: Optional[discord.TextChannel],
+) -> Optional[discord.TextChannel]:
+    """Resolve the same destination used by the war alert watchdog."""
+    channel_id = alerts_cfg.get("channel_id")
+    if channel_id:
+        candidate = guild.get_channel(channel_id)
+        if not isinstance(candidate, discord.TextChannel):
+            log.debug(
+                "Skipping alerts for %s in guild %s: stored channel missing",
+                clan_name,
+                guild.id,
+            )
+            return None
+        if not _bot_can_send_to_channel(guild, candidate):
+            log.debug(
+                "Skipping alerts for %s in guild %s: insufficient permissions for channel %s",
+                clan_name,
+                guild.id,
+                candidate.id,
+            )
+            return None
+        return candidate
+
+    if default_channel is None:
+        log.debug(
+            "Skipping alerts for %s in guild %s: no default channel available",
+            clan_name,
+            guild.id,
+        )
+        return None
+    return default_channel
+
+
 async def send_channel_message(channel: discord.TextChannel, content: str) -> None:
     """Post text content to a channel, splitting when Discord's limit is exceeded."""
     log.debug("send_channel_message called")
@@ -352,6 +425,85 @@ def _elapsed_within_window(value: Optional[float], *, target: float) -> bool:
     if value < target:
         return False
     return (value - target) <= ALERT_WINDOW_SECONDS
+
+
+def _format_war_nudge_interval(minutes: int) -> str:
+    """Render a configured nudge offset as a compact, human-readable label."""
+    if minutes >= 60 and minutes % 60 == 0:
+        hours = minutes // 60
+        return f"{hours} hour{'s' if hours != 1 else ''} remaining"
+    return f"{minutes} minutes remaining"
+
+
+def _normalise_war_nudge_automation_offsets(raw_offsets: Any) -> List[int]:
+    """Validate and sort automated nudge offsets from persisted config or UI input.
+
+    Stored config is considered external data: each entry must be one of the
+    predefined minute offsets, duplicates are ignored, and the first five valid
+    values in canonical countdown order are kept.
+    """
+    if not isinstance(raw_offsets, list):
+        return []
+
+    allowed = set(AUTOMATED_WAR_NUDGE_INTERVAL_MINUTES)
+    selected: Set[int] = set()
+    for value in raw_offsets:
+        if isinstance(value, int):
+            candidate = value
+        elif isinstance(value, str) and value.isdigit():
+            candidate = int(value)
+        else:
+            continue
+        if candidate in allowed:
+            selected.add(candidate)
+
+    ordered = [
+        minutes
+        for minutes in AUTOMATED_WAR_NUDGE_INTERVAL_MINUTES
+        if minutes in selected
+    ]
+    return ordered[:MAX_AUTOMATED_WAR_NUDGE_TIMINGS]
+
+
+def _war_timing_snapshot(
+    tag: str,
+    war: coc.wars.ClanWar,
+    now: datetime,
+) -> Dict[str, Any]:
+    """Build the shared timing snapshot used by war alerts and automated nudges.
+
+    coc.py documents `start_time` as the battle-day start and `end_time` as the
+    battle-day end. This helper centralises conversion to UTC-aware datetimes and
+    exposes seconds remaining/elapsed fields so watchdog consumers do not repeat
+    timestamp logic or infer timing indirectly.
+    """
+    state_value = war.state.value if hasattr(war.state, "value") else war.state
+    war_tag = war.war_tag or tag
+    start_dt = _timestamp_to_datetime(war.start_time)
+    end_dt = _timestamp_to_datetime(war.end_time)
+    if start_dt and start_dt.tzinfo is None:
+        start_dt = start_dt.replace(tzinfo=timezone.utc)
+    if end_dt and end_dt.tzinfo is None:
+        end_dt = end_dt.replace(tzinfo=timezone.utc)
+
+    return {
+        "state": state_value,
+        "war_tag": war_tag,
+        "start_dt": start_dt,
+        "end_dt": end_dt,
+        "start_seconds_remaining": (
+            (start_dt - now).total_seconds() if start_dt is not None else None
+        ),
+        "end_seconds_remaining": (
+            (end_dt - now).total_seconds() if end_dt is not None else None
+        ),
+        "seconds_since_start": (
+            (now - start_dt).total_seconds() if start_dt is not None else None
+        ),
+        "seconds_since_end": (
+            (now - end_dt).total_seconds() if end_dt is not None else None
+        ),
+    }
 
 
 def _normalise_player_tag(raw_tag: str) -> Optional[str]:
@@ -1541,11 +1693,7 @@ async def war_nudge(interaction: discord.Interaction, clan_name: str, reason_nam
         return
 
     reasons = clan_entry.get("war_nudge", {}).get("reasons", [])
-    selected_reason = None
-    for reason in reasons:
-        if reason.get("name", "").lower() == reason_name.lower():
-            selected_reason = reason
-            break
+    selected_reason = _find_war_nudge_reason(reasons, reason_name)
 
     if selected_reason is None:
         await send_text_response(
@@ -1599,80 +1747,40 @@ async def war_nudge(interaction: discord.Interaction, clan_name: str, reason_nam
         )
         return
 
-    reason_type = selected_reason.get("type")
-    if reason_type not in WAR_NUDGE_REASONS:
+    content, status = _build_war_nudge_content(
+        interaction.guild,
+        clan_name,
+        reason_name,
+        selected_reason,
+        war,
+    )
+    if content is None:
+        prefix = "✅" if status.startswith("Everyone is on track") else "⚠️"
         await send_text_response(
             interaction,
-            "⚠️ This reason was saved with an unsupported type. Please reconfigure it.",
+            f"{prefix} {status}",
             ephemeral=True,
         )
         return
-
-    targets = _collect_war_nudge_targets(war, reason_type)
-    if not targets:
-        await send_text_response(
-            interaction,
-            "✅ Everyone is on track—no nudge required for that reason.",
-            ephemeral=True,
-        )
-        return
-
-    lines = []
-    for member, info in targets:
-        tag = getattr(member, "tag", None)
-        name = getattr(member, "name", "Unknown")
-        discord_ping = _lookup_member_mention_by_tag(interaction.guild, tag) if tag else None
-        normalised_tag = _normalise_player_tag(tag) if isinstance(tag, str) else None
-        if discord_ping is None:
-            log.info(
-                "war_nudge target has no linked Discord mention: guild=%s clan=%s reason=%s player_name=%s raw_tag=%s normalised_tag=%s known_linked_tags=%s",
-                interaction.guild.id,
-                clan_name,
-                reason_name,
-                name,
-                tag,
-                normalised_tag,
-                _linked_player_tags_for_guild(interaction.guild),
-            )
-        else:
-            log.debug(
-                "war_nudge target linked Discord mention found: guild=%s clan=%s reason=%s player_name=%s raw_tag=%s normalised_tag=%s mention=%s",
-                interaction.guild.id,
-                clan_name,
-                reason_name,
-                name,
-                tag,
-                normalised_tag,
-                discord_ping,
-            )
-        ping_suffix = f" {discord_ping}" if discord_ping else ""
-        if reason_type == "unused_attacks":
-            lines.append(
-                f"• {name} — {info.get('remaining', '?')} attack(s) remaining.{ping_suffix}"
-            )
-        elif reason_type == "no_attacks":
-            lines.append(
-                f"• {name} — has not attacked yet.{ping_suffix}"
-            )
-        elif reason_type == "low_stars":
-            lines.append(
-                f"• {name} — best attack {info.get('best_stars', 0)}⭐ ({info.get('used', 0)} attempt(s)).{ping_suffix}"
-            )
-
-    mention_prefix = _build_reason_mention(interaction.guild, selected_reason)
-    description = selected_reason.get("description") or ""
-    header_parts = [
-        part for part in [mention_prefix, f"Nudge for `{clan_name}` — {selected_reason.get('name', 'Unnamed')}"] if part
-    ]
-    if description:
-        header_parts.append(description)
-    content = "\n".join(header_parts + [""] + lines)
 
     await send_text_response(
         interaction,
         content,
         ephemeral=False,
     )
+    diagnostic_content = _build_war_nudge_diagnostic_content(
+        interaction.guild,
+        clan_name,
+        reason_name,
+        selected_reason,
+        war,
+    )
+    if diagnostic_content:
+        await send_text_response(
+            interaction,
+            diagnostic_content,
+            ephemeral=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -3580,6 +3688,19 @@ def _ensure_guild_config(guild_id: int) -> Dict[str, Any]:
         war_nudge = clan_data.setdefault("war_nudge", {})
         if not isinstance(war_nudge.get("reasons"), list):
             war_nudge["reasons"] = []
+        else:
+            for reason in war_nudge["reasons"]:
+                if not isinstance(reason, dict):
+                    continue
+                offsets = _normalise_war_nudge_automation_offsets(
+                    reason.get("automation_offsets")
+                )
+                reason["automation_offsets"] = offsets
+                reason["automation_enabled"] = bool(
+                    reason.get("automation_enabled") and offsets
+                )
+                channel_id = reason.get("automation_channel_id")
+                reason["automation_channel_id"] = channel_id if isinstance(channel_id, int) else None
         donation_tracking = clan_data.setdefault("donation_tracking", {})
         metrics = donation_tracking.setdefault("metrics", {})
         metrics.setdefault("top_donors", True)
@@ -3804,6 +3925,135 @@ def _collect_war_nudge_targets(
     return targets
 
 
+def _find_war_nudge_reason(
+    reasons: Iterable[Dict[str, Any]],
+    reason_name: str,
+) -> Optional[Dict[str, Any]]:
+    """Resolve a configured nudge reason by case-insensitive display name."""
+    for reason in reasons:
+        if not isinstance(reason, dict):
+            continue
+        stored_name = reason.get("name")
+        if isinstance(stored_name, str) and stored_name.casefold() == reason_name.casefold():
+            return reason
+    return None
+
+
+def _build_war_nudge_content(
+    guild: discord.Guild,
+    clan_name: str,
+    reason_name: str,
+    selected_reason: Dict[str, Any],
+    war: coc.wars.ClanWar,
+) -> Tuple[Optional[str], str]:
+    """Render the public `/war_nudge` message for command and automation callers.
+
+    The returned status explains why no public message should be sent. Automated
+    callers log that status, while slash command callers show it ephemerally.
+    """
+    reason_type = selected_reason.get("type")
+    if reason_type not in WAR_NUDGE_REASONS:
+        return None, "This reason was saved with an unsupported type. Please reconfigure it."
+
+    targets = _collect_war_nudge_targets(war, reason_type)
+    if not targets:
+        return None, "Everyone is on track—no nudge required for that reason."
+
+    lines = []
+    for member, info in targets:
+        tag = getattr(member, "tag", None)
+        name = getattr(member, "name", "Unknown")
+        discord_ping = _lookup_member_mention_by_tag(guild, tag) if tag else None
+        normalised_tag = _normalise_player_tag(tag) if isinstance(tag, str) else None
+        if discord_ping is None:
+            log.info(
+                "war_nudge target has no linked Discord mention: guild=%s clan=%s reason=%s player_name=%s raw_tag=%s normalised_tag=%s known_linked_tags=%s",
+                guild.id,
+                clan_name,
+                reason_name,
+                name,
+                tag,
+                normalised_tag,
+                _linked_player_tags_for_guild(guild),
+            )
+        else:
+            log.debug(
+                "war_nudge target linked Discord mention found: guild=%s clan=%s reason=%s player_name=%s raw_tag=%s normalised_tag=%s mention=%s",
+                guild.id,
+                clan_name,
+                reason_name,
+                name,
+                tag,
+                normalised_tag,
+                discord_ping,
+            )
+        ping_suffix = f" {discord_ping}" if discord_ping else ""
+        if reason_type == "unused_attacks":
+            lines.append(
+                f"• {name} — {info.get('remaining', '?')} attack(s) remaining.{ping_suffix}"
+            )
+        elif reason_type == "no_attacks":
+            lines.append(
+                f"• {name} — has not attacked yet.{ping_suffix}"
+            )
+        elif reason_type == "low_stars":
+            lines.append(
+                f"• {name} — best attack {info.get('best_stars', 0)}⭐ ({info.get('used', 0)} attempt(s)).{ping_suffix}"
+            )
+
+    mention_prefix = _build_reason_mention(guild, selected_reason)
+    description = selected_reason.get("description") or ""
+    header_parts = [
+        part for part in [mention_prefix, f"Nudge for `{clan_name}` — {selected_reason.get('name', 'Unnamed')}"] if part
+    ]
+    if description:
+        header_parts.append(description)
+    return "\n".join(header_parts + [""] + lines), "sent"
+
+
+def _build_war_nudge_diagnostic_content(
+    guild: discord.Guild,
+    clan_name: str,
+    reason_name: str,
+    selected_reason: Dict[str, Any],
+    war: coc.wars.ClanWar,
+) -> Optional[str]:
+    """Render a private diagnostic summary of war nudge tag/link matching."""
+    reason_type = selected_reason.get("type")
+    if reason_type not in WAR_NUDGE_REASONS:
+        return None
+
+    targets = _collect_war_nudge_targets(war, reason_type)
+    if not targets:
+        return None
+
+    linked_tags = _linked_player_tags_for_guild(guild)
+    lines = [
+        f"**War nudge diagnostics — `{clan_name}` / `{reason_name}`**",
+        "These are private to you. They show the actual war roster tags used for Discord-link matching.",
+        "",
+        "**Targets:**",
+    ]
+    for member, _ in targets:
+        name = getattr(member, "name", "Unknown")
+        raw_tag = getattr(member, "tag", None)
+        normalised_tag = _normalise_player_tag(raw_tag) if isinstance(raw_tag, str) else None
+        discord_ping = _lookup_member_mention_by_tag(guild, raw_tag) if raw_tag else None
+        link_status = "linked mention found" if discord_ping else "no linked mention found"
+        lines.append(
+            f"- {name}: raw tag `{raw_tag or 'missing'}`, normalised `{normalised_tag or 'missing'}` — {link_status}"
+        )
+
+    linked_summary = ", ".join(f"`{tag}`" for tag in linked_tags) if linked_tags else "None"
+    lines.extend(
+        [
+            "",
+            f"Known linked tags in this server: {linked_summary}",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def _lookup_member_by_tag(
     guild: discord.Guild,
     tag: str,
@@ -3921,31 +4171,17 @@ def _collect_war_alerts(
 ) -> List[str]:
     """Determine which alerts should fire for the current war snapshot."""
     log.debug("_collect_war_alerts invoked")
-    state_value_str = war.state.value if hasattr(war.state, 'value') else war.state
+    timing = _war_timing_snapshot(tag, war, now)
+    state_value_str = timing["state"]
     if state_value_str in {'notInWar', 'inMatchmaking'}:
         return []
 
     messages: List[str] = []  # Collected alert strings to return
-    war_tag = war.war_tag or tag
-    start_dt = _timestamp_to_datetime(war.start_time)
-    end_dt = _timestamp_to_datetime(war.end_time)
-    if start_dt and start_dt.tzinfo is None:
-        start_dt = start_dt.replace(tzinfo=timezone.utc)
-    if end_dt and end_dt.tzinfo is None:
-        end_dt = end_dt.replace(tzinfo=timezone.utc)
-
-    start_seconds_remaining = (
-        (start_dt - now).total_seconds() if start_dt is not None else None
-    )
-    end_seconds_remaining = (
-        (end_dt - now).total_seconds() if end_dt is not None else None
-    )
-    seconds_since_start = (
-        (now - start_dt).total_seconds() if start_dt is not None else None
-    )
-    seconds_since_end = (
-        (now - end_dt).total_seconds() if end_dt is not None else None
-    )
+    war_tag = timing["war_tag"]
+    start_seconds_remaining = timing["start_seconds_remaining"]
+    end_seconds_remaining = timing["end_seconds_remaining"]
+    seconds_since_start = timing["seconds_since_start"]
+    seconds_since_end = timing["seconds_since_end"]
 
     def queue(alert_id: str, text: str) -> None:
         """Queue alert text when it has not already been sent."""
@@ -3985,6 +4221,112 @@ def _collect_war_alerts(
             )
 
     return messages
+
+
+def _has_enabled_automated_war_nudges(clan_data: Dict[str, Any]) -> bool:
+    """Return True when at least one configured nudge has active timings."""
+    war_nudge = clan_data.get("war_nudge", {})
+    if not isinstance(war_nudge, dict):
+        return False
+    reasons = war_nudge.get("reasons", [])
+    if not isinstance(reasons, list):
+        return False
+    for reason in reasons:
+        if not isinstance(reason, dict):
+            continue
+        offsets = _normalise_war_nudge_automation_offsets(reason.get("automation_offsets"))
+        if reason.get("automation_enabled") and offsets:
+            return True
+    return False
+
+
+async def _send_due_automated_war_nudges(
+    guild: discord.Guild,
+    fallback_channel: Optional[discord.TextChannel],
+    clan_name: str,
+    tag: str,
+    clan_data: Dict[str, Any],
+    war: coc.wars.ClanWar,
+    now: datetime,
+) -> None:
+    """Send configured nudge messages whose battle-end thresholds are due.
+
+    The same `alert_state` dictionary used by war alerts records automated
+    nudge alert IDs. That gives every configured reason/timing one send per
+    guild, clan, and war tag without introducing a second scheduler state store.
+    """
+    timing = _war_timing_snapshot(tag, war, now)
+    state_value_str = timing["state"]
+    if state_value_str != "inWar":
+        return
+
+    end_seconds_remaining = timing["end_seconds_remaining"]
+    war_tag = timing["war_tag"]
+    war_nudge = clan_data.get("war_nudge", {})
+    if not isinstance(war_nudge, dict):
+        return
+    reasons = war_nudge.get("reasons", [])
+    if not isinstance(reasons, list):
+        return
+
+    for reason in reasons:
+        if not isinstance(reason, dict) or not reason.get("automation_enabled"):
+            continue
+        reason_name = reason.get("name")
+        if not isinstance(reason_name, str) or not reason_name.strip():
+            continue
+        destination_channel = (
+            _resolve_war_automation_channel(guild, reason.get("automation_channel_id"))
+            or fallback_channel
+        )
+        if destination_channel is None:
+            log.info(
+                "Automated war nudge skipped with no destination: guild=%s clan=%s reason=%s",
+                guild.id,
+                clan_name,
+                reason_name,
+            )
+            continue
+
+        offsets = _normalise_war_nudge_automation_offsets(reason.get("automation_offsets"))
+        for minutes_remaining in offsets:
+            threshold_seconds = minutes_remaining * 60
+            if not _within_threshold_window(
+                end_seconds_remaining,
+                threshold=threshold_seconds,
+            ):
+                continue
+
+            alert_id = f"war_nudge:{reason_name.casefold()}:{minutes_remaining}m"
+            if not _mark_alert_sent(guild.id, clan_name, war_tag, alert_id):
+                continue
+
+            content, status = _build_war_nudge_content(
+                guild,
+                clan_name,
+                reason_name,
+                reason,
+                war,
+            )
+            if content is None:
+                log.info(
+                    "Automated war nudge skipped: guild=%s clan=%s reason=%s timing=%s status=%s",
+                    guild.id,
+                    clan_name,
+                    reason_name,
+                    _format_war_nudge_interval(minutes_remaining),
+                    status,
+                )
+                continue
+
+            log.info(
+                "Sending automated war nudge: guild=%s clan=%s reason=%s timing=%s",
+                guild.id,
+                clan_name,
+                reason_name,
+                _format_war_nudge_interval(minutes_remaining),
+            )
+            await send_channel_message(destination_channel, content)
 
 
 
@@ -4759,38 +5101,19 @@ async def war_alert_loop() -> None:
                 continue
 
             alerts_cfg = clan_data.get("alerts", {}) if isinstance(clan_data.get("alerts", {}), dict) else {}
-            if not alerts_cfg.get("enabled", True):
-                continue  # Admins disabled tracking for this clan
+            alerts_enabled = bool(alerts_cfg.get("enabled", True))
+            automated_nudges_enabled = _has_enabled_automated_war_nudges(clan_data)
+            if not alerts_enabled and not automated_nudges_enabled:
+                continue  # Nothing needs the active-war watchdog for this clan
 
-            target_channel: Optional[discord.TextChannel]
-            channel_id = alerts_cfg.get("channel_id")
-            if channel_id:
-                candidate = guild.get_channel(channel_id)
-                if not isinstance(candidate, discord.TextChannel):
-                    log.debug(
-                        "Skipping alerts for %s in guild %s: stored channel missing",
-                        clan_name,
-                        guild.id,
-                    )
-                    continue
-                if guild.me is None or not candidate.permissions_for(guild.me).send_messages:
-                    log.debug(
-                        "Skipping alerts for %s in guild %s: insufficient permissions for channel %s",
-                        clan_name,
-                        guild.id,
-                        candidate.id,
-                    )
-                    continue
-                target_channel = candidate
-            else:
-                target_channel = default_channel
-                if target_channel is None:
-                    log.debug(
-                        "Skipping alerts for %s in guild %s: no default channel available",
-                        clan_name,
-                        guild.id,
-                    )
-                    continue
+            alert_target_channel = _resolve_alert_destination_channel(
+                guild,
+                clan_name,
+                alerts_cfg,
+                default_channel,
+            )
+            if alert_target_channel is None and not automated_nudges_enabled:
+                continue
 
             try:
                 war = await client.get_active_war_raw(tag)
@@ -4806,8 +5129,19 @@ async def war_alert_loop() -> None:
                 continue
 
             _prune_war_alert_state_for_clan(guild.id, clan_name, getattr(war, "war_tag", None) or tag)
-            for alert in _collect_war_alerts(guild, clan_name, tag, war, alert_role, now):
-                await send_channel_message(target_channel, alert)
+            if alerts_enabled and alert_target_channel is not None:
+                for alert in _collect_war_alerts(guild, clan_name, tag, war, alert_role, now):
+                    await send_channel_message(alert_target_channel, alert)
+            if automated_nudges_enabled:
+                await _send_due_automated_war_nudges(
+                    guild,
+                    alert_target_channel,
+                    clan_name,
+                    tag,
+                    clan_data,
+                    war,
+                    now,
+                )
 
         if guild_id in _dirty_war_alert_state_guilds:
             if _persist_war_alert_state_for_guild(guild_id):
@@ -10574,25 +10908,39 @@ class WarNudgeMemberSelect(discord.ui.UserSelect):
 class WarNudgeTargetModeButton(discord.ui.Button):
     """Button for switching between role and member target editors."""
 
-    def __init__(self, parent_view: "WarNudgeConfigView", target_mode: str):
-        label = "Role Target" if target_mode == "role" else "Member Target"
-        style = (
-            discord.ButtonStyle.primary
-            if parent_view.target_mode == target_mode
-            else discord.ButtonStyle.secondary
-        )
-        super().__init__(label=label, style=style, row=3)
+    def __init__(self, parent_view: "WarNudgeConfigView"):
+        next_mode = "member" if parent_view.target_mode == "role" else "role"
+        label = "Target: Role" if parent_view.target_mode == "role" else "Target: Member"
+        super().__init__(label=label, style=discord.ButtonStyle.secondary, row=3)
         self.parent_view = parent_view
-        self.target_mode = target_mode
-        self.disabled = parent_view.target_mode == target_mode
+        self.next_mode = next_mode
 
     async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
-        self.parent_view.target_mode = self.target_mode
+        self.parent_view.target_mode = self.next_mode
         self.parent_view.refresh_components()
         self.parent_view.message = interaction.message
         await interaction.response.edit_message(
             content=self.parent_view.render_message(),
             view=self.parent_view,
+        )
+
+
+class WarNudgeAutomationButton(discord.ui.Button):
+    """Button that opens automated nudge timing controls."""
+
+    def __init__(self, parent_view: "WarNudgeConfigView"):
+        label = "Automation: On" if parent_view.selected_automation_enabled else "Automation: Off"
+        style = discord.ButtonStyle.success if parent_view.selected_automation_enabled else discord.ButtonStyle.secondary
+        super().__init__(label=label, style=style, row=3)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        self.parent_view.message = interaction.message
+        view = WarNudgeAutomationView(self.parent_view)
+        await interaction.response.send_message(
+            view.render_message(),
+            ephemeral=True,
+            view=view,
         )
 
 
@@ -10613,6 +10961,12 @@ class SaveWarNudgeButton(discord.ui.Button):
         if not (self.parent_view.selected_role_id or self.parent_view.selected_user_id):
             await interaction.response.send_message(
                 "⚠️ Please choose at least one role or member to mention.",
+                ephemeral=True,
+            )
+            return
+        if self.parent_view.selected_automation_enabled and not self.parent_view.selected_automation_offsets:
+            await interaction.response.send_message(
+                "⚠️ Choose at least one automation timing, or turn automation off.",
                 ephemeral=True,
             )
             return
@@ -10653,6 +11007,246 @@ class ListWarNudgeButton(discord.ui.Button):
         await self.parent_view.send_reason_list(interaction)
 
 
+class WarNudgeAutomationHourSelect(discord.ui.Select):
+    """Multi-select for hourly automated nudge timings."""
+
+    def __init__(self, parent_view: "WarNudgeAutomationView"):
+        self.parent_view = parent_view
+        options = [
+            discord.SelectOption(
+                label=_format_war_nudge_interval(minutes),
+                value=str(minutes),
+                default=minutes in parent_view.config_view.selected_automation_offsets,
+            )
+            for minutes in AUTOMATED_WAR_NUDGE_INTERVAL_MINUTES
+            if minutes >= 60
+        ]
+        super().__init__(
+            placeholder="Hourly timings",
+            min_values=0,
+            max_values=MAX_AUTOMATED_WAR_NUDGE_TIMINGS,
+            options=options,
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        await self.parent_view.update_offsets(interaction, hourly_values=self.values)
+
+
+class WarNudgeAutomationMinuteSelect(discord.ui.Select):
+    """Multi-select for sub-hour automated nudge timings."""
+
+    def __init__(self, parent_view: "WarNudgeAutomationView"):
+        self.parent_view = parent_view
+        options = [
+            discord.SelectOption(
+                label=_format_war_nudge_interval(minutes),
+                value=str(minutes),
+                default=minutes in parent_view.config_view.selected_automation_offsets,
+            )
+            for minutes in AUTOMATED_WAR_NUDGE_INTERVAL_MINUTES
+            if minutes < 60
+        ]
+        super().__init__(
+            placeholder="Sub-hour timings",
+            min_values=0,
+            max_values=len(options),
+            options=options,
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        await self.parent_view.update_offsets(interaction, minute_values=self.values)
+
+
+class WarNudgeAutomationChannelSelect(discord.ui.ChannelSelect):
+    """Channel selector for automated war nudge delivery."""
+
+    def __init__(self, parent_view: "WarNudgeAutomationView"):
+        self.parent_view = parent_view
+        default_values = []
+        channel_id = parent_view.config_view.selected_automation_channel_id
+        if channel_id is not None:
+            channel = parent_view.config_view.guild.get_channel(channel_id)
+            if isinstance(channel, discord.TextChannel):
+                default_values = [channel]
+        super().__init__(
+            placeholder="Nudge channel (blank uses war alert/default channel)",
+            min_values=0,
+            max_values=1,
+            channel_types=[discord.ChannelType.text],
+            default_values=default_values,
+            row=2,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        channel = self.values[0] if self.values else None
+        if channel is not None and not isinstance(channel, discord.TextChannel):
+            await interaction.response.send_message(
+                "⚠️ Choose a text channel for automated nudges.",
+                ephemeral=True,
+            )
+            return
+        if isinstance(channel, discord.TextChannel):
+            if not _bot_can_send_to_channel(self.parent_view.config_view.guild, channel):
+                await interaction.response.send_message(
+                    "⚠️ I cannot send messages in that channel. Please choose another channel.",
+                    ephemeral=True,
+                )
+                return
+            if not _user_can_configure_channel(interaction.user, channel):
+                await interaction.response.send_message(
+                    "⚠️ You need access to that channel before using it for automated nudges.",
+                    ephemeral=True,
+                )
+                return
+            self.parent_view.config_view.selected_automation_channel_id = channel.id
+        else:
+            self.parent_view.config_view.selected_automation_channel_id = None
+        await self.parent_view.refresh(interaction)
+
+
+class WarNudgeAutomationToggleButton(discord.ui.Button):
+    """Button that toggles automated sending for the selected reason."""
+
+    def __init__(self, parent_view: "WarNudgeAutomationView"):
+        label = "Turn Off" if parent_view.config_view.selected_automation_enabled else "Turn On"
+        style = discord.ButtonStyle.danger if parent_view.config_view.selected_automation_enabled else discord.ButtonStyle.success
+        super().__init__(label=label, style=style, row=3)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        self.parent_view.config_view.selected_automation_enabled = (
+            not self.parent_view.config_view.selected_automation_enabled
+        )
+        await self.parent_view.refresh(interaction)
+
+
+class WarNudgeAutomationClearChannelButton(discord.ui.Button):
+    """Button that clears the per-reason automation channel override."""
+
+    def __init__(self, parent_view: "WarNudgeAutomationView"):
+        super().__init__(
+            label="Clear Channel",
+            style=discord.ButtonStyle.secondary,
+            row=3,
+            disabled=parent_view.config_view.selected_automation_channel_id is None,
+        )
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        self.parent_view.config_view.selected_automation_channel_id = None
+        await self.parent_view.refresh(interaction)
+
+
+class WarNudgeAutomationDoneButton(discord.ui.Button):
+    """Button that closes the automation editor after staging changes."""
+
+    def __init__(self, parent_view: "WarNudgeAutomationView"):
+        super().__init__(label="Done", style=discord.ButtonStyle.primary, row=3)
+        self.parent_view = parent_view
+
+    async def callback(self, interaction: discord.Interaction) -> None:  # type: ignore[override]
+        await self.parent_view.refresh_parent_config_message()
+        await interaction.response.edit_message(
+            content="Automation settings staged. Use **Save Reason** to persist them.",
+            view=None,
+        )
+
+
+class WarNudgeAutomationView(discord.ui.View):
+    """Ephemeral editor for automated nudge timing fields."""
+
+    def __init__(self, config_view: "WarNudgeConfigView", *, timeout: float = 300):
+        super().__init__(timeout=timeout)
+        self.config_view = config_view
+        self.refresh_components()
+
+    def refresh_components(self) -> None:
+        self.clear_items()
+        self.add_item(WarNudgeAutomationHourSelect(self))
+        self.add_item(WarNudgeAutomationMinuteSelect(self))
+        self.add_item(WarNudgeAutomationChannelSelect(self))
+        self.add_item(WarNudgeAutomationToggleButton(self))
+        self.add_item(WarNudgeAutomationClearChannelButton(self))
+        self.add_item(WarNudgeAutomationDoneButton(self))
+
+    def render_message(self) -> str:
+        offsets = self.config_view.selected_automation_offsets
+        if offsets:
+            timings = ", ".join(_format_war_nudge_interval(value) for value in offsets)
+        else:
+            timings = "_No timings selected_"
+        channel = None
+        channel_id = self.config_view.selected_automation_channel_id
+        if channel_id is not None:
+            candidate = self.config_view.guild.get_channel(channel_id)
+            if isinstance(candidate, discord.TextChannel):
+                channel = candidate
+        channel_summary = channel.mention if channel is not None else "War alert/default channel"
+        state = "ON" if self.config_view.selected_automation_enabled else "OFF"
+        return (
+            f"**Automate nudge:** `{state}`\n"
+            f"**Selected timings:** {timings}\n"
+            f"**Destination:** {channel_summary}\n"
+            f"Choose up to {MAX_AUTOMATED_WAR_NUDGE_TIMINGS} timings, then save the reason."
+        )
+
+    async def refresh_parent_config_message(self) -> None:
+        self.config_view.refresh_components()
+        if self.config_view.message is None:
+            return
+        try:
+            await self.config_view.message.edit(
+                content=self.config_view.render_message(),
+                view=self.config_view,
+            )
+        except discord.HTTPException as exc:
+            log.warning("Failed to refresh configure_war_nudge automation summary: %s", exc)
+
+    async def refresh(self, interaction: discord.Interaction) -> None:
+        self.refresh_components()
+        await self.refresh_parent_config_message()
+        await interaction.response.edit_message(
+            content=self.render_message(),
+            view=self,
+        )
+
+    async def update_offsets(
+        self,
+        interaction: discord.Interaction,
+        *,
+        hourly_values: Optional[List[str]] = None,
+        minute_values: Optional[List[str]] = None,
+    ) -> None:
+        current_hourly = [
+            value
+            for value in self.config_view.selected_automation_offsets
+            if value >= 60
+        ]
+        current_minutes = [
+            value
+            for value in self.config_view.selected_automation_offsets
+            if value < 60
+        ]
+        if hourly_values is not None:
+            current_hourly = [int(value) for value in hourly_values if value.isdigit()]
+        if minute_values is not None:
+            current_minutes = [int(value) for value in minute_values if value.isdigit()]
+
+        combined = _normalise_war_nudge_automation_offsets(current_hourly + current_minutes)
+        unique_requested = set(current_hourly + current_minutes)
+        if len(unique_requested) > MAX_AUTOMATED_WAR_NUDGE_TIMINGS:
+            await interaction.response.send_message(
+                f"⚠️ Select no more than {MAX_AUTOMATED_WAR_NUDGE_TIMINGS} automation timings.",
+                ephemeral=True,
+            )
+            return
+
+        self.config_view.selected_automation_offsets = combined
+        await self.refresh(interaction)
+
+
 class WarNudgeConfigView(discord.ui.View):
     """Interactive interface for managing war nudge reasons."""
 
@@ -10667,6 +11261,9 @@ class WarNudgeConfigView(discord.ui.View):
         self.selected_role_id: Optional[int] = None
         self.selected_user_id: Optional[int] = None
         self.selected_description: str = ""
+        self.selected_automation_enabled = False
+        self.selected_automation_offsets: List[int] = []
+        self.selected_automation_channel_id: Optional[int] = None
         self.target_mode = "role"
         self.pending_reason_name: Optional[str] = None
         self.pending_reason_description: Optional[str] = None
@@ -10689,12 +11286,23 @@ class WarNudgeConfigView(discord.ui.View):
                 self.selected_role_id = None
                 self.selected_user_id = None
                 self.selected_description = ""
+                self.selected_automation_enabled = False
+                self.selected_automation_offsets = []
+                self.selected_automation_channel_id = None
                 self.target_mode = "role"
             else:
                 self.selected_reason_type = matched.get("type", WAR_NUDGE_REASONS[0])
                 self.selected_role_id = matched.get("mention_role_id")
                 self.selected_user_id = matched.get("mention_user_id")
                 self.selected_description = matched.get("description", "")
+                self.selected_automation_offsets = _normalise_war_nudge_automation_offsets(
+                    matched.get("automation_offsets")
+                )
+                self.selected_automation_enabled = bool(
+                    matched.get("automation_enabled") and self.selected_automation_offsets
+                )
+                channel_id = matched.get("automation_channel_id")
+                self.selected_automation_channel_id = channel_id if isinstance(channel_id, int) else None
                 if self.selected_user_id and not self.selected_role_id:
                     self.target_mode = "member"
                 else:
@@ -10714,8 +11322,8 @@ class WarNudgeConfigView(discord.ui.View):
         self.add_item(WarNudgeClanSelect(self, clan_map))
         self.add_item(WarNudgeReasonSelect(self, reasons))
         self.add_item(WarNudgeTypeSelect(self))
-        self.add_item(WarNudgeTargetModeButton(self, "role"))
-        self.add_item(WarNudgeTargetModeButton(self, "member"))
+        self.add_item(WarNudgeTargetModeButton(self))
+        self.add_item(WarNudgeAutomationButton(self))
         self.add_item(SaveWarNudgeButton(self))
         self.add_item(RemoveWarNudgeButton(self))
         self.add_item(ListWarNudgeButton(self))
@@ -10731,6 +11339,9 @@ class WarNudgeConfigView(discord.ui.View):
         self.selected_role_id = None
         self.selected_user_id = None
         self.selected_description = ""
+        self.selected_automation_enabled = False
+        self.selected_automation_offsets = []
+        self.selected_automation_channel_id = None
         self.target_mode = "role"
         self.refresh_state()
 
@@ -10741,6 +11352,9 @@ class WarNudgeConfigView(discord.ui.View):
             self.selected_role_id = None
             self.selected_user_id = None
             self.selected_description = ""
+            self.selected_automation_enabled = False
+            self.selected_automation_offsets = []
+            self.selected_automation_channel_id = None
             self.target_mode = "role"
         self.refresh_state()
 
@@ -10767,11 +11381,27 @@ class WarNudgeConfigView(discord.ui.View):
         if not target_summary:
             target_summary.append("_No mention target selected_")
         reason_label = "New reason" if self.selected_reason_name == "__new__" else f"`{self.selected_reason_name}`"
+        if self.selected_automation_offsets:
+            automation_timings = ", ".join(
+                _format_war_nudge_interval(value)
+                for value in self.selected_automation_offsets
+            )
+        else:
+            automation_timings = "_No timings selected_"
+        automation_state = "ON" if self.selected_automation_enabled else "OFF"
+        automation_channel = None
+        if self.selected_automation_channel_id is not None:
+            channel = self.guild.get_channel(self.selected_automation_channel_id)
+            if isinstance(channel, discord.TextChannel):
+                automation_channel = channel.mention
+        automation_destination = automation_channel or "War alert/default channel"
         return (
             f"**Clan:** `{self.clan_name}`\n"
             f"**Reason:** {reason_label}\n"
             f"**Type:** `{self.selected_reason_type}`\n"
             f"**Targets:** {' '.join(target_summary)}\n"
+            f"**Automate nudge:** `{automation_state}` — {automation_timings}\n"
+            f"**Nudge channel:** {automation_destination}\n"
             f"**Description:** {description_line}\n\n"
             f"**Reason type behavior:**\n{reason_type_summary}\n\n"
             "Use the controls below to add, update, or remove war nudge reasons."
@@ -10790,6 +11420,24 @@ class WarNudgeConfigView(discord.ui.View):
                 ephemeral=True,
             )
             return
+        if self.selected_automation_channel_id is not None:
+            channel = _resolve_war_automation_channel(
+                self.guild,
+                self.selected_automation_channel_id,
+            )
+            if channel is None:
+                await interaction.response.send_message(
+                    "⚠️ I can no longer send messages in the selected nudge channel. "
+                    "Choose another channel or clear the channel override.",
+                    ephemeral=True,
+                )
+                return
+            if not _user_can_configure_channel(interaction.user, channel):
+                await interaction.response.send_message(
+                    "⚠️ You no longer have access to the selected nudge channel.",
+                    ephemeral=True,
+                )
+                return
 
         clan_entry = _get_clan_entry(self.guild.id, self.clan_name)
         war_nudge = clan_entry.setdefault("war_nudge", {})
@@ -10801,6 +11449,11 @@ class WarNudgeConfigView(discord.ui.View):
             "mention_role_id": self.selected_role_id,
             "mention_user_id": self.selected_user_id,
             "description": description,
+            "automation_enabled": bool(
+                self.selected_automation_enabled and self.selected_automation_offsets
+            ),
+            "automation_offsets": list(self.selected_automation_offsets),
+            "automation_channel_id": self.selected_automation_channel_id,
         }
 
         updated = False
@@ -10856,6 +11509,9 @@ class WarNudgeConfigView(discord.ui.View):
         self.selected_role_id = None
         self.selected_user_id = None
         self.selected_description = ""
+        self.selected_automation_enabled = False
+        self.selected_automation_offsets = []
+        self.selected_automation_channel_id = None
         self.refresh_state()
         self.refresh_components()
 
@@ -10878,10 +11534,20 @@ class WarNudgeConfigView(discord.ui.View):
                 ephemeral=True,
             )
             return
-        lines = [
-            f"- **{reason.get('name', 'Unnamed')}** — type: `{reason.get('type', 'unknown')}`"
-            for reason in reasons
-        ]
+        lines = []
+        for reason in reasons:
+            offsets = _normalise_war_nudge_automation_offsets(reason.get("automation_offsets"))
+            automation = "off"
+            if reason.get("automation_enabled") and offsets:
+                automation = ", ".join(_format_war_nudge_interval(value) for value in offsets)
+            channel_label = "war alert/default channel"
+            channel_id = reason.get("automation_channel_id")
+            if isinstance(channel_id, int):
+                channel = self.guild.get_channel(channel_id)
+                channel_label = channel.mention if isinstance(channel, discord.TextChannel) else f"channel ID {channel_id}"
+            lines.append(
+                f"- **{reason.get('name', 'Unnamed')}** — type: `{reason.get('type', 'unknown')}`, automation: {automation}, channel: {channel_label}"
+            )
         await interaction.response.send_message(
             f"Configured reasons for `{self.clan_name}`:\n" + "\n".join(lines),
             ephemeral=True,
