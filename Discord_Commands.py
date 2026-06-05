@@ -32,6 +32,12 @@ ALERT_ROLE_NAME = "War Alerts"
 ALERT_WINDOW_SECONDS = 300
 README_URL = "https://github.com/mataeo-eh/CoC_Clan_Bot/tree/main"
 WAR_NUDGE_REASONS = ("unused_attacks", "no_attacks", "low_stars")
+WAR_NUDGE_REASON_DESCRIPTIONS = {
+    # Keep these under Discord's 100-character SelectOption description limit.
+    "unused_attacks": "Members with at least one attack still available.",
+    "no_attacks": "Members who have not used any attack yet.",
+    "low_stars": "Members who attacked, but whose best attack is 0 or 1 star.",
+}
 DEFAULT_EVENT_DEFINITIONS: "OrderedDict[str, Dict[str, str]]" = OrderedDict(
     [
         ("clan_games", {"label": "Clan Games", "role_name": "Clan Games Alerts"}),
@@ -9489,8 +9495,15 @@ class LinkPlayerDetailsModal(discord.ui.Modal):
             alias_raw = self.alias_input.value.strip()
             alias_value = alias_raw or None
         self.parent_view.set_details(tag_value, alias_value)
-        await interaction.response.send_message("Player details updated.", ephemeral=True)
-        await self.parent_view.refresh_view_message()
+        if interaction.message is not None:
+            self.parent_view.message = interaction.message
+        # Modal submissions created from a component can update that source
+        # message directly. Editing it here propagates the rebuilt view, including
+        # the now-enabled confirm buttons, back to the visible /link_player UI.
+        await interaction.response.edit_message(
+            content=self.parent_view.render_message(),
+            view=self.parent_view,
+        )
 
 
 class LinkPlayerActionSelect(discord.ui.Select):
@@ -10303,6 +10316,7 @@ class WarNudgeTypeSelect(discord.ui.Select):
             discord.SelectOption(
                 label=reason_type.replace("_", " ").title(),
                 value=reason_type,
+                description=WAR_NUDGE_REASON_DESCRIPTIONS.get(reason_type),
                 default=reason_type == parent_view.selected_reason_type,
             )
             for reason_type in WAR_NUDGE_REASONS
@@ -10557,6 +10571,11 @@ class WarNudgeConfigView(discord.ui.View):
                 "⚠️ No clans are configured yet. Use `/set_clan` to add one before managing war nudges."
             )
         description_line = self.selected_description or "No description set."
+        reason_type_lines = [
+            f"- `{reason_type}`: {WAR_NUDGE_REASON_DESCRIPTIONS.get(reason_type, 'No description available.')}"
+            for reason_type in WAR_NUDGE_REASONS
+        ]
+        reason_type_summary = "\n".join(reason_type_lines)
         target_summary = []
         if self.selected_role_id:
             role = self.guild.get_role(self.selected_role_id)
@@ -10575,6 +10594,7 @@ class WarNudgeConfigView(discord.ui.View):
             f"**Type:** `{self.selected_reason_type}`\n"
             f"**Targets:** {' '.join(target_summary)}\n"
             f"**Description:** {description_line}\n\n"
+            f"**Reason type behavior:**\n{reason_type_summary}\n\n"
             "Use the controls below to add, update, or remove war nudge reasons."
         )
 
