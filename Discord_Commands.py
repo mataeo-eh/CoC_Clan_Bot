@@ -72,6 +72,8 @@ DONATION_METRIC_INFO: Dict[str, str] = {
 alert_state: Dict[Tuple[int, str, str], Set[str]] = {}
 _dirty_war_alert_state_guilds: Set[int] = set()
 _war_alert_state_loaded = False
+_configured_roster_cache: Dict[int, Tuple[datetime, List[Dict[str, str]]]] = {}
+CONFIGURED_ROSTER_CACHE_TTL = timedelta(minutes=5)
 
 # Global dictionary to store active AI help sessions by user ID
 active_ai_help_sessions: Dict[int, "AIHelpSessionManager"] = {}
@@ -694,6 +696,112 @@ async def _link_player_account(
     save_server_config()
     target_label = target.display_name if isinstance(target, discord.Member) else str(target.id)
     return f"✅ Removed `{normalised_tag}` from {target_label}."
+
+
+async def _fetch_configured_clan_roster(
+    guild: discord.Guild,
+    *,
+    use_cache: bool = True,
+    context: str = "configured roster lookup",
+) -> List[Dict[str, str]]:
+    """Fetch player names and tags from every clan configured for a guild."""
+    now = datetime.now(timezone.utc)
+    cached = _configured_roster_cache.get(guild.id)
+    if use_cache and cached is not None:
+        cached_at, cached_roster = cached
+        if now - cached_at <= CONFIGURED_ROSTER_CACHE_TTL:
+            return list(cached_roster)
+
+    clan_map = _clan_names_for_guild(guild.id)
+    if not clan_map:
+        raise PlayerLinkError("⚠️ No clans are configured for this server yet, so there is no roster to search.")
+
+    roster: List[Dict[str, str]] = []
+    seen_tags: Set[str] = set()
+    failures: List[str] = []
+    for clan_name, clan_tag in clan_map.items():
+        try:
+            clan = await client.get_clan(clan_tag)
+        except Exception as exc:  # pylint: disable=broad-except
+            log.warning(
+                "Failed to fetch roster for %s: guild=%s clan=%s tag=%s error=%s",
+                context,
+                guild.id,
+                clan_name,
+                clan_tag,
+                exc,
+            )
+            failures.append(clan_name)
+            continue
+
+        for clan_member in getattr(clan, "members", []):
+            raw_tag = getattr(clan_member, "tag", None)
+            raw_name = getattr(clan_member, "name", None)
+            normalised_tag = _normalise_player_tag(raw_tag) if isinstance(raw_tag, str) else None
+            if normalised_tag is None or normalised_tag in seen_tags:
+                continue
+            member_name = raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else normalised_tag
+            roster.append(
+                {
+                    "name": member_name,
+                    "tag": normalised_tag,
+                    "clan_name": clan_name,
+                }
+            )
+            seen_tags.add(normalised_tag)
+
+    if not roster:
+        if failures:
+            raise PlayerLinkError(
+                "⚠️ I couldn't load the configured clan roster(s) right now. Try again in a moment."
+            )
+        raise PlayerLinkError("⚠️ The configured clan roster is empty right now.")
+
+    _configured_roster_cache[guild.id] = (now, list(roster))
+    return roster
+
+
+def _normalise_tag_autocomplete_query(current: str) -> str:
+    """Return the typed tag search text after the first non-# character."""
+    if not isinstance(current, str):
+        return ""
+    return current.strip().upper().lstrip("#")
+
+
+def _search_configured_roster_tags(
+    roster: List[Dict[str, str]],
+    current: str,
+    *,
+    limit: int = 25,
+) -> List[Dict[str, str]]:
+    """Search configured clan roster tags by sequential typed tag characters."""
+    compact_query = _normalise_tag_autocomplete_query(current)
+    if not compact_query:
+        return []
+
+    ranked: List[Tuple[Tuple[int, int, str, str], Dict[str, str]]] = []
+    for entry in roster:
+        tag = entry.get("tag", "")
+        tag_text = tag.upper().lstrip("#")
+        if compact_query not in tag_text:
+            continue
+        position = tag_text.find(compact_query)
+        score = 0 if tag_text.startswith(compact_query) else 1
+        ranked.append(
+            (
+                (
+                    score,
+                    position,
+                    entry.get("name", "").casefold(),
+                    tag_text,
+                ),
+                entry,
+            )
+        )
+
+    ranked.sort(key=lambda item: item[0])
+    return [entry for _, entry in ranked[:limit]]
+
 
 # ---------------------------------------------------------------------------
 # Command for Logging Silent Slash Command Failures
@@ -1514,6 +1622,29 @@ async def war_nudge(interaction: discord.Interaction, clan_name: str, reason_nam
         tag = getattr(member, "tag", None)
         name = getattr(member, "name", "Unknown")
         discord_ping = _lookup_member_mention_by_tag(interaction.guild, tag) if tag else None
+        normalised_tag = _normalise_player_tag(tag) if isinstance(tag, str) else None
+        if discord_ping is None:
+            log.info(
+                "war_nudge target has no linked Discord mention: guild=%s clan=%s reason=%s player_name=%s raw_tag=%s normalised_tag=%s known_linked_tags=%s",
+                interaction.guild.id,
+                clan_name,
+                reason_name,
+                name,
+                tag,
+                normalised_tag,
+                _linked_player_tags_for_guild(interaction.guild),
+            )
+        else:
+            log.debug(
+                "war_nudge target linked Discord mention found: guild=%s clan=%s reason=%s player_name=%s raw_tag=%s normalised_tag=%s mention=%s",
+                interaction.guild.id,
+                clan_name,
+                reason_name,
+                name,
+                tag,
+                normalised_tag,
+                discord_ping,
+            )
         ping_suffix = f" {discord_ping}" if discord_ping else ""
         if reason_type == "unused_attacks":
             lines.append(
@@ -3723,6 +3854,23 @@ def _lookup_member_mention_by_tag(guild: discord.Guild, tag: str) -> Optional[st
             member = guild.get_member(int(user_id_str))
             return member.mention if member else f"<@{user_id_str}>"
     return None
+
+
+def _linked_player_tags_for_guild(guild: discord.Guild) -> List[str]:
+    """Return normalised linked CoC tags for diagnostic logging."""
+    guild_config = _ensure_guild_config(guild.id)
+    accounts = guild_config.get("player_accounts", {})
+    tags: Set[str] = set()
+    for records in accounts.values():
+        if not isinstance(records, list):
+            continue
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            normalised_tag = _normalise_player_tag(record.get("tag"))
+            if normalised_tag is not None:
+                tags.add(normalised_tag)
+    return sorted(tags)
 
 
 def _build_reason_mention(guild: discord.Guild, reason: Dict[str, Any]) -> str:
@@ -10918,50 +11066,10 @@ class RegisterMeView(discord.ui.View):
         if self.roster_cache is not None:
             return self.roster_cache
 
-        clan_map = _clan_names_for_guild(self.guild.id)
-        if not clan_map:
-            raise PlayerLinkError("⚠️ No clans are configured for this server yet, so there is no roster to search.")
-
-        roster: List[Dict[str, str]] = []
-        seen_tags: Set[str] = set()
-        failures: List[str] = []
-        for clan_name, clan_tag in clan_map.items():
-            try:
-                clan = await client.get_clan(clan_tag)
-            except Exception as exc:  # pylint: disable=broad-except
-                log.warning(
-                    "Failed to fetch roster for register_me search: guild=%s clan=%s tag=%s error=%s",
-                    self.guild.id,
-                    clan_name,
-                    clan_tag,
-                    exc,
-                )
-                failures.append(clan_name)
-                continue
-
-            for clan_member in getattr(clan, "members", []):
-                raw_tag = getattr(clan_member, "tag", None)
-                raw_name = getattr(clan_member, "name", None)
-                normalised_tag = _normalise_player_tag(raw_tag) if isinstance(raw_tag, str) else None
-                if normalised_tag is None or normalised_tag in seen_tags:
-                    continue
-                member_name = raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else normalised_tag
-                roster.append(
-                    {
-                        "name": member_name,
-                        "tag": normalised_tag,
-                        "clan_name": clan_name,
-                    }
-                )
-                seen_tags.add(normalised_tag)
-
-        if not roster:
-            if failures:
-                raise PlayerLinkError(
-                    "⚠️ I couldn't load the configured clan roster(s) right now. Try again in a moment."
-                )
-            raise PlayerLinkError("⚠️ The configured clan roster is empty right now.")
-
+        roster = await _fetch_configured_clan_roster(
+            self.guild,
+            context="register_me search",
+        )
         self.roster_cache = roster
         return roster
 
@@ -11757,6 +11865,40 @@ async def war_nudge_reason_autocomplete(
             if len(suggestions) >= 25:
                 return suggestions
 
+    return suggestions
+
+
+@link_player.autocomplete("player_tag")
+async def player_tag_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> List[app_commands.Choice[str]]:
+    """Suggest player tags from configured clan rosters after tag text is typed."""
+    if interaction.guild is None:
+        return []
+    if not _normalise_tag_autocomplete_query(current):
+        return []
+
+    try:
+        roster = await _fetch_configured_clan_roster(
+            interaction.guild,
+            context="link_player player_tag autocomplete",
+        )
+    except PlayerLinkError as exc:
+        log.debug("player_tag autocomplete unavailable: %s", exc.message)
+        return []
+
+    suggestions: List[app_commands.Choice[str]] = []
+    for entry in _search_configured_roster_tags(roster, current):
+        name = entry.get("name", "Unknown")
+        tag = entry.get("tag", "")
+        clan_name = entry.get("clan_name", "Configured clan")
+        if not tag:
+            continue
+        label = f"{name} — {tag} ({clan_name})"
+        suggestions.append(app_commands.Choice(name=label[:100], value=tag[:100]))
+        if len(suggestions) >= 25:
+            break
     return suggestions
 
 
