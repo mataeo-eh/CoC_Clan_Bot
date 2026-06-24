@@ -199,6 +199,12 @@ def _format_datetime_utc(value: Optional[datetime]) -> str:
     return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
+def _format_count(count: Any, singular: str, plural: Optional[str] = None) -> str:
+    """Format a count with the grammatically correct singular or plural noun."""
+    noun = singular if count == 1 else (plural or f"{singular}s")
+    return f"{count} {noun}"
+
+
 def _build_help_message(title: str, bullet_lines: Iterable[str]) -> str:
     """Create a formatted help blurb for specialised help commands."""
     body = "\n".join(f"• {line}" for line in bullet_lines)
@@ -952,7 +958,7 @@ async def _fetch_configured_clan_roster(
     if not roster:
         if failures:
             raise PlayerLinkError(
-                "⚠️ I couldn't load the configured clan roster(s) right now. Try again in a moment."
+                "⚠️ I couldn't load the configured clan rosters right now. Try again in a moment."
             )
         raise PlayerLinkError("⚠️ The configured clan roster is empty right now.")
 
@@ -1288,8 +1294,9 @@ async def help_usage(interaction: discord.Interaction):
     top_commands = summary.get("top_commands", [])
     if top_commands:
         for index, entry in enumerate(top_commands, start=1):
+            call_count = entry.get("count", 0)
             lines.append(
-                f"{index}. {entry.get('name')} — {entry.get('count', 0)} call(s) "
+                f"{index}. {entry.get('name')} — {_format_count(call_count, 'call')} "
                 f"(last used { _format_datetime_utc(entry.get('last_invoked')) })"
             )
     else:
@@ -1304,7 +1311,7 @@ async def help_usage(interaction: discord.Interaction):
     )
     if top_counts:
         for index, count in enumerate(top_counts, start=1):
-            lines.append(f"User #{index}: {count} call(s)")
+            lines.append(f"User #{index}: {_format_count(count, 'call')}")
     else:
         lines.append("No user activity recorded yet.")
 
@@ -3324,8 +3331,9 @@ def _format_member_stars_list(members: Iterable[Any], attacks_per_member: int) -
     for member in members:
         stats = _war_member_attack_stats(member, attacks_per_member)
         header = _format_member_header(member)
+        attack_label = "attack" if attacks_per_member == 1 else "attacks"
         lines.append(
-            f"• {header} — {stats['stars']}⭐ from {stats['used']}/{attacks_per_member} attack(s)"
+            f"• {header} — {stats['stars']}⭐ from {stats['used']}/{attacks_per_member} {attack_label}"
         )
     return "\n".join(lines) if lines else "No members listed."
 
@@ -3372,7 +3380,7 @@ def _format_cwl_member_totals(entries: Iterable[Any]) -> str:
             f"• {name} (TH{town_hall}) — {attacks_used}/{attacks_available} attacks used, "
             f"{stars_earned}/{max_stars} stars"
             + (
-                f" across {rounds_rostered} round(s)"
+                f" across {_format_count(rounds_rostered, 'round')}"
                 if isinstance(rounds_rostered, int) and rounds_rostered > 0
                 else ""
             )
@@ -4090,16 +4098,19 @@ def _build_war_nudge_content(
             )
         ping_suffix = f" {discord_ping}" if discord_ping else ""
         if reason_type == "unused_attacks":
+            remaining = info.get("remaining", "?")
             lines.append(
-                f"• {name} — {info.get('remaining', '?')} attack(s) remaining.{ping_suffix}"
+                f"• {name} — {_format_count(remaining, 'attack')} remaining.{ping_suffix}"
             )
         elif reason_type == "no_attacks":
             lines.append(
                 f"• {name} — has not attacked yet.{ping_suffix}"
             )
         elif reason_type == "low_stars":
+            attempts = info.get("used", 0)
             lines.append(
-                f"• {name} — best attack {info.get('best_stars', 0)}⭐ ({info.get('used', 0)} attempt(s)).{ping_suffix}"
+                f"• {name} — best attack {info.get('best_stars', 0)}⭐ "
+                f"({_format_count(attempts, 'attempt')}).{ping_suffix}"
             )
 
     mention_prefix = _build_reason_mention(guild, selected_reason)
@@ -4262,6 +4273,23 @@ def _format_alert_message(role: Optional[discord.Role], message: str) -> str:
     return f"{prefix}{message}".strip()
 
 
+def _format_finished_war_result(clan_name: str, status: Any) -> str:
+    """Render every documented coc.py ``ClanWar.status`` result as a sentence.
+
+    coc.py 3.9 returns an in-progress form (``winning``, ``losing``, or
+    ``tied``) and a completed form (``won``, ``lost``, or ``tie``). The alert
+    window can observe either form while the API transitions to ``warEnded``.
+    """
+    status_value = status.value if hasattr(status, "value") else status
+    if status_value in {"winning", "won"}:
+        return f"{clan_name} won."
+    if status_value in {"losing", "lost"}:
+        return f"{clan_name} lost."
+    if status_value in {"tied", "tie"}:
+        return "The result was a tie."
+    return "The final result is unavailable."
+
+
 def _collect_war_alerts(
     guild: discord.Guild,
     clan_name: str,
@@ -4283,6 +4311,8 @@ def _collect_war_alerts(
     end_seconds_remaining = timing["end_seconds_remaining"]
     seconds_since_start = timing["seconds_since_start"]
     seconds_since_end = timing["seconds_since_end"]
+    opponent_name = getattr(war.opponent, "name", "the opposing clan")
+    matchup = f"{clan_name} versus {opponent_name}"
 
     def queue(alert_id: str, text: str) -> None:
         """Queue alert text when it has not already been sent."""
@@ -4291,32 +4321,31 @@ def _collect_war_alerts(
 
     if state_value_str in {'preparation', 'inWar'}:
         if _within_threshold_window(start_seconds_remaining, threshold=3600):
-            queue("start_1h", f"War for {clan_name} starts in 1 hour.")
+            queue("start_1h", f"War alert: {matchup} starts in 1 hour.")
         if _within_threshold_window(start_seconds_remaining, threshold=300):
-            queue("start_5m", f"War for {clan_name} starts in 5 minutes.")
+            queue("start_5m", f"War alert: {matchup} starts in 5 minutes.")
 
     if state_value_str in {'inWar', 'warEnded'}:
         if _elapsed_within_window(seconds_since_start, target=300):
-            queue("start_plus_5m", f"War for {clan_name} started 5 minutes ago. Good luck!")
+            queue("start_plus_5m", f"War alert: {matchup} started 5 minutes ago. Good luck!")
 
     if state_value_str in {'preparation', 'inWar'}:
         if _within_threshold_window(end_seconds_remaining, threshold=43200):
-            queue("end_12h", f"War for {clan_name} ends in 12 hours.")
+            queue("end_12h", f"War alert: {matchup} ends in 12 hours.")
         if _within_threshold_window(end_seconds_remaining, threshold=3600):
-            queue("end_1h", f"War for {clan_name} ends in 1 hour.")
+            queue("end_1h", f"War alert: {matchup} ends in 1 hour.")
         if _within_threshold_window(end_seconds_remaining, threshold=300):
-            queue("end_5m", f"War for {clan_name} ends in 5 minutes.")
+            queue("end_5m", f"War alert: {matchup} ends in 5 minutes.")
 
     if state_value_str in {'warEnded', 'inWar'}:
         if _elapsed_within_window(seconds_since_end, target=0):
             home_stars = getattr(war.clan, 'stars', '?')
             enemy_stars = getattr(war.opponent, 'stars', '?')
-            status_raw = war.status.value if hasattr(war.status, 'value') else war.status
-            status_value = status_raw or state_value_str
+            result_sentence = _format_finished_war_result(clan_name, war.status)
             queue(
                 'end_result',
                 (
-                    f"War for {clan_name} versus {war.opponent.name} has {status_value}. "
+                    f"War alert: {matchup} has ended. {result_sentence} "
                     f"Final stars: {home_stars}-{enemy_stars}."
                 ),
             )
@@ -5638,7 +5667,7 @@ class ChooseWarAlertChannelView(discord.ui.View):
             options.append(
                 discord.SelectOption(
                     label=label,
-                    description=f"{len(channels)} channel(s)",
+                    description=_format_count(len(channels), "channel"),
                     value="none" if category_id is None else str(category_id),
                 )
             )
@@ -12139,13 +12168,13 @@ class RegisterMeView(discord.ui.View):
         try:
             if role in getattr(target_member, "roles", []):
                 await interaction.response.send_message(
-                    f"You have already signed up for {role_name} alert(s).",
+                    f"You have already signed up for {role_name} alerts.",
                     ephemeral=True,
                 )
                 return
 
             await target_member.add_roles(role, reason="RegisterMe subscription")
-            message = f"{target_member.mention} is now subscribed to {role_name} alert(s)."
+            message = f"{target_member.mention} is now subscribed to {role_name} alerts."
         except discord.Forbidden:
             await interaction.response.send_message(
                 "I don't have permission to modify that role.",
